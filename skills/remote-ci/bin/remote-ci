@@ -1,0 +1,160 @@
+#!/bin/bash
+# ABOUTME: Runs a project's heavy checks on a separate runner machine so the dev machine stays cool (any project with .remote-ci.conf).
+# ABOUTME: Route: direct link (e.g. Thunderbolt bridge) → named SSH host (e.g. over Tailscale) → exit 3 (caller falls back to local). See ../SKILL.md.
+set -uo pipefail
+kit=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# Machine-specific settings live outside the repo: ${AGENT_LANES_CONFIG:-~/.config/agent-lanes/config}.
+#   REMOTE_CI_USER (default: your login) · REMOTE_CI_DIRECT_HOST (default: the bridge0 router, i.e. a Thunderbolt bridge)
+#   REMOTE_CI_HOSTKEY_ALIAS (ssh HostKeyAlias for the direct route) · REMOTE_CI_HOST (ssh host for the fallback route)
+cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}
+# shellcheck disable=SC1090
+[ -f "$cfg" ] && . "$cfg"
+user=${REMOTE_CI_USER:-$(id -un)}
+usage() {
+  cat <<'USAGE'
+remote-ci check [--force] [--worktree] [--run "<cmd>"] [--summary] [<commit>]   run the check on the runner
+remote-ci status                                                       lock, runs, disk, Postgres
+remote-ci log [-C n] <regex>                                           grep the latest run's log (no colors)
+remote-ci info                                                         one-line route, ssh command, ports, paths (cheap lookup)
+remote-ci setup                                                        prepare the runner for this project
+remote-ci init                                                         add .remote-ci.conf + pre-push hook here
+Exit codes: check result, 3 = runner unreachable, 75 = busy (all slots unavailable).
+USAGE
+}
+cmd=${1:-}; shift || true
+[ "$cmd" = init ] && exec bash "$kit/bin/remote-ci-init" "$@"
+case "$cmd" in check | status | setup | info | log) ;; *) usage; exit 2 ;; esac
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "remote-ci: not in a git repository" >&2; exit 2; }
+conf=$root/.remote-ci.conf
+[ -f "$conf" ] || { echo "remote-ci: no .remote-ci.conf in $root (run: remote-ci init)" >&2; exit 2; }
+# Keep the settings used for cache identity and execution identical while queued.
+conf_snapshot=$(mktemp)
+chmod 600 "$conf_snapshot"
+cp "$conf" "$conf_snapshot"
+conf=$conf_snapshot
+trap 'rm -f "$conf_snapshot"' EXIT
+# shellcheck disable=SC1090
+. "$conf"
+: "${REMOTE_CI_NAME:?set REMOTE_CI_NAME in .remote-ci.conf}"
+case "${REMOTE_CI_SLOTS:-1}" in *[!0-9]* | "" | 0*) echo "remote-ci: REMOTE_CI_SLOTS must be a positive integer" >&2; exit 2 ;; esac
+
+base=(-o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+router=${REMOTE_CI_DIRECT_HOST:-$(ipconfig getoption bridge0 router 2>/dev/null)}
+alias_opt=(); [ -n "${REMOTE_CI_HOSTKEY_ALIAS:-}" ] && alias_opt=(-o "HostKeyAlias=$REMOTE_CI_HOSTKEY_ALIAS")
+if [ -n "$router" ] && ssh "${base[@]}" "${alias_opt[@]}" "$user@$router" true 2>/dev/null; then
+  ssh_cmd=(ssh "${base[@]}" "${alias_opt[@]}" "$user@$router")
+  git_url="ssh://$user@$router/~/ci/projects/$REMOTE_CI_NAME/repo.git"
+  git_ssh="ssh ${base[*]} ${alias_opt[*]}"
+  route="direct $router"
+elif [ -n "${REMOTE_CI_HOST:-}" ] && ssh "${base[@]}" "$REMOTE_CI_HOST" true 2>/dev/null; then
+  ssh_cmd=(ssh "${base[@]}" "$REMOTE_CI_HOST")
+  git_url="$REMOTE_CI_HOST:ci/projects/$REMOTE_CI_NAME/repo.git"
+  git_ssh="ssh ${base[*]}"
+  route="ssh $REMOTE_CI_HOST"
+else
+  echo "remote-ci: runner unreachable" >&2
+  exit 3
+fi
+remote() { "${ssh_cmd[@]}" "$@" 2>&1 | grep -v '^Pseudo-terminal'; return "${PIPESTATUS[0]}"; }
+p="~/ci/projects/$REMOTE_CI_NAME"
+
+sync_kit() {
+  local run_dir=""
+  [ -n "${1:-}" ] && run_dir="$p/runs/$1"
+  # Runner scripts and this project's config travel on every call, so changes apply at once.
+  tar -C "$kit/remote" -cf - . | remote 'mkdir -p ~/ci/bin; tmp=$(mktemp -d ~/ci/bin/.sync.XXXXXX) && tar -C "$tmp" -xf - && for f in "$tmp"/*; do mv -f "$f" ~/ci/bin/; done; rmdir "$tmp"' || return 1
+  remote "mkdir -p $p; tmp=\$(mktemp $p/.conf.XXXXXX) && chmod 600 \"\$tmp\" && cat >\"\$tmp\" && mv -f \"\$tmp\" $p/conf" <"$conf" || return 1
+  if [ -n "$run_dir" ]; then
+    tar -C "$kit/remote" -cf - . | remote "mkdir -p $run_dir/bin && chmod 700 $run_dir && tar -C $run_dir/bin -xf -" || return 1
+    remote "umask 077; cat >$run_dir/conf; if [ -f $p/env.local ]; then cp $p/env.local $run_dir/env.local; fi" <"$conf" || return 1
+  fi
+  if [ -n "${REMOTE_CI_ENV_KEYS:-}" ] && [ -f "$root/.env" ]; then
+    # Selected .env keys (e.g. test-storage credentials): copied, never printed, mode 600.
+    local pattern
+    pattern=$(printf '%s' "$REMOTE_CI_ENV_KEYS" | tr ' ' '\n' | sed 's/\*/[A-Z0-9_]*/g; s/^/^/; s/$/=/' | paste -sd'|' -)
+    grep -E "$pattern" "$root/.env" | sed 's/^/export /' | remote "umask 077; tmp=\$(mktemp $p/.env.XXXXXX) && cat >\"\$tmp\" ${run_dir:+ && cp \"\$tmp\" $run_dir/env.local} && mv -f \"\$tmp\" $p/env.local" || return 1
+  fi
+}
+
+case "$cmd" in
+setup)
+  sync_kit && remote "bash ~/ci/bin/setup.sh $REMOTE_CI_NAME"
+  exit $?
+  ;;
+info)
+  echo "route=$route ssh='${ssh_cmd[*]}' project=$p db_port=${REMOTE_CI_POSTGRES:+$((5400 + REMOTE_CI_POSTGRES))} node=${REMOTE_CI_NODE:-system} check='${REMOTE_CI_CHECK:-pnpm run check}' logs=$p/logs"
+  exit 0
+  ;;
+log)
+  ctx=2; [ "${1:-}" = -C ] && { ctx=$2; shift 2; }
+  pattern=$(printf '%s' "${1:-== finished}" | base64)
+  remote "f=\$(ls -t $p/logs/*.log | head -1); echo \"\$f\"; sed 's/\x1b\[[0-9;]*m//g' \"\$f\" | grep -E -C $ctx \"\$(echo $pattern | base64 -D)\" | head -120"
+  exit $?
+  ;;
+status)
+  remote "bash ~/ci/bin/status.sh $REMOTE_CI_NAME '$route' ${REMOTE_CI_SLOTS:-1}"
+  exit $?
+  ;;
+esac
+
+worktree=0 summary=0 force=0 command="" target=HEAD
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --force) force=1 ;;
+  --worktree) worktree=1 ;;
+  --summary) summary=1 ;;
+  --run) command=$2; shift ;;
+  -h | --help) usage; exit 0 ;;
+  *) target=$1 ;;
+  esac
+  shift
+done
+cd "$root" || exit 2
+# A bare check on a dirty tree means "check what I have": include uncommitted files,
+# otherwise HEAD's cached pass hides the edits.
+if [ "$worktree" = 0 ] && [ "$target" = HEAD ] && [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+  echo "remote-ci: uncommitted changes found; checking them too (--worktree)."
+  worktree=1
+fi
+if [ "$worktree" = 1 ]; then
+  # Snapshot tracked and untracked (not ignored) files through a throwaway index.
+  index=$(mktemp)
+  GIT_INDEX_FILE=$index git read-tree HEAD
+  GIT_INDEX_FILE=$index git add -A
+  sha=$(git commit-tree "$(GIT_INDEX_FILE=$index git write-tree)" -p HEAD -m "remote-ci worktree snapshot")
+  rm -f "$index"
+else
+  sha=$(git rev-parse "$target^{commit}") || exit 2
+fi
+# A pass is keyed on the code and this project's remote-ci settings together.
+tree=$(git rev-parse "$sha^{tree}")-$(git hash-object "$conf" | cut -c1-8)
+if [ "$force" = 0 ] && [ -z "$command" ] && remote "test -f $p/results/tree-$tree.pass"; then
+  echo "remote-ci: this exact code already passed on the runner ($route); skipping."
+  exit 0
+fi
+run=$(date +%Y%m%d-%H%M%S)-${sha:0:8}-$$
+sync_kit "$run" || exit 1
+remote "test -f $p/.ready" || remote "bash ~/ci/bin/setup.sh $REMOTE_CI_NAME" || exit 1
+# One ref per run, so parallel callers never overwrite each other's commit while queued.
+GIT_SSH_COMMAND="$git_ssh" git push -q --force "$git_url" "$sha:refs/heads/run/$run" || exit 1
+echo "remote-ci: $REMOTE_CI_NAME ${sha:0:8} on the runner via $route (log $p/logs/$run.log)"
+encoded=$(printf '%s' "$command" | base64)
+remote "nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$encoded' $force >/dev/null 2>&1 &" || exit 1
+# If this connection drops, the run still finishes and cleans up on the runner (see: remote-ci status).
+if [ "$summary" = 1 ]; then
+  remote "done=$p/results/$run.exit
+    while [ ! -f \$done ]; do sleep 2; done
+    sed 's/\x1b\[[0-9;]*m//g' $p/logs/$run.log |
+      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|== timing|== finished|maximum resident' |
+      sed 's/^[^ :]*:[a-z:-]*: *//' | awk '!seen[\$0]++' | head -60
+    exit \$(cat \$done)"
+  rc=$?
+  echo "remote-ci: full log on the runner at $p/logs/$run.log"
+  exit $rc
+fi
+remote "log=$p/logs/$run.log; done=$p/results/$run.exit
+  while [ ! -f \$log ]; do sleep 1; done
+  tail -n +1 -f \$log & t=\$!
+  while [ ! -f \$done ]; do sleep 2; done
+  sleep 1; kill \$t; exit \$(cat \$done)"

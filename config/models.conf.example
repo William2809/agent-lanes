@@ -1,0 +1,5 @@
+# Personal model presets. Copy to ~/.config/agent-lanes/models.conf. Same format as presets/models.conf;
+# a line with the same name overrides the default, new names add short aliases.
+# name     model          effort   sandbox(max)   route
+# fast     gpt-6.1-sol    low      full-access    codex
+# deep     gpt-6.1-sol    xhigh    full-access    codex

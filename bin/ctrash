@@ -1,0 +1,14 @@
+#!/bin/sh
+# ABOUTME: Safe delete for agents: moves paths into ~/.claude-trash/YYYY-MM-DD/ instead of rm.
+# ABOUTME: Name clashes get a time suffix; prints where each path went. Never prompts. Exit 1 if any move failed.
+# Usage: ctrash <path>...   (missing paths are skipped quietly; globs that match nothing are fine)
+d="$HOME/.claude-trash/$(date +%F)"; mkdir -p "$d"; rc=0
+for p in "$@"; do
+  [ -e "$p" ] || [ -L "$p" ] || continue
+  t="$d/$(basename "$p")"; { [ -e "$t" ] || [ -L "$t" ]; } && t="$t.$(date +%H%M%S).$$"
+  if [ -L "$p" ]; then  # a link: recreate it in the trash (mv across volumes fails on broken/looping links)
+    ln -s "$(readlink "$p")" "$t" && unlink "$p" && { echo "trashed link $p -> $t"; continue; }
+  elif mv "$p" "$t" 2>/dev/null || mv "$p" "$t"; then echo "trashed $p -> $t"; continue; fi
+  echo "ctrash: FAILED to move $p" >&2; rc=1
+done
+exit $rc

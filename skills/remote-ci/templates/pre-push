@@ -1,0 +1,24 @@
+#!/bin/sh
+# CI before pushing a shared branch (dev, staging, main); feature-branch pushes skip it.
+# Runs on the runner (remote-ci) and falls back to the local check only when the runner
+# is unreachable (exit 3). Never --no-verify.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+# Read only the check command; the conf's exports are for the runner run, not the local fallback.
+check=$(. ./.remote-ci.conf; printf '%s' "$REMOTE_CI_CHECK")
+shas=""
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/heads/dev | refs/heads/staging | refs/heads/main)
+      case "$local_sha" in 0000000000000000000000000000000000000000) ;; *) shas="$shas $local_sha" ;; esac ;;
+  esac
+done
+[ -n "$shas" ] || exit 0
+for sha in $shas; do
+  remote-ci check --summary "$sha"
+  rc=$?
+  [ "$rc" = 0 ] && continue
+  [ "$rc" != 3 ] && exit "$rc"
+  echo "pre-push: runner unreachable; running the check locally on the working tree." >&2
+  [ "$sha" = "$(git rev-parse HEAD)" ] || echo "pre-push: note: pushing $sha but HEAD is checked out." >&2
+  sh -c "$check" || exit 1
+done

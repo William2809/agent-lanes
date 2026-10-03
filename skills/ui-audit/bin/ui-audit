@@ -1,0 +1,75 @@
+#!/usr/bin/env node
+// ui-audit: mechanical UI checks over a route list, one line per problem.
+// Checks per page and width: sideways page scroll, words broken across lines,
+// text cut off with an ellipsis (no title), and console/page errors.
+// Usage (repo root): ui-audit [--base URL] [--widths 1440,390] [--routes FILE] [--only substr] [--theme dark]
+// Routes file (default .ui-audit-routes): one "role path" per line, # comments.
+import { execFileSync } from "node:child_process"
+import { readFileSync, existsSync, mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+const a = process.argv.slice(2)
+const opt = { base: "http://localhost:3000", widths: "1440,390", routes: ".ui-audit-routes", only: "", theme: "" }
+for (let i = 0; i < a.length; i++) {
+  const k = a[i].replace(/^--/, "")
+  if (k === "h" || k === "help") { console.log(readFileSync(new URL(import.meta.url)).toString().split("\n").slice(1, 7).join("\n")); process.exit(0) }
+  if (!(k in opt)) { console.error(`ui-audit: unknown option ${a[i]}`); process.exit(2) }
+  opt[k] = a[++i]
+}
+if (!existsSync(opt.routes)) { console.error(`ui-audit: no ${opt.routes}`); process.exit(2) }
+const routes = readFileSync(opt.routes, "utf8").split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"))
+  .map((l) => { const [role, ...rest] = l.split(/\s+/); return { role, path: rest.join(" ") } })
+  .filter((r) => !opt.only || r.path.includes(opt.only))
+
+// Runs in the page; returns problems as one string.
+const probe = `(() => {
+  const out = []
+  const se = document.scrollingElement
+  if (se.scrollWidth > innerWidth + 1) out.push("sideways " + se.scrollWidth + ">" + innerWidth)
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== "hidden" }
+  const cut = []
+  for (const el of document.querySelectorAll("body *")) {
+    if (el.children.length > 3 || el.title) continue
+    const cs = getComputedStyle(el)
+    const txt = (el.innerText || "").trim()
+    if (txt && cs.textOverflow === "ellipsis" && el.scrollWidth > el.clientWidth + 1 && visible(el)) cut.push(txt.slice(0, 28))
+  }
+  if (cut.length) out.push("cut(" + cut.length + "): " + cut.slice(0, 4).join(" | "))
+  const broken = new Set(); let n = 0
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+  while (walker.nextNode() && n < 4000) {
+    const t = walker.currentNode, s = t.nodeValue
+    if (!s || s.trim().length < 4 || !t.parentElement || !visible(t.parentElement)) continue
+    for (const m of s.matchAll(/[^\\s\\/·,–-]{4,}/g)) {
+      if (++n > 4000) break
+      const r = document.createRange(); r.setStart(t, m.index); r.setEnd(t, m.index + m[0].length)
+      const rects = [...r.getClientRects()].filter((x) => x.width > 0)
+      if (rects.length > 1 && Math.abs(rects[0].top - rects.at(-1).top) > 2) broken.add(m[0])
+    }
+  }
+  if (broken.size) out.push("word-broken(" + broken.size + "): " + [...broken].slice(0, 4).join(" | "))
+  return out.join("; ")
+})()`
+
+const shotsDir = mkdtempSync(join(tmpdir(), "ui-audit-"))
+let problems = 0
+const byRole = {}
+for (const r of routes) (byRole[r.role] ||= []).push(r.path)
+for (const [role, paths] of Object.entries(byRole)) {
+  const args = ["--base", opt.base, "--as", role, "--widths", opt.widths, "--wait", "2500", "--console", "--out", shotsDir, "--eval", probe]
+  if (opt.theme) args.push("--theme", opt.theme)
+  let text
+  try { text = execFileSync("ui-shots", [...args, ...paths], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1 << 26 }) }
+  catch (e) { text = (e.stdout || "") + (e.stderr || ""); console.log(`${role}: ui-shots failed: ${String(e.stderr || e.message).split("\n").find((l) => /Error/.test(l)) || "see output"}`); problems++ }
+  let cur = ""
+  for (const line of text.split("\n")) {
+    if (line.endsWith(".png")) { cur = line.split("/").pop().replace(/^[a-z]+_/, "").replace(/\.png$/, ""); continue }
+    const m = line.match(/^\s+eval:\s*(.*)$/)
+    if (m) { const v = JSON.parse(m[1] || '""'); if (v) { console.log(`${role} ${cur}: ${v}`); problems++ } continue }
+    const c = line.match(/^\s+(error|pageerror|warning):\s*(.*)$/i)
+    if (c && !/LCP|Largest Contentful Paint/.test(c[2])) { console.log(`${role} ${cur}: console ${c[1]}: ${c[2].slice(0, 140)}`); problems++ }
+  }
+}
+console.log(problems ? `ui-audit: ${problems} problem line(s); screenshots in ${shotsDir}` : `ui-audit: clean (${routes.length} routes × ${opt.widths}); screenshots in ${shotsDir}`)
+process.exit(problems ? 1 : 0)

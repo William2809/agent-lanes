@@ -1,0 +1,99 @@
+#!/bin/sh
+# ABOUTME: Merge queue over `land`: lands wt-dev worktrees ONE at a time, bounces a conflicting or red
+# ABOUTME: batch back to its worker, and keeps going; also holds per-worktree file claims used by `wk -o`.
+# Usage (inside the repo):
+#   mq add WT...            queue committed worktrees (refuses dirty ones: commit with wtcommit first)
+#   mq run                  process the queue until nothing is ready (run as ONE background command; one runner per repo)
+#   mq ls                   queue + claims
+#   mq claim WT PATH...     add path prefixes to WT's claim      mq who PATH...  owner of each path (exit 1 if owned)
+#   mq drop WT              remove WT from the queue
+# A claim is live while its worktree exists, so land's `wt-dev rm` releases it. Output: one line per event.
+set -u
+# Run from a private copy: sh parses as it runs, so in-place edits can break a live runner.
+if [ -z "${MQ_COPY:-}" ]; then t=$(mktemp "${TMPDIR:-/tmp}/mq.XXXXXX") && cp "$0" "$t" && MQ_COPY=$t exec sh "$t" "$@"; fi
+main=$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd) || { echo "mq: not in a git repo" >&2; exit 2; }
+st="$HOME/.claude/state/mq/$(basename "$main")"; mkdir -p "$st/claims"; q="$st/queue"; touch "$q"
+MAX_BOUNCES=${MQ_MAX_BOUNCES:-2}
+alive() { [ -n "$(wt-dev path "$1" 2>/dev/null)" ] && [ -d "$(wt-dev path "$1")" ]; }
+# Queue lines: "WT<TAB>state<TAB>bounces<TAB>worker"; state = ready | bounced | parked.
+setq() { awk -F'\t' -v OFS='\t' -v w="$1" -v s="$2" -v b="$3" -v k="$4" '$1==w{$2=s;$3=b;$4=k} {print}' "$q" >"$q.tmp" && mv "$q.tmp" "$q"; }
+delq() { awk -F'\t' -v w="$1" '$1!=w' "$q" >"$q.tmp" && mv "$q.tmp" "$q"; }
+field() { awk -F'\t' -v w="$1" -v f="$2" '$1==w{print $f}' "$q"; }
+# Prefix overlap in either direction.
+clash() { case "$1/" in "$2"/*) return 0 ;; esac; case "$2/" in "$1"/*) return 0 ;; esac; return 1; }
+changed() { _p=$(wt-dev path "$1") && _b=$(git -C "$main" rev-parse --abbrev-ref HEAD) &&
+  { git -C "$_p" diff --name-only "$_b...HEAD"; git -C "$_p" status --porcelain=v1 -uall | cut -c4- | sed 's/.* -> //'; } 2>/dev/null |
+  grep -v -e '^\.reviews/' -e '^tools/file-size-baseline\.json$' | sort -u; }
+# Latest registered worker whose directory is this worktree.
+worker_of() { d=$(wt-dev path "$1") || return; awk -F'\t' -v d="$d" '$4==d {l=$3} END {if (l) {sub(/.*\//,"",l); sub(/\.log$/,"",l); print l}}' "$HOME/.claude/state/workers.tsv" 2>/dev/null; }
+running() { [ -n "$1" ] && batches 2>/dev/null | awk -v n="$1" '$1==n && $2=="running"{f=1} END{exit !f}'; }
+
+cmd=${1:-ls}; [ $# -gt 0 ] && shift
+case "$cmd" in
+  claim) w=${1:?mq claim WT PATH...}; shift; alive "$w" || { echo "no worktree $w" >&2; exit 1; }
+    for p in "$@"; do p=${p%/}; echo "$p"; done >>"$st/claims/$w"; sort -u -o "$st/claims/$w" "$st/claims/$w"; exit 0 ;;
+  who) rc=0; for p in "$@"; do p=${p%/}
+      for f in "$st"/claims/*; do [ -f "$f" ] || continue; w=${f##*/}; [ "$w" = "${MQ_SELF:-}" ] && continue; alive "$w" || continue
+        while read -r c; do clash "$p" "$c" && { echo "$p claimed by $w ($c)"; rc=1; }; done <"$f"; done
+      for w in $(wt-dev ls 2>/dev/null | awk '{print $1}'); do [ -n "${MQ_SELF:-}" ] && [ "$w" = "$MQ_SELF" ] && continue
+        changed "$w" | while read -r c; do clash "$p" "$c" && echo "$p touched by $w ($c)"; done | head -1 | grep . && rc=1; done
+    done; exit $rc ;;
+  add) for w in "$@"; do alive "$w" || { echo "mq: no worktree $w" >&2; continue; }
+      p=$(wt-dev path "$w"); [ -z "$(git -C "$p" status --porcelain -- . ':!.reviews')" ] || { echo "mq: $w has uncommitted work (wtcommit $w \"msg\")" >&2; continue; }
+      # Scope check: changes outside the batch's claim are how overlaps start; warn, don't block.
+      if [ -f "$st/claims/$w" ]; then out=$(changed "$w" | while read -r c; do ok=0
+          while read -r cl; do clash "$c" "$cl" && ok=1; done <"$st/claims/$w"; [ $ok = 1 ] || echo "$c"; done)
+        [ -z "$out" ] || echo "mq: $w changed files outside its claim: $(printf '%s\n' "$out" | head -5 | tr '\n' ' ')" >&2; fi
+      grep -q "^$w	" "$q" && setq "$w" ready "$(field "$w" 3)" "" || printf '%s\tready\t0\t\n' "$w" >>"$q"; echo "queued $w"; done; exit 0 ;;
+  drop) delq "${1:?}"; echo "dropped $1"; exit 0 ;;
+  ls) if [ -s "$q" ]; then b=$(batches --all 2>/dev/null)
+      while IFS="$(printf '\t')" read -r w s n k; do x=""
+        [ "$s" = bounced ] && [ -n "$k" ] && x=$(printf '%s\n' "$b" | awk -v k="$k" '$1==k {$1=""; print; exit}')
+        echo "$w  $s  $n  $k${x:+ ($(echo $x))}"; done <"$q"; else echo "queue empty"; fi
+    for f in "$st"/claims/*; do [ -f "$f" ] || continue; alive "${f##*/}" || { mv "$f" "$st/claims/.released.${f##*/}"; continue; }
+      echo "claim ${f##*/}: $(tr '\n' ' ' <"$f")"; done; [ -f "$st/run.pid" ] && kill -0 "$(cat "$st/run.pid")" 2>/dev/null && echo "runner pid $(cat "$st/run.pid")"; exit 0 ;;
+  run) ;;
+  *) sed -n '4,10p' "$MQ_COPY"; exit 2 ;;
+esac
+
+# --- run: one runner per repo (pid file, liveness-checked so a dead runner never wedges the queue).
+if [ -f "$st/run.pid" ] && kill -0 "$(cat "$st/run.pid")" 2>/dev/null; then echo "mq: runner already active (pid $(cat "$st/run.pid")); mq add is enough"; exit 0; fi
+echo $$ >"$st/run.pid"; trap 'rm -f "$st/run.pid"' EXIT
+cd "$main" || exit 1
+landed=0
+while :; do
+  # Bounced entries come back once their worker stops: new commits and a clean tree -> ready, else park.
+  for w in $(awk -F'\t' '$2=="bounced"{print $1}' "$q"); do k=$(field "$w" 4); running "$k" && continue
+    p=$(wt-dev path "$w" 2>/dev/null)
+    if [ -n "$p" ] && [ -z "$(git -C "$p" status --porcelain -- . ':!.reviews')" ]; then setq "$w" ready "$(field "$w" 3)" "$k"; echo "requeued $w (worker $k done)"
+    else setq "$w" parked "$(field "$w" 3)" "$k"; echo "PARKED $w: worker $k left uncommitted work"; fi
+  done
+  w=$(awk -F'\t' '$2=="ready"{print $1; exit}' "$q")
+  if [ -z "$w" ]; then
+    awk -F'\t' '$2=="bounced"' "$q" | grep -q . || break
+    sleep 30; continue
+  fi
+  echo "landing $w"
+  out=$(land "$w" 2>&1); last=$(printf '%s\n' "$out" | tail -1)
+  case "$last" in
+    LANDED*) delq "$w"; landed=$((landed + 1)); echo "$w: $last"; printf '%s\t%s\t%s\n' "$(date +%FT%T)" "$w" "$last" >>"$st/history"; continue ;;
+  esac
+  why=${last#FAILED }; b=$(( $(field "$w" 3) + 1 ))
+  # Already merged (e.g. the runner died after landing it): drop it instead of bouncing.
+  case "$why" in *"has nothing to land"*) delq "$w"; echo "$w: already on the branch; dropped"; continue ;; esac
+  # ff-merge also fails on a dirty main checkout touching the same files: retry once, then park (never loop).
+  case "$why" in "ff-merge"*) if [ "$b" -le 1 ]; then setq "$w" ready "$b" ""; echo "$w: ff-merge failed (branch moved?); retrying once"
+    else setq "$w" parked "$b" ""; echo "PARKED $w: ff-merge keeps failing (main checkout dirty on its files?)"; fi; continue ;; esac
+  if [ "$b" -gt "$MAX_BOUNCES" ] || ! alive "$w"; then setq "$w" parked "$b" ""; echo "PARKED $w after $((b - 1)) bounces: $why"; printf '%s\n' "$out" | tail -6 | sed 's/^/  /'; continue; fi
+  base=$(git rev-parse --abbrev-ref HEAD)
+  msg="The merge queue could not land this worktree: $why
+Land output (tail):
+$(printf '%s\n' "$out" | tail -12)
+
+Fix it in THIS worktree only. If it conflicts: \`git rebase $base\`, resolve keeping both sides' intent, \`git rebase --continue\` (this rebase is allowed here; never push/reset/force/stash). If a check or preflight is red: fix the cause, not the test. Then run the targeted tests for the touched files and \`sh tools/land-preflight.sh $base\`, commit with \`wtcommit \"type(scope): message\"\`, and report in the usual format."
+  k=$(worker_of "$w")
+  if [ -n "$k" ] && ! running "$k" && printf '%s\n' "$msg" | wk "$k" -r - >/dev/null 2>&1; then :
+  else k="$w-mq$b"; (cd "$(wt-dev path "$w")" && printf '%s\n' "$msg" | wk "$k" -d "$w" -m build-hard >/dev/null 2>&1) || { setq "$w" parked "$b" ""; echo "PARKED $w: could not start a fixer ($why)"; continue; }; fi
+  setq "$w" bounced "$b" "$k"; echo "BOUNCED $w to $k: $why"
+done
+echo "mq done: landed $landed; $(awk -F'\t' '$2=="parked"' "$q" | wc -l | tr -d ' ') parked$(awk -F'\t' '$2=="parked"{printf " %s", $1}' "$q")"

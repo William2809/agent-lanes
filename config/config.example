@@ -1,0 +1,13 @@
+# agent-lanes machine settings. Copy to ~/.config/agent-lanes/config (never commit it).
+# Sourced as shell by remote-ci, wk and run-worker.
+
+# remote-ci: where heavy checks run. Leave unset to use only the direct route.
+# REMOTE_CI_USER=you                    # ssh user on the runner (default: your login)
+# REMOTE_CI_DIRECT_HOST=192.0.2.10      # direct link address (default: the bridge0 router, e.g. a Thunderbolt bridge)
+# REMOTE_CI_HOSTKEY_ALIAS=runner-direct # ssh HostKeyAlias for the direct route
+# REMOTE_CI_HOST=runner                 # ssh host (from ~/.ssh/config) for the fallback route, e.g. over a VPN
+
+# Codex CLI binary (default: `codex` on PATH)
+# CODEX_BIN=/path/to/codex
+# Codex profile used by `run-worker.sh --lead` (a proxy that lets a worker spawn other providers' subagents)
+# AGENT_LANES_LEAD_PROFILE=my-proxy

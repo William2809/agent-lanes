@@ -1,0 +1,24 @@
+#!/bin/bash
+# ABOUTME: Adds remote-ci to the current repo: a .remote-ci.conf and a pre-push hook; never overwrites.
+set -euo pipefail
+kit=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+root=$(git rev-parse --show-toplevel)
+name=$(basename "$root")
+if [ -f "$root/.remote-ci.conf" ]; then
+  echo "exists: .remote-ci.conf"
+else
+  sed "s/__NAME__/$name/" "$kit/templates/remote-ci.conf" >"$root/.remote-ci.conf"
+  echo "added: .remote-ci.conf (edit the check, toolchain and Postgres lines)"
+fi
+hooks=$(git -C "$root" config core.hooksPath || true)
+hooks=${hooks:-.git/hooks}
+case "$hooks" in /*) ;; *) hooks=$root/$hooks ;; esac
+mkdir -p "$hooks"
+if [ -f "$hooks/pre-push" ]; then
+  echo "exists: $hooks/pre-push (compare with $kit/templates/pre-push)"
+else
+  cp "$kit/templates/pre-push" "$hooks/pre-push"
+  chmod +x "$hooks/pre-push"
+  echo "added: $hooks/pre-push"
+fi
+echo "next: remote-ci setup, then remote-ci check --summary"

@@ -1,0 +1,85 @@
+#!/usr/bin/env node
+// ABOUTME: Logs in to a local app as a role (like ui-shots) and runs a Playwright step script against it.
+// ABOUTME: Usage (from project root): pw-run --base URL --as ROLE [--width 1440] script.mjs  (script default-exports async ({page, base, shot}) => {})
+import { createRequire } from "node:module"
+import { readFileSync, existsSync } from "node:fs"
+import { join, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
+const args = process.argv.slice(2)
+const opt = { base: "http://localhost:3000", width: 1440, role: "ADMIN", script: "" }
+for (let i = 0; i < args.length; i++) {
+  const a = args[i]
+  if (a === "--base") opt.base = args[++i]
+  else if (a === "--as") opt.role = args[++i].toUpperCase()
+  else if (a === "--width") opt.width = Number(args[++i])
+  else opt.script = a
+}
+if (!opt.script) { console.error("usage: pw-run --base URL --as ROLE [--width N] script.mjs"); process.exit(2) }
+const base = new URL(opt.base)
+if (!['http:', 'https:'].includes(base.protocol) ||
+    (!['localhost', '127.0.0.1', '[::1]'].includes(base.hostname) && process.env.UI_SHOTS_ALLOW_REMOTE !== '1')) {
+  console.error("pw-run: refusing credentials for remote base; set UI_SHOTS_ALLOW_REMOTE=1"); process.exit(2)
+}
+
+async function fillLogin(page, login, emailSel, passwordSel, email, password) {
+  let redirected = false
+  const crossOrigin = request => request.isNavigationRequest() && request.frame() === page.mainFrame() && new URL(request.url()).origin !== base.origin
+  // Request events include every HTTP redirect; route handlers see only the first URL.
+  const observe = request => { if (crossOrigin(request)) redirected = true }
+  page.on("request", observe)
+  const guard = async route => {
+    const request = route.request()
+    if (crossOrigin(request)) {
+      redirected = true; await route.abort()
+    } else await route.continue()
+  }
+  await page.route("**/*", guard)
+  try {
+    await page.goto(opt.base + login)
+    if (new URL(page.url()).origin !== base.origin) redirected = true
+    if (!redirected) await page.fill(emailSel, email)
+    if (!redirected) await page.fill(passwordSel, password)
+  } catch (error) {
+    if (!redirected) throw error
+  } finally {
+    await page.unroute("**/*", guard)
+    page.off("request", observe)
+  }
+  if (redirected) {
+    const error = new Error("pw-run: refusing credentials: login redirected to another origin")
+    error.credentialRefusal = true; throw error
+  }
+}
+
+const env = {}
+if (existsSync(".env")) for (const line of readFileSync(".env", "utf8").split("\n")) {
+  const m = line.match(/^([A-Z0-9_]+)=(.*)$/); if (m) env[m[1]] = m[2].replace(/^["']|["']$/g, "")
+}
+const val = (k) => process.env[k] ?? env[k]
+const login = val("UI_SHOTS_LOGIN") || "/login"
+let pre = val("UI_SHOTS_ROLE_PREFIX")
+if (pre === undefined) { const k = Object.keys(env).filter((k) => k.endsWith(`_${opt.role}_EMAIL`) || k === `${opt.role}_EMAIL`); if (k.length === 1) pre = k[0].slice(0, -`${opt.role}_EMAIL`.length) }
+if (pre === undefined) { console.error(`pw-run: no single .env key ends in _${opt.role}_EMAIL; set UI_SHOTS_ROLE_PREFIX`); process.exit(2) }
+const require = createRequire(join(process.cwd(), "package.json"))
+let chromium
+try { ({ chromium } = require("@playwright/test")) } catch { ({ chromium } = require("playwright")) }
+const browser = await chromium.launch()
+try {
+  const context = await browser.newContext({ viewport: { width: opt.width, height: 900 }, deviceScaleFactor: 1 })
+  const page = await context.newPage()
+  const errors = []
+  page.on("console", (m) => { if (m.type() === "error") errors.push(m.text().split("\n")[0].slice(0, 300)) })
+  page.on("pageerror", (e) => errors.push("pageerror: " + String(e.message).split("\n")[0]))
+  const email = val(`${pre}${opt.role}_EMAIL`), password = val(`${pre}${opt.role}_PASSWORD`)
+  await fillLogin(page, login, 'input[type="email"], input[name="email"]', 'input[type="password"]', email, password)
+  await Promise.all([page.waitForURL((u) => !u.pathname.startsWith(login), { timeout: 20000 }), page.click('button[type="submit"]')])
+  const { default: run } = await import(pathToFileURL(resolve(opt.script)).href)
+  let n = 0
+  const shot = async (name) => { const f = resolve(process.env.PW_OUT || "/tmp", `${name || "shot" + ++n}.png`); await page.screenshot({ path: f, fullPage: true }); console.log(f) }
+  try { await run({ page, base: opt.base, shot }) }
+  catch (e) { console.log("FAILED:", String(e.message).split("\n").slice(0, 3).join(" | ")); await shot("failure") }
+  finally { for (const e of [...new Set(errors)]) console.log("console:", e) }
+} catch (error) {
+  if (!error.credentialRefusal) throw error
+  console.error(error.message); process.exitCode = 2
+} finally { await browser.close() }

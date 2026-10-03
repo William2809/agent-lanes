@@ -1,0 +1,176 @@
+#!/usr/bin/env node
+// wt-compare: screenshot the same pages on two running dev servers (default: the main
+// checkout on :3000 vs a wt-dev worktree) and build one self-contained HTML review page
+// with side-by-side, swipe and pixel-diff views plus the worktree's commits and diff stat.
+// Run from the repo root (uses that project's Playwright via ui-shots). Prints the HTML path.
+import { execFileSync } from "node:child_process"
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs"
+import { join, basename, dirname } from "node:path"
+import { homedir, tmpdir } from "node:os"
+
+const usage = `usage: wt-compare --wt NAME [--before http://localhost:3000] [--after URL]
+  [--as admin] [--widths 1440,390] [--theme dark|light|both] [--click TEXT]... [--wait ms] [--full]
+  [--title "..."] [--note "..."]... [--pair "label|before.png|after.png"]... [--out review.html] [ROUTE...]
+Screens every ROUTE on both servers with ui-shots and writes one HTML page (images embedded).
+--wt resolves the worktree's port and git info from wt-dev; --after overrides the URL.`
+const a = process.argv.slice(2)
+const pairs = []
+const o = { before: "http://localhost:3000", after: "", wt: "", as: "admin", widths: "1440,390", theme: "light", click: [], wait: "", full: false, title: "", note: [], out: "" }
+const routes = []
+for (let i = 0; i < a.length; i++) {
+  const k = a[i], v = () => a[++i]
+  if (k === "-h" || k === "--help") { console.log(usage); process.exit(0) }
+  else if (k === "--click") o.click.push(v())
+  else if (k === "--note") o.note.push(v())
+  else if (k === "--pair") pairs.push(v())
+  else if (k === "--full") o.full = true
+  else if (k.startsWith("--")) o[k.slice(2)] = v()
+  else routes.push(k)
+}
+if ((!routes.length && !pairs.length) || (routes.length && !o.wt && !o.after)) { console.error(usage); process.exit(2) }
+
+const sh = (cmd, args, opts = {}) => execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts }).trim()
+const tryq = (f, d = "") => { try { return f() } catch { return d } }
+
+// Worktree: port from wt-dev state, folder from ~/worktrees/<repo>/<name>.
+let wtDir = "", repo = ""
+if (o.wt) {
+  const cache = join(homedir(), ".cache/wt-dev")
+  for (const r of tryq(() => readdirSync(cache), [])) if (existsSync(join(cache, r, `${o.wt}.port`))) {
+    repo = r
+    o.after ||= `http://localhost:${readFileSync(join(cache, r, `${o.wt}.port`), "utf8").trim()}`
+  }
+  wtDir = join(homedir(), "worktrees", repo, o.wt)
+  if (!o.after) { console.error(`wt-compare: no wt-dev worktree named ${o.wt}`); process.exit(2) }
+}
+
+const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
+const work = join(tmpdir(), `wt-compare-${o.wt || "x"}-${stamp}`)
+const themes = o.theme === "both" ? ["light", "dark"] : [o.theme]
+const shots = []
+for (const theme of routes.length ? themes : []) {
+  const run = (base, side) => {
+    const dir = join(work, side, theme); mkdirSync(dir, { recursive: true })
+    const args = ["--base", base, "--as", o.as, "--widths", o.widths, "--out", dir]
+    if (theme === "dark") args.push("--theme", "dark")
+    if (o.full) args.push("--full")
+    if (o.wait) args.push("--wait", o.wait)
+    for (const c of o.click) args.push("--click", c)
+    return sh("ui-shots", [...args, ...routes]).split("\n").filter(l => l.endsWith(".png"))
+  }
+  const before = run(o.before, "before"), after = run(o.after, "after")
+  const widths = o.widths.split(",")
+  const images = widths.flatMap(width => routes.map(route => ({ route, width })))
+  if (before.length !== images.length || after.length !== images.length) throw new Error("wt-compare: incomplete screenshot set")
+  after.forEach((file, i) => shots.push({ theme, ...images[i], before: before[i], after: file }))
+}
+
+// Extra cards from screenshots taken elsewhere: --pair "label|before.png|after.png"
+for (const pr of pairs) { const [label, before, after] = pr.split("|"); shots.push({ theme: "", route: label, width: "", before, after }) }
+
+// Embed as JPEG (sips on macOS) to keep the page small; fall back to PNG.
+const embed = file => {
+  if (!file || !existsSync(file)) return ""
+  const jpg = file.replace(/\.png$/, ".jpg")
+  const ok = tryq(() => (sh("sips", ["-s", "format", "jpeg", "-s", "formatOptions", "82", file, "--out", jpg]), true), false)
+  return ok ? `data:image/jpeg;base64,${readFileSync(jpg).toString("base64")}` : `data:image/png;base64,${readFileSync(file).toString("base64")}`
+}
+
+let git = { branch: "", commits: "", stat: "", base: "" }
+if (wtDir && existsSync(wtDir)) {
+  const main = tryq(() => sh("git", ["-C", wtDir, "rev-parse", "--path-format=absolute", "--git-common-dir"]).replace(/\/\.git$/, ""))
+  const baseRef = tryq(() => sh("git", ["-C", main, "rev-parse", "--short", "HEAD"]))
+  git = {
+    base: baseRef,
+    branch: tryq(() => sh("git", ["-C", wtDir, "rev-parse", "--abbrev-ref", "HEAD"])),
+    commits: tryq(() => sh("git", ["-C", wtDir, "log", "--oneline", `${baseRef}..HEAD`])),
+    stat: tryq(() => sh("git", ["-C", wtDir, "diff", "--stat", baseRef])),
+  }
+}
+
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c])
+const title = o.title || `${o.wt || "Change"} review`
+const cards = shots.map((s, i) => `
+<section class="card" id="s${i}">
+  <header><b>${esc(s.route)}</b><span>${s.width ? esc(s.width) + "px · " + s.theme : "manual state"}</span><span class="chip" data-chip>…</span>
+    <nav role="tablist"><button data-mode="side" aria-pressed="true">Side by side</button><button data-mode="swipe">Swipe</button><button data-mode="diff">Diff</button></nav></header>
+  <div class="view side"><figure><figcaption>Before</figcaption><img data-b src="${embed(s.before)}" alt="Before"></figure><figure><figcaption>After</figcaption><img data-a src="${embed(s.after)}" alt="After"></figure></div>
+  <div class="view swipe" hidden><div class="sw"><img src="" data-sb alt=""><div class="top"><img src="" data-sa alt=""></div></div><input type="range" min="0" max="100" value="50" aria-label="Swipe between before and after"><div class="meta"><span>◀ Before</span><span style="margin-left:auto">After ▶</span></div></div>
+  <div class="view diff" hidden><canvas></canvas></div>
+</section>`).join("")
+
+const html = `<title>${esc(title)}</title>
+<style>
+/* Review page: one column of comparison cards; before is the main checkout, after is the worktree. */
+:root{--bg:#f6f7f5;--surface:#fff;--fg:#1c2420;--muted:#5d6963;--line:#dfe4df;--accent:#1f5c3d;--hot:#d6336c;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121614;--surface:#1a1f1c;--fg:#e4e9e5;--muted:#9aa59f;--line:#2c332f;--accent:#7cc79c;--hot:#ff6b9a;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#121614;--surface:#1a1f1c;--fg:#e4e9e5;--muted:#9aa59f;--line:#2c332f;--accent:#7cc79c;--hot:#ff6b9a;color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;margin:0;padding-inline:16px;padding-block:24px 48px}
+[hidden]{display:none!important}
+main{max-width:1500px;margin:0 auto;display:grid;gap:20px}
+h1{font-size:22px;margin:0}
+.meta{color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 18px}
+details{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+pre{margin:6px 0 0;overflow-x:auto;font:12px/1.5 ui-monospace,Menlo,monospace}
+.notes{margin:0;padding-left:18px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden;min-width:0}
+.card>header{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding:10px 14px;border-bottom:1px solid var(--line)}
+.card>header span{color:var(--muted)}
+.chip{font-size:12px;border-radius:999px;padding:1px 8px;background:var(--bg)}
+.chip.changed{color:var(--hot)}
+nav{margin-left:auto;display:flex;gap:4px}
+nav button{font:inherit;font-size:13px;border:1px solid var(--line);background:transparent;color:var(--fg);border-radius:6px;padding:3px 10px;cursor:pointer}
+nav button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--surface)}
+nav button:focus-visible{outline:none;border-color:var(--muted)}
+.view{padding:12px;overflow-x:auto}
+.side{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:12px;align-items:start}
+figure{margin:0;min-width:0}figcaption{font-size:12px;color:var(--muted);margin-bottom:4px}
+img,canvas{max-width:100%;display:block;border:1px solid var(--line)}
+.sw{position:relative;display:inline-block;max-width:100%}.sw .top{position:absolute;inset:0 auto 0 0;overflow:hidden;width:50%;border-right:2px solid var(--hot)}
+.sw .top img{max-width:none}
+input[type=range]{width:100%;margin-top:8px}
+</style>
+<main>
+<header style="display:grid;gap:6px"><h1>${esc(title)}</h1>
+<div class="meta"><span>Before <b>${esc(o.before)}</b>${git.base ? ` (${esc(git.base)})` : ""}</span><span>After <b>${esc(o.after)}</b>${git.branch ? ` (${esc(git.branch)})` : ""}</span><span>Role ${esc(o.as)}</span><span>${esc(new Date().toLocaleString("en-GB", { timeZoneName: "short" }))}</span></div></header>
+${o.note.length ? `<ul class="notes">${o.note.map(n => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}
+${git.commits || git.stat ? `<details><summary>${git.commits ? git.commits.split("\n").length : 0} commits · ${git.stat ? git.stat.split("\n").length - 1 : 0} files changed (including uncommitted)</summary><pre>${esc(git.commits)}\n\n${esc(git.stat)}</pre></details>` : ""}
+${cards}
+</main>
+<script>
+for (const card of document.querySelectorAll(".card")) {
+  const b = card.querySelector("[data-b]"), a = card.querySelector("[data-a]"), chip = card.querySelector("[data-chip]")
+  card.querySelector("[data-sb]").src = a.src; card.querySelector("[data-sa]").src = b.src
+  const top = card.querySelector(".top"), range = card.querySelector("input[type=range]")
+  const sync = () => { top.style.width = range.value + "%"; top.querySelector("img").style.width = card.querySelector("[data-sb]").clientWidth + "px" }
+  range.addEventListener("input", sync)
+  for (const btn of card.querySelectorAll("nav button")) btn.addEventListener("click", () => {
+    for (const x of card.querySelectorAll("nav button")) x.setAttribute("aria-pressed", String(x === btn))
+    for (const v of card.querySelectorAll(".view")) v.hidden = !v.classList.contains(btn.dataset.mode)
+    if (btn.dataset.mode === "swipe") requestAnimationFrame(sync)
+  })
+  const diff = () => {
+    if (!b.naturalWidth || !a.naturalWidth) { chip.textContent = "missing shot"; return }
+    const w = Math.max(b.naturalWidth, a.naturalWidth), h = Math.max(b.naturalHeight, a.naturalHeight)
+    const mk = img => { const c = document.createElement("canvas"); c.width = w; c.height = h; const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, w, h); x.drawImage(img, 0, 0); return x.getImageData(0, 0, w, h) }
+    const p = mk(b), q = mk(a), out = card.querySelector("canvas"); out.width = w; out.height = h
+    const ctx = out.getContext("2d"), img = ctx.createImageData(w, h); let n = 0
+    for (let i = 0; i < p.data.length; i += 4) {
+      const d = Math.abs(p.data[i] - q.data[i]) + Math.abs(p.data[i + 1] - q.data[i + 1]) + Math.abs(p.data[i + 2] - q.data[i + 2])
+      if (d > 48) { n++; img.data[i] = 214; img.data[i + 1] = 51; img.data[i + 2] = 108; img.data[i + 3] = 255 }
+      else { const g = (q.data[i] + q.data[i + 1] + q.data[i + 2]) / 3; img.data[i] = img.data[i + 1] = img.data[i + 2] = 255 - (255 - g) * 0.25; img.data[i + 3] = 255 }
+    }
+    ctx.putImageData(img, 0, 0)
+    const pct = (100 * n / (w * h)); chip.textContent = pct < 0.01 ? "no visible change" : pct.toFixed(1) + "% of pixels changed"
+    chip.classList.toggle("changed", pct >= 0.01)
+  }
+  let loaded = 0; for (const img of [a, b]) img.complete ? ++loaded : img.addEventListener("load", () => ++loaded === 2 && diff())
+  if (loaded === 2) diff()
+}
+</script>
+`
+const repoRoot = tryq(() => sh("git", ["rev-parse", "--show-toplevel"]), process.cwd())
+const out = o.out || join(repoRoot, ".reviews", `${o.wt || "compare"}-review.html`)
+mkdirSync(dirname(out), { recursive: true })
+writeFileSync(out, html)
+console.log(out)

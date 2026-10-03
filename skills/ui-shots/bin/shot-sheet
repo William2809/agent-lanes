@@ -1,0 +1,27 @@
+#!/usr/bin/env node
+// shot-sheet: tile PNG screenshots (cropped to the top N source px) into one labelled contact sheet.
+// Usage (from a project root with Playwright):
+//   shot-sheet [--crop 360] [--cols 2] [--out sheet.png] a.png b.png ...
+//   Mixed widths are fine: each shot keeps its own width (wide shots scale down to --max 1152 px),
+//   so before/after = `--cols 2 b_1440.png b_390.png a_1440.png a_390.png` (one row per state).
+//   --crop 0 = whole page.  --help = this text.
+const fs = require("fs"), path = require("path");
+const a = process.argv.slice(2);
+const usage = () => { console.log(fs.readFileSync(__filename, "utf8").split("\n").slice(1, 7).map(l => l.replace(/^\/\/ ?/, "")).join("\n")); process.exit(2) };
+const opt = { crop: 360, cols: 2, out: "sheet.png", max: 1152 }; const files = [];
+for (let i = 0; i < a.length; i++) { const k = a[i]; if (k === "--help" || k === "-h") usage(); if (k.startsWith("--")) opt[k.slice(2)] = a[++i]; else files.push(k) }
+if (!files.length) usage();
+for (const f of files) if (!fs.existsSync(f)) { console.error("missing: " + f); process.exit(1) }
+const { createRequire } = require("module");
+const req = createRequire(path.join(process.cwd(), "package.json"));
+let chromium; try { ({ chromium } = req("@playwright/test")) } catch { ({ chromium } = req("playwright")) }
+const cols = Number(opt.cols), crop = Number(opt.crop), max = Number(opt.max);
+const pngWidth = f => fs.readFileSync(f).readUInt32BE(16);
+const cell = f => { const src = pngWidth(f), w = Math.min(src, max), h = crop > 0 ? Math.round(crop * w / src) : null;
+  return `<figure style="width:${w}px"><figcaption>${path.basename(f).replace(/\.png$/, "")}</figcaption><div style="${h ? `height:${h}px;` : ""}overflow:hidden"><img src="data:image/png;base64,${fs.readFileSync(f).toString("base64")}" style="width:${w}px;display:block"></div></figure>` };
+const rows = []; for (let i = 0; i < files.length; i += cols) rows.push(`<div class="r">${files.slice(i, i + cols).map(cell).join("")}</div>`);
+const html = `<html><body style="margin:0;background:#ddd;font:14px system-ui;display:inline-grid;gap:8px;padding:8px">${rows.join("")}<style>.r{display:flex;gap:8px;align-items:flex-start}figure{margin:0;background:#fff}figcaption{padding:4px 8px;background:#333;color:#fff;font-size:16px;overflow-wrap:anywhere}</style></body></html>`;
+(async () => { const b = await chromium.launch(); const p = await b.newPage({ viewport: { width: 400, height: 400 } });
+  await p.setContent(html); const box = await p.evaluate(() => [document.body.scrollWidth, document.body.scrollHeight]);
+  await p.setViewportSize({ width: box[0], height: Math.min(box[1], 4000) });
+  await p.screenshot({ path: opt.out, fullPage: true }); await b.close(); console.log(path.resolve(opt.out)) })();

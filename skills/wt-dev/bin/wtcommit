@@ -1,0 +1,21 @@
+#!/bin/sh
+# ABOUTME: Commits a wt-dev worktree's changes by explicit path (never `git add -A`), skipping
+# ABOUTME: .reviews/ and the file-size baseline. Prints the short sha and file count, or the hook error tail.
+# Usage: wtcommit <worktree> "<message>"  |  wtcommit "<message>" (inside the worktree)     (run inside the repo)   -n = dry run (list files only)
+set -eu
+[ "${1:-}" = "-n" ] && { dry=1; shift; } || dry=0
+name=${1:?usage: wtcommit [-n] <worktree> "<message>"}; msg=${2:-}
+# Run inside a worktree with only a message: commit that worktree.
+if [ $# -eq 1 ] && [ ! -d "$(wt-dev path "$name" 2>/dev/null)" ]; then
+  top=$(git rev-parse --show-toplevel 2>/dev/null || true); msg=$name; name=$(basename "${top:-.}")
+fi
+wt=$(wt-dev path "$name"); [ -d "$wt" ] || { echo "no worktree $name" >&2; exit 1; }
+files=$(git -C "$wt" status --porcelain=v1 -uall | cut -c4- | sed 's/.* -> //' | grep -v -e '^\.reviews/' -e '^tools/file-size-baseline\.json$' || true)
+[ -n "$files" ] || { echo "$name: nothing to commit"; exit 0; }
+if [ $dry -eq 1 ]; then printf '%s\n' "$files"; exit 0; fi
+[ -n "$msg" ] || { echo "message required" >&2; exit 2; }
+# Deleted paths can't be `git add`ed once the deletion is staged: stage them with `git rm --cached` instead.
+printf '%s\n' "$files" | (cd "$wt" && while IFS= read -r f; do
+  if [ -e "$f" ] || [ -L "$f" ]; then git add -- "$f"; else git rm -q --cached --ignore-unmatch -- "$f"; fi; done)
+out=$(git -C "$wt" commit -q -m "$msg" 2>&1) || { printf '%s\n' "$out" | tail -8; echo "COMMIT FAILED $name"; exit 1; }
+echo "$name $(git -C "$wt" rev-parse --short HEAD) ($(printf '%s\n' "$files" | wc -l | tr -d ' ') files)"

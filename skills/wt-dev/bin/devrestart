@@ -1,0 +1,14 @@
+#!/bin/sh
+# ABOUTME: Restarts the main checkout's dev server with a clean Next cache (stale HMR after big merges).
+# ABOUTME: Old cache goes to ~/.claude-trash/<date>/; log at ~/.claude/state/logs/<repo>/devserver.log.
+# Usage (inside the main checkout): devrestart [port=3000]
+set -u
+port=${1:-3000}; top=$(git rev-parse --show-toplevel) || exit 1; repo=$(basename "$top")
+log="$HOME/.claude/state/logs/$repo/devserver.log"; trash="$HOME/.claude-trash/$(date +%F)"; mkdir -p "$trash" "$(dirname "$log")"
+pkill -f "turbo dev" 2>/dev/null; for p in $(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null); do kill "$p"; done; sleep 3
+for c in "$top"/apps/*/.next; do [ -d "$c" ] && mv "$c" "$trash/$(basename "$(dirname "$c")")-next-cache-$(date +%H%M%S)"; done
+[ -f "$log" ] && mv "$log" "$trash/devserver-$(date +%H%M%S).log"
+# Own session (setsid via perl): the server must outlive the calling shell's process group.
+(cd "$top" || exit 1; nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' pnpm dev >"$log" 2>&1 </dev/null &)
+i=0; while [ $i -lt 60 ]; do c=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$port/" 2>/dev/null); [ "$c" != 000 ] && { echo "up :$port ($c) log $log"; exit 0; }; sleep 2; i=$((i+1)); done
+echo "not up after 120s; see $log"; exit 1

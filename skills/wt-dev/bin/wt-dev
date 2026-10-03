@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# wt-dev: one git worktree + its own Next dev server per agent session.
+# Usage (run inside the repo):
+#   wt-dev new <name> [--from <ref>] [--branch <b>] [--port N] [--app apps/web] [--no-install] [--shared-db]
+#   Own database: when .env has a localhost DATABASE_URL, `new` clones that database to <db>_wt_<name>
+#   and gives the worktree a real .env pointing at it (parallel workers can't change each other's data);
+#   `rm` drops it. --shared-db (or WT_DEV_SHARED_DB=1) keeps the old shared database.
+#   wt-dev start|stop|log|path <name>      wt-dev ls      wt-dev rm <name>
+set -euo pipefail
+
+die() { echo "wt-dev: $*" >&2; exit 1; }
+repo=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "not in a git repo"
+repo=$(cd "$repo/.." && pwd)
+repo_name=$(basename "$repo" | tr ' ' '-')
+root="$HOME/worktrees/$repo_name"
+state="$HOME/.cache/wt-dev/$repo_name"
+mkdir -p "$root" "$state"
+
+cmd=${1:-}; shift || true
+name=""
+[[ "$cmd" =~ ^(new|start|stop|log|path|rm)$ ]] && { name=${1:-}; [ -n "$name" ] || die "$cmd needs a name"; shift; }
+from=HEAD; branch=""; port=""; app=""; install=1; shared_db=${WT_DEV_SHARED_DB:-0}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from) from=$2; shift 2;; --branch) branch=$2; shift 2;;
+    --port) port=$2; shift 2;; --app) app=$2; shift 2;;
+    --no-install) install=0; shift;; --shared-db) shared_db=1; shift;; *) die "unknown option $1";;
+  esac
+done
+wt="$root/$name"
+
+detect_app() {
+  [ -n "$app" ] && { echo "$app"; return; }
+  [ -f "$state/$name.app" ] && { cat "$state/$name.app"; return; }
+  for d in apps/web web .; do grep -q '"next"' "$wt/$d/package.json" 2>/dev/null && { echo "$d"; return; }; done
+  die "no Next app found; pass --app"
+}
+free_port() { local p=3001; while lsof -iTCP:$p -sTCP:LISTEN >/dev/null 2>&1; do p=$((p+1)); done; echo $p; }
+# Per-worktree database helpers. URLs are never printed (they hold passwords).
+main_url() { grep -E '^DATABASE_URL=' "$repo/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"; }
+db_of() { local u=${1%%\?*}; echo "${u##*/}"; }
+with_db() { local u=$1 d=$2 q=""; case "$u" in *\?*) q="?${u#*\?}"; u=${u%%\?*};; esac; echo "${u%/*}/$d$q"; }
+own_db() {
+  local u; u=$(main_url); [ -n "$u" ] || return 1
+  case "$u" in *@localhost[:/]*|*@127.0.0.1[:/]*) ;; *) return 1;; esac
+  command -v pg_dump >/dev/null || return 1
+  local src; src=$(db_of "$u"); local dst; dst="${src}_wt_$(echo "$name" | tr -c 'a-zA-Z0-9\n' '_' | tr 'A-Z' 'a-z')"
+  local admin; admin=$(with_db "$u" postgres)
+  psql "$admin" -q -c "drop database if exists \"$dst\" with (force)" >/dev/null 2>&1
+  createdb --maintenance-db="$admin" "$dst" 2>/dev/null || return 1
+  local clone; clone=$(with_db "$u" "$dst")
+  local failed="" source_tables clone_tables
+  local table_sql="select n.nspname, count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'p', 'f') and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' group by n.nspname order by n.nspname collate \"C\""
+  if ! pg_dump -Fc "$u" 2>/dev/null | pg_restore --exit-on-error -d "$clone" >/dev/null 2>&1; then
+    failed="dump/restore failed"
+  elif ! source_tables=$(psql "$u" -Atqc "$table_sql" 2>/dev/null) ||
+       ! clone_tables=$(psql "$clone" -Atqc "$table_sql" 2>/dev/null); then
+    failed="clone table counts could not be verified"
+  elif [ "$source_tables" != "$clone_tables" ]; then
+    failed="clone table counts differ from source"
+  fi
+  if [ -n "$failed" ]; then
+    psql "$admin" -q -c "drop database if exists \"$dst\" with (force)" >/dev/null 2>&1 || failed="$failed; clone cleanup failed"
+    db_warning=" ($failed)"; return 1
+  fi
+  # Real .env for the worktree: every URL naming the source database now names the clone.
+  rm -f "$wt/.env"
+  while IFS= read -r line; do
+    case "$line" in *://*/"$src"|*://*/"$src"\?*|*://*/"$src"\"|*://*/"$src"\"\?*)
+      k=${line%%=*}; v=${line#*=}; q=""; case "$v" in \"*\") q='"'; v=${v#\"}; v=${v%\"};; esac
+      echo "$k=$q$(with_db "$v" "$dst")$q";;
+    *) echo "$line";; esac
+  done <"$repo/.env" >"$wt/.env"
+  echo "$dst" >"$state/$name.db"; echo "database: $dst (clone of $src)"
+}
+drop_db() {
+  [ -f "$state/$name.db" ] || return 0; local u; u=$(main_url)
+  psql "$(with_db "$u" postgres)" -q -c "drop database if exists \"$(cat "$state/$name.db")\" with (force)" >/dev/null 2>&1 && echo "dropped database $(cat "$state/$name.db")"
+}
+running() { [ -f "$state/$name.pid" ] && kill -0 "$(cat "$state/$name.pid")" 2>/dev/null; }
+
+start() {
+  running && { echo "already running: http://localhost:$(cat "$state/$name.port")"; return; }
+  local a; a=$(detect_app); echo "$a" > "$state/$name.app"
+  [ -n "$port" ] || port=$( [ -f "$state/$name.port" ] && ! lsof -iTCP:"$(cat "$state/$name.port")" -sTCP:LISTEN >/dev/null 2>&1 && cat "$state/$name.port" || free_port )
+  echo "$port" > "$state/$name.port"
+  local log="$state/$name.log"
+  local envargs=()
+  if [ -f "$wt/.env" ]; then
+    envargs=(-e "$wt/.env")
+    # Auth libraries reject callbacks from another origin; point them at this port.
+    for v in BETTER_AUTH_URL NEXTAUTH_URL AUTH_URL; do
+      grep -q "^$v=" "$wt/.env" && envargs+=(-v "$v=http://localhost:$port")
+    done
+    # Many worktree servers share one local Postgres (100 connections): keep each pool small.
+    envargs+=(-v "DATABASE_POOL_MAX=${WT_DEV_POOL_MAX:-3}")
+  fi
+  local dotenv="$wt/node_modules/.bin/dotenv"
+  (
+    cd "$wt/$a"
+    if [ ${#envargs[@]} -gt 0 ] && [ -x "$dotenv" ]; then
+      nohup "$dotenv" "${envargs[@]}" -- npx next dev -p "$port" > "$log" 2>&1 &
+    else
+      nohup npx next dev -p "$port" > "$log" 2>&1 &
+    fi
+    echo $! > "$state/$name.pid"
+  )
+  for _ in $(seq 1 60); do grep -q 'Ready' "$log" 2>/dev/null && break; sleep 1; done
+  grep -q 'Ready' "$log" || { tail -5 "$log"; die "dev server not ready after 60s (log: $log)"; }
+  echo "ready: http://localhost:$port  (ui-shots --base http://localhost:$port)"
+}
+stop() {
+  if running; then
+    local pid; pid=$(cat "$state/$name.pid")
+    pkill -P "$pid" 2>/dev/null || true; kill "$pid" 2>/dev/null || true
+    echo "stopped $name"
+  else echo "$name not running"; fi
+  rm -f "$state/$name.pid"
+}
+
+case "$cmd" in
+  new)
+    [ -e "$wt" ] && die "$wt exists"
+    if [ -n "$branch" ]; then git -C "$repo" worktree add -q -b "$branch" "$wt" "$from"
+    else git -C "$repo" worktree add -q --detach "$wt" "$from"; fi
+    for f in "$repo"/.env "$repo"/.env.local "$repo"/apps/*/.env "$repo"/apps/*/.env.local; do
+      [ -f "$f" ] || continue; rel=${f#"$repo/"}; ln -s "$f" "$wt/$rel"
+    done
+    if [ "$shared_db" != 1 ] && [ -f "$repo/.env" ]; then own_db || echo "wt-dev: own database not created${db_warning:-}; using the shared one"; fi
+    if [ $install = 1 ]; then (cd "$wt" && pnpm install --frozen-lockfile --prefer-offline >/dev/null 2>&1) || die "pnpm install failed in $wt"; fi
+    echo "worktree: $wt ($(git -C "$wt" rev-parse --short HEAD)${branch:+, branch $branch})"
+    start;;
+  start) [ -d "$wt" ] || die "no worktree $name"; start;;
+  stop) stop;;
+  log) tail -n 40 "$state/$name.log";;
+  path) echo "$wt";;
+  rm)
+    stop
+    git -C "$repo" worktree remove "$wt" || die "worktree has changes; commit or move them first (not forced)"
+    drop_db || true
+    rm -f "$state/$name".*; echo "removed $wt";;
+  ls)
+    for d in "$root"/*/; do
+      [ -d "$d" ] || continue; name=$(basename "$d")
+      st=stopped; running && st="http://localhost:$(cat "$state/$name.port")"
+      echo "$name  $(git -C "$d" rev-parse --abbrev-ref HEAD)@$(git -C "$d" rev-parse --short HEAD)  $st  dirty:$(git -C "$d" status --porcelain | wc -l | tr -d ' ')  db:$(cat "$state/$name.db" 2>/dev/null || echo shared)"
+    done;;
+  *) sed -n '2,6p' "$0"; exit 1;;
+esac

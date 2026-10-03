@@ -1,0 +1,72 @@
+#!/bin/sh
+# ABOUTME: Lands one or more wt-dev worktrees as a merge train: stacks them in order, runs cheap
+# ABOUTME: local preflight, ONE full remote-ci check on the stack tip, then ff-merges and removes them.
+# Usage (inside the repo's main checkout): land <worktree>... [--keep]
+# Prints one line per step, then "LANDED <sha>" or "FAILED <step>". Run as one background command.
+# On a red stack tip, rerun with fewer worktrees (the failing step names the commit range).
+set -u
+keep=0; names=""
+for a in "$@"; do [ "$a" = "--keep" ] && keep=1 || names="$names $a"; done
+[ -n "$names" ] || { echo "usage: land <worktree>... [--keep]"; exit 2; }
+main=$(git rev-parse --show-toplevel) || exit 1
+base=$(git -C "$main" rev-parse --abbrev-ref HEAD)
+restore=""
+# On failure, put every stacked worktree back on its own original commit, so a failed
+# train never leaves one batch carrying another's commits.
+fail() {
+  for pair in $restore; do git -C "${pair%%=*}" reset -q --hard "${pair#*=}" 2>/dev/null; done
+  [ -n "$restore" ] && echo "restored worktrees to their original commits"
+  echo "FAILED $*"; exit 1
+}
+
+# 1. Stack: each worktree rebases onto the previous one's tip (the first onto the branch).
+onto=$base; last=""
+for name in $names; do
+  wt=$(wt-dev path "$name") || fail "no worktree $name"
+  [ -z "$(git -C "$wt" status --porcelain -- . ':!.reviews')" ] || fail "$name dirty (commit first)"
+  [ "$(git -C "$wt" rev-list --count "$base..HEAD")" -gt 0 ] || fail "$name has nothing to land"
+  restore="$restore $wt=$(git -C "$wt" rev-parse HEAD)"
+  git -C "$wt" rebase -q "$onto" >/dev/null 2>&1 || { git -C "$wt" rebase --abort 2>/dev/null; fail "$name conflicts onto $onto"; }
+  onto=$(git -C "$wt" rev-parse HEAD); last=$wt
+  echo "stacked $name"
+done
+wt=$last
+command -v migcheck >/dev/null && { migcheck "$wt" || fail "migration journal (renumber with a newer when)"; }
+
+# 2. Baseline once, on the tip.
+if [ -f "$wt/tools/check-file-size.mjs" ]; then
+  out=$(cd "$wt" && node tools/check-file-size.mjs --update 2>&1) || { printf "%s\n" "$out" | tail -8; fail "file-size ratchet"; }
+  git -C "$wt" diff --quiet -- tools/file-size-baseline.json ||
+    { git -C "$wt" commit -q -m "chore(tooling): lower file-size baseline" -- tools/file-size-baseline.json; echo "baseline lowered"; }
+fi
+
+# 3. Preflight: seconds-cheap guards that otherwise cost a full remote round.
+# A worktree made with --no-install has no prettier/eslint; install before the guards.
+if [ -f "$wt/pnpm-lock.yaml" ] && [ ! -d "$wt/node_modules" ]; then
+  (cd "$wt" && pnpm install --frozen-lockfile --prefer-offline >/dev/null 2>&1) || fail "pnpm install"
+  echo "installed deps"
+fi
+if [ -x "$main/tools/land-preflight.sh" ]; then
+  out=$(cd "$wt" && sh "$main/tools/land-preflight.sh" "$base" 2>&1) || { printf '%s\n' "$out" | tail -8; fail "preflight"; }
+  echo "preflight ok"
+fi
+
+# 4. One full check on the stack tip.
+sha=$(git -C "$wt" rev-parse --short HEAD); tries=0
+check=remote-ci
+if [ -f "$wt/package.json" ] && node -e 'const p = require(process.argv[1]); process.exit(typeof p.scripts?.["check:remote"] === "string" ? 0 : 1)' "$wt/package.json"; then check=pnpm; fi
+while :; do
+  if [ "$check" = pnpm ]; then out=$(cd "$wt" && pnpm -s check:remote --summary "$sha" 2>&1)
+  else out=$(cd "$wt" && remote-ci check --summary "$sha" 2>&1); fi
+  rc=$?
+  [ $rc -eq 75 ] || break
+  tries=$((tries + 1)); [ $tries -lt 120 ] || fail "runner busy for an hour"
+  sleep 30
+done
+[ $rc -eq 0 ] || { printf '%s\n' "$out" | grep -E "FAIL|Failed:|rror" | head -8; fail "check rc=$rc on $sha ($base..$sha)"; }
+echo "check green ($sha)"
+
+# 5. Merge and clean up.
+git -C "$main" merge -q --ff-only "$sha" 2>/dev/null || fail "ff-merge ($base moved; rerun land)"
+[ $keep -eq 1 ] || for name in $names; do wt-dev rm "$name" >/dev/null 2>&1; done
+echo "LANDED $sha on $base"

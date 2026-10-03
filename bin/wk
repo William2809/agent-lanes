@@ -1,0 +1,89 @@
+#!/bin/sh
+# ABOUTME: One-line worker launch: picks model/sandbox, optional wt-dev worktree, prepends the
+# ABOUTME: repo's standing header, keeps logs in a stable place so `batches wait/report NAME` finds them.
+# Usage (inside a repo): wk NAME [-w | -d WORKTREE] [-o "PATH ..."] [-m PRESET] [-f PROMPT_FILE]   (prompt on stdin otherwise)
+#   -w        run in wt-dev worktree NAME (created from the current branch if missing)
+#   -d WT     run in an existing wt-dev worktree WT (name or path), e.g. a second worker in a batch's worktree
+#   -m        a model preset from `ao-model ls` (default: build). Presets with a read-only sandbox are reviewers.
+#   header    ~/.claude/state/headers/<repo>.md, placeholders {{DIR}} {{URL}} {{BASE}} {{NAME}} {{LOGDIR}}; Astra gets a read-only line instead
+#   -r [MSG|-] resume NAME's codex session (MSG '-' = read it from stdin, use a quoted heredoc) (same model/sandbox/dir) after a capacity error or a cut-off run
+# Then: batches wait NAME… (background) · batches report NAME…
+set -eu
+# Scripts ship next to this file: <repo>/bin/wk -> <repo>/skills (no fixed install location).
+skills=$(cd "$(dirname "$(readlink -f "$0")")/../skills" && pwd)
+name=${1:?usage: wk NAME [-w] [-m model] [-f file] | wk NAME -r [msg]}; shift
+if [ "${1:-}" = "-r" ]; then
+  top=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  # Logs are named after the MAIN checkout, also when resuming from inside a linked worktree.
+  main=$(cd "$top" && cd "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/.." 2>/dev/null && pwd || echo "$top")
+  logs="$HOME/.claude/state/logs/$(basename "$main")"; log="$logs/$name.log"
+  [ -f "$log" ] || { echo "no log $log" >&2; exit 1; }
+  if [ -f "$log.pid" ] && { ps -p "$(cat "$log.pid")" -o command= 2>/dev/null | grep -q codex || kill -0 "$(cat "$log.pid")" 2>/dev/null; }; then echo "$name is still running" >&2; exit 1; fi
+  ! grep -q '^tokens used' "$log" && [ $(( $(date +%s) - $(stat -f %m "$log") )) -lt 180 ] && { echo "$name log was written <3 min ago; probably still running (check: batches)" >&2; exit 1; }
+  hv() { sed -n "1,20s/^$1: //p" "$log" | head -1; }
+  sid=$(hv "session id"); model=$(hv model); eff=$(hv "reasoning effort"); sb=$(hv sandbox); dir=$(hv workdir)
+  [ -n "$sid" ] && [ -d "$dir" ] || { echo "cannot read session id/workdir from $log" >&2; exit 1; }
+  [ "${2:-}" = "-" ] && set -- "$1" "$(cat)"  # MSG '-' = message on stdin (quoted heredoc); bare -r never reads stdin (it hung in background shells)
+  msg=${2:-"You were cut off (model capacity error). Continue the same task from where you stopped: check git status/diff in your directory, finish the remaining steps and checks, then give the final report in the requested format."}
+  old="$logs/$name.$(date +%m%d-%H%M).log"; mv "$log" "$old"
+  cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}; [ -f "$cfg" ] && . "$cfg"; codex=${CODEX_BIN:-$(command -v codex)}
+  (cd "$dir" || exit 1; nohup "$codex" exec resume --model "$model" -c "model_reasoning_effort=\"$eff\"" -c "sandbox_mode=\"$sb\"" \
+    --skip-git-repo-check "$sid" "$msg" </dev/null >"$log" 2>&1 &
+   echo $! >"$log.pid"; printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$!" "$log" "$dir" >>"$HOME/.claude/state/workers.tsv")
+  echo "resumed $name ($model $eff, $sid); previous log $old"; exit 0
+fi
+# Plan guard: no new launches near the Codex limit (overflow would spend credits). WK_FORCE=1 overrides.
+if command -v codex-limit >/dev/null && [ "${WK_FORCE:-0}" != 1 ]; then
+  pct=$(codex-limit --pct 2>/dev/null || echo 0)
+  [ "$pct" -lt "${WK_MAX_PCT:-100}" ] || { echo "wk: Codex plan at ${pct}% used; not launching (WK_FORCE=1 to override)" >&2; exit 1; }
+fi
+wt=0; m=${WK_DEFAULT_PRESET:-build}; file=""; into=""; own=""
+while [ $# -gt 0 ]; do case "$1" in -w) wt=1 ;; -m) m=$2; shift ;; -f) file=$2; shift ;; -d) into=$2; shift ;; -o) own=$2; shift ;; *) echo "bad arg $1" >&2; exit 2 ;; esac; shift; done
+preset=$(ao-model get "$m") || exit 2
+set -- $preset; model=$1 eff=$2 sb=$3
+top=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+# Inside a linked worktree, name logs/headers after the main checkout, not the worktree.
+main=$(cd "$top" && cd "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/.." 2>/dev/null && pwd || echo "$top"); repo=$(basename "$main")
+base=$(git -C "$top" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
+logs="$HOME/.claude/state/logs/$repo"; mkdir -p "$logs"; log="$logs/$name.log"
+if [ -f "$log.pid" ] && ps -p "$(cat "$log.pid")" -o command= 2>/dev/null | grep -q codex; then echo "$name is already running" >&2; exit 1; fi
+[ -f "$log" ] && mv "$log" "$logs/$name.$(date +%m%d-%H%M).log"
+dir=$top; url=""
+# File claims (merge queue): a new build worktree must claim the paths it will edit, and may not
+# overlap another live worktree's claim or its actual changes. A claim dies with its worktree.
+if [ $wt -eq 1 ] && [ -z "$own" ] && [ "${WK_FORCE:-0}" != 1 ]; then
+  echo "wk: -w needs -o \"PATH ...\" (dirs/files this batch owns, e.g. -o apps/web/modules/invoice); WK_FORCE=1 skips" >&2; exit 2; fi
+if [ -n "$own" ] && [ "${WK_FORCE:-0}" != 1 ]; then
+  self=$name; [ -n "$into" ] && self=$(basename "$(wt-dev path "$into" 2>/dev/null || echo "$into")")
+  hit=$(cd "$main" && MQ_SELF=$self mq who $own) || { printf '%s\n' "$hit" >&2; echo "wk: not launching $name: paths owned elsewhere. Join that batch (-d WT) or wait for it to land (WK_FORCE=1 overrides)" >&2; exit 1; }
+fi
+if [ $wt -eq 1 ]; then
+  [ "$sb" = read-only ] && { echo "-w needs a build preset (read-only presets are reviewers: use -d WT)" >&2; exit 2; }
+  [ -d "$(wt-dev path "$name" 2>/dev/null)" ] || (cd "$top" && wt-dev new "$name" --from "$base" >/dev/null) || { echo "wt-dev new $name failed" >&2; exit 1; }
+  dir=$(wt-dev path "$name"); u=$(wt-dev ls 2>/dev/null | awk -v n="$name" '$1==n {print $3}'); [ -n "$u" ] && url=" (dev server $u)"
+elif [ -n "$into" ]; then
+  dir=$(wt-dev path "$into" 2>/dev/null || true); [ -d "$dir" ] || dir=$into; [ -d "$dir" ] || { echo "no worktree $into" >&2; exit 1; }
+  # One writer per worktree: workers commit everything in it (wtcommit), so a second writer could commit the first one's edits.
+  if [ "$sb" != read-only ] && [ "${WK_FORCE:-0}" != 1 ]; then
+    busy=$(awk -F'\t' -v d="$dir" '$4==d {print $2"\t"$3}' "$HOME/.claude/state/workers.tsv" 2>/dev/null | while IFS="$(printf '\t')" read -r pid lg; do
+      ps -p "$pid" -o command= 2>/dev/null | grep -q codex && grep -q '^sandbox: .*full\|^sandbox: danger\|^sandbox: workspace' "$lg" 2>/dev/null && basename "$lg" .log; done | head -1)
+    [ -z "$busy" ] || { echo "wk: $busy is already writing in $into; one writer per worktree (wait for it to finish with batches wait $busy, then send the task with wk $busy -r -, or use a new -w worktree). WK_FORCE=1 overrides" >&2; exit 1; }
+  fi
+  n=$(basename "$dir"); u=$(wt-dev ls 2>/dev/null | awk -v n="$n" '$1==n {print $3}'); [ -n "$u" ] && url=" (dev server $u)"
+fi
+[ -n "$own" ] && (cd "$main" && mq claim "$(basename "$dir")" $own)
+body=$( [ -n "$file" ] && cat "$file" || cat ); [ -n "$body" ] || { echo "empty prompt" >&2; exit 2; }
+p="$logs/$name.prompt"
+# Workers commit only inside their own wt-dev worktree; in the main checkout they leave edits for the lead.
+if [ "$dir" != "$main" ] && wt-dev ls 2>/dev/null | awk -v n="$(basename "$dir")" '$1==n{f=1} END{exit !f}'; then
+  git='Commit your finished, checked work in this worktree with `wtcommit "type(scope): message"` (explicit paths; one commit per logical change). Never push, reset, stash, force or touch other branches'
+else git='Never change git state (no stage/commit/checkout/reset/stash/push); leave edits uncommitted for the lead'; fi
+if [ "$sb" = read-only ]; then hdr="Read-only work on the repo at the current directory: do not edit anything. English. Never print secrets. Be terse: ranked findings with file:line, no preamble or restating the task."
+elif [ -f "$HOME/.claude/state/headers/$repo.md" ]; then hdr=$(sed -e "s#{{DIR}}#$dir#g" -e "s#{{URL}}#$url#g" -e "s#{{BASE}}#$base#g" -e "s#{{NAME}}#$name#g" -e "s#{{LOGDIR}}#$logs#g" -e "s#{{GIT}}#$git#g" "$HOME/.claude/state/headers/$repo.md")
+else hdr="Working directory: $dir$url. English. Never print secrets. $git."; fi
+printf '%s\n%s\n' "$hdr" "$body" >"$p"
+sh "$skills/agent-workers/scripts/run-worker.sh" "$model" "$eff" "$sb" "$dir" "$p" "$log" >/dev/null || { echo "wk: launch of $name FAILED (run-worker refused; see above)" >&2; exit 1; }
+where=""; [ "$dir" = "$main" ] && [ "$sb" != "read-only" ] && where=" — MAIN CHECKOUT (edits land on the branch; use -w for a worktree)"
+echo "started $name: $model $eff${url:+ @$name$url}$where"
+# Unlanded worktrees touching the same files conflict at land: say so now, not later.
+(cd "$main" 2>/dev/null && sh "$skills/agent-workers/scripts/batches.sh" overlap) || true
