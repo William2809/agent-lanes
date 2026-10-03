@@ -51,14 +51,25 @@ case "$cmd" in
         [ "$s" = bounced ] && [ -n "$k" ] && x=$(printf '%s\n' "$b" | awk -v k="$k" '$1==k {$1=""; print; exit}')
         echo "$w  $s  $n  $k${x:+ ($(echo $x))}"; done <"$q"; else echo "queue empty"; fi
     for f in "$st"/claims/*; do [ -f "$f" ] || continue; alive "${f##*/}" || { mv "$f" "$st/claims/.released.${f##*/}"; continue; }
-      echo "claim ${f##*/}: $(tr '\n' ' ' <"$f")"; done; [ -f "$st/run.pid" ] && kill -0 "$(cat "$st/run.pid")" 2>/dev/null && echo "runner pid $(cat "$st/run.pid")"; exit 0 ;;
+      echo "claim ${f##*/}: $(tr '\n' ' ' <"$f")"; done
+    pid=$(cat "$st/run.lock/pid" 2>/dev/null || cat "$st/run.pid" 2>/dev/null || true)
+    case "$pid" in ''|*[!0-9]*|0) ;; *) kill -0 "$pid" 2>/dev/null && echo "runner pid $pid" ;; esac; exit 0 ;;
   run) ;;
   *) sed -n '4,10p' "$MQ_COPY"; exit 2 ;;
 esac
 
-# --- run: one runner per repo (pid file, liveness-checked so a dead runner never wedges the queue).
-if [ -f "$st/run.pid" ] && kill -0 "$(cat "$st/run.pid")" 2>/dev/null; then echo "mq: runner already active (pid $(cat "$st/run.pid")); mq add is enough"; exit 0; fi
-echo $$ >"$st/run.pid"; trap 'rm -f "$st/run.pid"' EXIT
+# --- run: one runner per repo. mkdir is atomic, so only one starter gets the lock; a lock whose
+# pid is dead (or still empty after 10 s) is stale and taken over.
+lock="$st/run.lock"
+pid_live() { case "$1" in ''|*[!0-9]*|0) return 1 ;; esac; kill -0 "$1" 2>/dev/null; }
+if ! mkdir "$lock" 2>/dev/null; then
+  pid=$(cat "$lock/pid" 2>/dev/null || true)
+  if pid_live "$pid" || { [ -z "$pid" ] && [ $(( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || echo 0) )) -lt 10 ]; }; then
+    echo "mq: runner already active (pid ${pid:-starting}); mq add is enough"; exit 0; fi
+  mv "$lock" "$lock.stale.$$" 2>/dev/null && rm -r "$lock.stale.$$"
+  mkdir "$lock" 2>/dev/null || { echo "mq: another runner just started; mq add is enough"; exit 0; }
+fi
+echo $$ >"$lock/pid"; trap 'rm -r "$lock"' EXIT; trap 'exit 1' HUP INT TERM
 cd "$main" || exit 1
 landed=0
 while :; do

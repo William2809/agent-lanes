@@ -41,13 +41,17 @@ main_url() { grep -E '^DATABASE_URL=' "$repo/.env" 2>/dev/null | head -1 | cut -
 db_of() { local u=${1%%\?*}; echo "${u##*/}"; }
 with_db() { local u=$1 d=$2 q=""; case "$u" in *\?*) q="?${u#*\?}"; u=${u%%\?*};; esac; echo "${u%/*}/$d$q"; }
 own_db() {
-  local u; u=$(main_url); [ -n "$u" ] || return 1
-  case "$u" in *@localhost[:/]*|*@127.0.0.1[:/]*) ;; *) return 1;; esac
-  command -v pg_dump >/dev/null || return 1
+  local u; u=$(main_url) || true
+  [ -n "$u" ] || { db_warning=" (no DATABASE_URL in .env)"; return 1; }
+  case "$u" in *@localhost[:/]*|*@127.0.0.1[:/]*) ;; *) db_warning=" (DATABASE_URL is not on localhost)"; return 1;; esac
+  local tool
+  for tool in pg_dump psql createdb pg_restore; do
+    command -v "$tool" >/dev/null || { db_warning=" ($tool missing)"; return 1; }
+  done
   local src; src=$(db_of "$u"); local dst; dst="${src}_wt_$(echo "$name" | tr -c 'a-zA-Z0-9\n' '_' | tr 'A-Z' 'a-z')"
   local admin; admin=$(with_db "$u" postgres)
   psql "$admin" -q -c "drop database if exists \"$dst\" with (force)" >/dev/null 2>&1
-  createdb --maintenance-db="$admin" "$dst" 2>/dev/null || return 1
+  createdb --maintenance-db="$admin" "$dst" 2>/dev/null || { db_warning=" (createdb failed)"; return 1; }
   local clone; clone=$(with_db "$u" "$dst")
   local failed="" source_tables clone_tables
   local table_sql="select n.nspname, count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'p', 'f') and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' group by n.nspname order by n.nspname collate \"C\""
@@ -64,7 +68,7 @@ own_db() {
     db_warning=" ($failed)"; return 1
   fi
   # Real .env for the worktree: every URL naming the source database now names the clone.
-  rm -f "$wt/.env"
+  rm -f "$wt/.env"  # the symlink to the main .env
   while IFS= read -r line; do
     case "$line" in *://*/"$src"|*://*/"$src"\?*|*://*/"$src"\"|*://*/"$src"\"\?*)
       k=${line%%=*}; v=${line#*=}; q=""; case "$v" in \"*\") q='"'; v=${v#\"}; v=${v%\"};; esac
@@ -126,7 +130,7 @@ case "$cmd" in
     for f in "$repo"/.env "$repo"/.env.local "$repo"/apps/*/.env "$repo"/apps/*/.env.local; do
       [ -f "$f" ] || continue; rel=${f#"$repo/"}; ln -s "$f" "$wt/$rel"
     done
-    if [ "$shared_db" != 1 ] && [ -f "$repo/.env" ]; then own_db || echo "wt-dev: own database not created${db_warning:-}; using the shared one"; fi
+    if [ "$shared_db" != 1 ]; then own_db || echo "wt-dev: own database not created${db_warning:-}; using the shared one"; fi
     if [ $install = 1 ]; then (cd "$wt" && pnpm install --frozen-lockfile --prefer-offline >/dev/null 2>&1) || die "pnpm install failed in $wt"; fi
     echo "worktree: $wt ($(git -C "$wt" rev-parse --short HEAD)${branch:+, branch $branch})"
     start;;
@@ -136,6 +140,8 @@ case "$cmd" in
   path) echo "$wt";;
   rm)
     stop
+    if [ ! -d "$wt" ]; then  # already gone: clean leftovers, say so plainly
+      git -C "$repo" worktree prune; drop_db || true; rm -f "$state/$name".*; die "no worktree $name (not found; leftover state cleaned)"; fi
     git -C "$repo" worktree remove "$wt" || die "worktree has changes; commit or move them first (not forced)"
     drop_db || true
     rm -f "$state/$name".*; echo "removed $wt";;

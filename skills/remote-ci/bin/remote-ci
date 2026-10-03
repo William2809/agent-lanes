@@ -53,6 +53,7 @@ elif [ -n "${REMOTE_CI_HOST:-}" ] && ssh "${base[@]}" "$REMOTE_CI_HOST" true 2>/
   git_ssh="ssh ${base[*]}"
   route="ssh $REMOTE_CI_HOST"
 else
+  [ "$cmd" != info ] || echo "direct=${router:-unset} alias=${REMOTE_CI_HOSTKEY_ALIAS:-unset} ssh=${REMOTE_CI_HOST:-unset} unreachable"
   echo "remote-ci: runner unreachable" >&2
   exit 3
 fi

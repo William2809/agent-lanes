@@ -35,7 +35,7 @@ More detail and the reasoning: [docs/concepts.md](docs/concepts.md).
 - macOS with `git`, Node.js with `pnpm`, and `python3`.
 - A Next.js app in the repo (`apps/web`, `web` or the root; `--app` for another folder) for `wt-dev`'s per-lane dev server. The app's `.env` is loaded through the project's `dotenv` CLI (`dotenv-cli` as a dev dependency), which is also what points a lane at its own database.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for the lead and the [Codex CLI](https://github.com/openai/codex), logged in, for workers.
-- For a database copy per lane: a local PostgreSQL with `psql`, `createdb`, `pg_dump` and `pg_restore` on your PATH, and a `DATABASE_URL` on `localhost` in the repo's root `.env`. Without them, lanes share the database.
+- For a database copy per lane: a local PostgreSQL with `psql`, `createdb`, `pg_dump` and `pg_restore` on your PATH, and a `DATABASE_URL` on `localhost` in the repo's root `.env`. Without them, lanes share the database and `wt-dev new` reports why the copy was skipped.
 - For screenshots (`ui-shots`, `wt-compare`): Playwright installed in the project.
 - Optional: a second Apple Silicon Mac with Homebrew that you can SSH into, as the check runner (see [Example setup](#example-setup-a-macbook-and-a-mac-mini)).
 
@@ -91,18 +91,19 @@ mq run                             # one runner per repo; run it in the backgrou
 mq ls                              # queue, claims, bounced lanes and their workers
 ```
 
-`mq` lands one lane at a time: rebase, preflight, full check, fast-forward, then removes the worktree, its dev server and its database copy. A conflict or red check goes back to the lane's worker with the error, and the lane rejoins the queue when the worker finishes with everything committed (uncommitted leftovers park it). After two failed fixes the lane is parked for you (`mq drop NAME` to remove it from the queue). Start `mq run` once; a second runner started at the same moment is not locked out.
+`mq` lands one lane at a time: rebase, preflight, full check, fast-forward, then removes the worktree, its dev server and its database copy. A conflict or red check goes back to the lane's worker with the error, and the lane rejoins the queue when the worker finishes with everything committed (uncommitted leftovers park it). After two failed fixes the lane is parked for you (`mq drop NAME` to remove it from the queue). Start `mq run` once; an atomic lock refuses concurrent runners and allows takeover of a dead runner’s lock.
 
 ### 6. Pause, resume and usage limits
 
 ```sh
-batches pause            # stop the running workers (or name them); stalled ones are left alone
+batches pause            # stop running workers (or name them)
+batches pause --stalled NAME  # also allow stopping a STALLED worker
 batches resume           # continue them where they stopped
 codex-limit              # Codex plan usage and reset time
 codex-watch 95 &         # pause running workers automatically at 95% usage
 ```
 
-`wk` refuses new launches when usage reaches `WK_MAX_PCT` (default 100). A worker cut off by a provider error continues with `wk NAME -r`.
+`wk` refuses new launches when usage reaches `WK_MAX_PCT` (default 100). Expired usage windows count as 0%; unknown usage allows a launch. A worker cut off by a provider error continues with `wk NAME -r`.
 
 ### 7. Change models
 
@@ -114,10 +115,10 @@ Presets are the only place model names live. `ao-model ls` shows them; override 
 |---|---|
 | `wk: … claimed by …` | Another lane owns those paths. Give the task to that lane's worker when it finishes (`wk NAME -r -`), or wait for it to land. `WK_FORCE=1` overrides. |
 | A worker shows `DIED` in `batches` | `batches report NAME`, then `wk NAME -r` to continue or `batches ack NAME` to hide it. |
-| A worker shows `STALLED` | Its log has been quiet for a while but the process lives. Check `batches report NAME`; stop it (`batches pause NAME` does not touch stalled workers, so `kill` its pid from `NAME.log.pid` in the log folder) before `wk NAME -r`. |
+| A worker shows `STALLED` | Its log has been quiet for a while but the process lives. Check `batches report NAME`; stop it with `batches pause --stalled NAME` before `wk NAME -r`. `batches ack NAME` hides it from the default listing while leaving the process alive. |
 | `mq` says `PARKED` | Read `mq ls` and the lane's last report; fix it in the worktree, `wtcommit`, then `mq add NAME` again. |
-| `remote-ci` exits 3 | The runner is unreachable (check the cable, network or VPN and `~/.config/agent-lanes/config`). `land` and `mq` treat this as a failed check; only the pre-push hook falls back to a local run. |
-| `wt-dev: own database not created…` | The lane uses the shared database. When the copy failed the message says why (restore failed, table counts differ); otherwise the URL is not on localhost or the Postgres tools are missing. |
+| `remote-ci` exits 3 | The runner is unreachable. `remote-ci info` still shows configured direct/alias and SSH routes; check the cable, network or VPN and `~/.config/agent-lanes/config`. `land` and `mq` treat this as a failed check; only the pre-push hook falls back to a local run. |
+| `wt-dev: own database not created…` | The lane uses the shared database. The message gives the reason: missing `DATABASE_URL` in `.env`, a URL away from localhost, missing Postgres tools, `createdb` failure, dump/restore failure or unverifiable/different table counts. |
 
 ## Example setup: a MacBook and a Mac mini
 
@@ -159,7 +160,7 @@ Host mac-mini
 REMOTE_CI_HOST=mac-mini              # fallback route; the Thunderbolt bridge is tried first
 ```
 
-Then once per project: `remote-ci init` (adds `.remote-ci.conf` and a pre-push hook) and `remote-ci setup` (prepares the Mac mini). `remote-ci info` prints the route it will use.
+Then once per project: `remote-ci init` (adds `.remote-ci.conf` and a pre-push hook) and `remote-ci setup` (prepares the Mac mini). `remote-ci info` prints the selected route, or the configured routes and `unreachable` with exit 3.
 
 **A morning with this setup.** You ask the lead to fix an invoice total bug and redesign the settings page.
 

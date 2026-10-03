@@ -3,9 +3,9 @@
 # ABOUTME: and wt-dev worktrees with work not yet merged. Finished items collapse to one count.
 # Usage: batches            only what needs attention (cheap to run often)
 #        batches --all      every worker of the last 24h
-#        batches pause [NAME…]  pause named workers (no names: all running)
+#        batches pause [--stalled] [NAME…]  pause running workers; --stalled includes STALLED
 #        batches resume [NAME…] resume named workers (no names: all paused)
-#        batches ack NAME…  mark a DIED worker/pipeline as handled (hidden afterwards)
+#        batches ack NAME…  mark a DIED/STALLED worker or pipeline as handled
 #        batches wait [NAME…] block until those workers exit (no names: until any running one exits), one "NAME finished" line each
 #                           (run as one background command for a notification)
 #        batches report NAME…  final report of finished workers (report.sh on their logs)
@@ -23,9 +23,10 @@ if [ "${1:-}" = "ack" ]; then shift; for n in "$@"; do echo "$n" >>"$acked"; don
 row() { awk -F'\t' -v n="$1" '{b=$3; sub(/.*\//,"",b); sub(/\.log$/,"",b)} b==n {r=$2"\t"$3} END {if (r) print r}' "$reg"; }
 case "${1:-}" in
   pause) shift
+    stalled=0; [ "${1:-}" = --stalled ] && { stalled=1; shift; }
     [ -s "$reg" ] || exit 0
-    # Only workers the status listing calls running: an old registry pid may now belong to another process.
-    live=$("$0" 2>/dev/null | awk '$2=="running"{print $1}')
+    # --all keeps acknowledged STALLED workers available for an explicit pause.
+    live=$("$0" --all 2>/dev/null | awk -v stalled="$stalled" '$2=="running" || (stalled && $2=="STALLED"){print $1}')
     [ $# -eq 0 ] && set -- $live
     for n in "$@"; do
       printf '%s\n' "$live" | grep -qx "$n" || { echo "$n is not running" >&2; continue; }
@@ -111,7 +112,9 @@ is_acked() { grep -qx "$1" "$acked"; }
     mt=$(stat -f %m "$log" 2>/dev/null || echo "$start")
     if is_paused "$name"; then st="paused (batches resume $name)"
     elif alive "$pid" "$log"; then
-      if [ $((now - mt)) -gt $((stall * 60)) ]; then st="STALLED log quiet $(age "$mt")"; echo 1 >"$flag"
+      if [ $((now - mt)) -gt $((stall * 60)) ]; then
+        is_acked "$name" && [ $all -eq 0 ] && continue
+        st="STALLED log quiet $(age "$mt")"; is_acked "$name" || echo 1 >"$flag"
       else st="running $(age "$start")"; fi
     elif tail -5 "$log" 2>/dev/null | grep -q '^ERROR:' && ! is_acked "$name"; then
       st="ERRORED ($(tail -5 "$log" | grep '^ERROR:' | tail -1 | cut -c8-60)) -> wk $name -r"; echo 1 >"$flag"

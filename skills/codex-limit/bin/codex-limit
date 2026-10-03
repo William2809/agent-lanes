@@ -27,16 +27,21 @@ for f in files:
         rl = find(o) or rl
     if rl: break
 else:
-    print("codex-limit: no rate_limits event in recent sessions"); sys.exit(1)
+    if "--pct" not in sys.argv: print("codex usage unknown")
+    sys.exit(1)
+now = time.time()
+def used(w):
+    reset = w.get("resets_at")
+    return 0 if reset is not None and reset <= now else w.get("used_percent", 0)
 if "--pct" in sys.argv:
-    print(int(max((rl.get(k) or {}).get("used_percent", 0) for k in ("primary", "secondary")))); sys.exit(0)
+    print(int(max(used(rl.get(k) or {}) for k in ("primary", "secondary")))); sys.exit(0)
 out = []
 for k in ("primary", "secondary"):
     w = rl.get(k)
     if not w: continue
     name = {300: "5h", 10080: "weekly"}.get(w["window_minutes"], f'{w["window_minutes"]}m')
-    out.append(f'{w["used_percent"]:.0f}% used ({name}), resets {time.strftime("%a %d %b %H:%M", time.localtime(w["resets_at"]))}')
+    out.append(f'{used(w):.0f}% used ({name}), resets {time.strftime("%a %d %b %H:%M", time.localtime(w["resets_at"]))}')
 c = rl.get("credits") or {}
 age = int((time.time() - os.path.getmtime(f)) / 60)
 print("codex " + "; ".join(out) + (f', credits {c.get("balance")}' if c.get("has_credits") else "")
-      + (" LIMIT REACHED" if rl.get("rate_limit_reached_type") else "") + f" (as of {age} min ago)")
+      + (" LIMIT REACHED" if rl.get("rate_limit_reached_type") and any(used(rl.get(k) or {}) >= 100 for k in ("primary", "secondary")) else "") + f" (as of {age} min ago)")

@@ -18,7 +18,12 @@ if [ "${1:-}" = "-r" ]; then
   main=$(cd "$top" && cd "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/.." 2>/dev/null && pwd || echo "$top")
   logs="$HOME/.claude/state/logs/$(basename "$main")"; log="$logs/$name.log"
   [ -f "$log" ] || { echo "no log $log" >&2; exit 1; }
-  if [ -f "$log.pid" ] && { ps -p "$(cat "$log.pid")" -o command= 2>/dev/null | grep -q codex || kill -0 "$(cat "$log.pid")" 2>/dev/null; }; then echo "$name is still running" >&2; exit 1; fi
+  if [ -f "$log.pid" ] && { ps -p "$(cat "$log.pid")" -o command= 2>/dev/null | grep -q codex || kill -0 "$(cat "$log.pid")" 2>/dev/null; }; then
+    if batches --all 2>/dev/null | awk -v n="$name" '$1==n && $2=="STALLED" {f=1} END {exit !f}'; then
+      echo "$name is still running (STALLED; stop it with batches pause --stalled $name before resuming)" >&2
+    else echo "$name is still running" >&2; fi
+    exit 1
+  fi
   # A worker stopped by `batches pause` is known dead (pid checked above): skip the recent-log guard.
   paused=$(awk -F'\t' -v n="$name" '$1==n {f=1} END {print f+0}' "$HOME/.claude/state/paused-workers.tsv" 2>/dev/null || echo 0)
   [ "$paused" != 1 ] && ! grep -q '^tokens used' "$log" && [ $(( $(date +%s) - $(stat -f %m "$log") )) -lt 180 ] && { echo "$name log was written <3 min ago; probably still running (check: batches)" >&2; exit 1; }
@@ -36,8 +41,10 @@ if [ "${1:-}" = "-r" ]; then
 fi
 # Plan guard: no new launches near the Codex limit (overflow would spend credits). WK_FORCE=1 overrides.
 if command -v codex-limit >/dev/null && [ "${WK_FORCE:-0}" != 1 ]; then
-  pct=$(codex-limit --pct 2>/dev/null || echo 0)
-  [ "$pct" -lt "${WK_MAX_PCT:-100}" ] || { echo "wk: Codex plan at ${pct}% used; not launching (WK_FORCE=1 to override)" >&2; exit 1; }
+  pct=$(codex-limit --pct 2>/dev/null) || pct=""
+  case "$pct" in ''|*[!0-9]*) ;; *)
+    [ "$pct" -lt "${WK_MAX_PCT:-100}" ] || { echo "wk: Codex plan at ${pct}% used; not launching (WK_FORCE=1 to override)" >&2; exit 1; } ;;
+  esac
 fi
 wt=0; m=${WK_DEFAULT_PRESET:-build}; file=""; into=""; own=""
 while [ $# -gt 0 ]; do case "$1" in -w) wt=1 ;; -m) m=$2; shift ;; -f) file=$2; shift ;; -d) into=$2; shift ;; -o) own=$2; shift ;; *) echo "bad arg $1" >&2; exit 2 ;; esac; shift; done
