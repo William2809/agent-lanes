@@ -1,0 +1,18 @@
+---
+name: loop-stats
+description: Report daily worker time buckets, rebuild rounds, merge queue timing, feature lead time, and trends from local agent telemetry without exposing transcript content.
+---
+
+Run `loop-stats` from a repository, or `loop-stats --repo NAME --day YYYY-MM-DD --days 7`. Defaults are the current repository, today's local calendar date, and a seven-day trend ending on that day. `--json` includes all daily metrics, feature rows, sample counts, and definitions. Text stays within 30 lines; feature/rebuild entries share one line each.
+
+Read-only inputs: `~/.claude/state/workers.tsv`, worker log headers (including archived logs and deleted worktrees identified by repository-name ancestry), `~/.codex/sessions/**/*.jsonl`, `worker-tags.tsv`, `mq/<repo>/events`, and the repository's current branch reflog. Missing evidence prints `no data`; numeric trends use 0 for empty counts/hours and -1 for missing medians. Never print prompts, transcript outputs, commands, arguments, paths, environment values, or credentials. Only metrics and validated/opaque repository and feature identifiers are emitted.
+
+Definitions retain the timebudget measurement method: each ledger row is a launch/resume; match log session IDs to task starts within 180 seconds, with equal-cwd/60-second fallback marked as an estimate. Finish is the first task completion before the next turn/cutoff. Unmatched and incomplete runs contribute run/tag counts, not time. No logfile mtime fallback. Daily time totals contain entire completed runs launched that day, including startup, and sum overlapping workers. Deduplicate command item IDs; duration is secs+nanos; infer start from end minus duration. Pair tools by call ID. Allocate interval unions, let commands override wrappers, and split mixed families equally (estimate). Model/gaps includes idle, scheduling, and missing telemetry; it is an upper-bound proxy, not inference latency.
+
+Buckets: model/gaps, typecheck, targeted tests, full check including observed slot retry waits, lint/preflight, install/build/dev-server, browser automation, and other. Browser executions include playwright, pw-run, ui-shots, agent-browser, executable node browser code, and browser/node REPL tools; opaque scripts can remain other. Reads and heredoc file writes do not classify as executions. Locator timeouts count completed browser-command/tool output markers once per deduplicated item/call; this is a lower bound.
+
+Tags attach to the nearest unused same-repo/name launch within 180 seconds; untagged resumes remain untagged. Rebuild rounds count only `rework` launches per feature. Queue counts show distinct lanes; JSON also gives event counts. Queue wait is queued/requeued→landing; land time is landing→landed. Pairs can cross midnight; attribute them to the ending day. Bounce/park/drop close the attempt. Duplicate queued events keep the original enqueue time; requeue starts a new attempt.
+
+Feature lead time is an estimate from the first recorded launch tagged with that feature to its last linked landing that day. Reflog merges supply landing epochs; mq landed events attach lanes/hashes and fill missing reflog entries. Link the latest completed worker by lane/worktree identity or exact commit hash. Missing tags or linkage stay explicit; do not invent features or assume zero queue delay. Earlier launch/tag history may be incomplete.
+
+Test: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s skills/loop-stats -p 'test_*.py'`.
