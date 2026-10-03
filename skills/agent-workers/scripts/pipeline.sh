@@ -32,7 +32,7 @@ verify() {
 run "$bmodel" "$effort" full-access "$dir" "$brief" "$out.build.log"
 
 cat > "$out.review.md" <<REV
-READ-ONLY code review. Repo: $dir. Don't edit files or run state-changing git. Read AGENTS.md and docs/engineering/coding-standards.md (including Testing) first.
+READ-ONLY code review. Repo: $dir. Don't edit files or run state-changing git. Read AGENTS.md (or CLAUDE.md) and the coding and testing rules it points to first.
 Read-only git commands and remote-ci (which uses git internally) are allowed; never stage, commit, checkout, reset, or push.
 The remote check runner is not reachable from your sandbox; don't try remote-ci. Rely on the build report and the lead's verify step.
 

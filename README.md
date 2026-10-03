@@ -28,23 +28,96 @@ Getting agents to write code is the easy part. With many parallel workers, the s
 
 More detail and the reasoning: [docs/concepts.md](docs/concepts.md).
 
-## Install
+## How-to guide
+
+### 1. Prerequisites
+
+- macOS with `git`, Node.js with `pnpm`, and `python3`.
+- A Next.js app in the repo (`apps/web`, `web` or the root; `--app` for another folder) for `wt-dev`'s per-lane dev server. The app's `.env` is loaded through the project's `dotenv` CLI (`dotenv-cli` as a dev dependency), which is also what points a lane at its own database.
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for the lead and the [Codex CLI](https://github.com/openai/codex), logged in, for workers.
+- For a database copy per lane: a local PostgreSQL with `psql`, `createdb`, `pg_dump` and `pg_restore` on your PATH, and a `DATABASE_URL` on `localhost` in the repo's root `.env`. Without them, lanes share the database.
+- For screenshots (`ui-shots`, `wt-compare`): Playwright installed in the project.
+- Optional: a second Apple Silicon Mac with Homebrew that you can SSH into, as the check runner (see [Example setup](#example-setup-a-macbook-and-a-mac-mini)).
+
+### 2. Install
 
 ```sh
 git clone https://github.com/<you>/agent-lanes && cd agent-lanes && ./install.sh
 ```
 
-This links the tools into `~/.local/bin` and the skills into `~/.claude/skills`, and creates `~/.config/agent-lanes/{config,models.conf}` from the examples. Edit those two files for your machine; they are never committed.
+This links the tools into `~/.local/bin` and the skills into `~/.claude/skills` (change with `BIN_DIR` / `SKILLS_DIR`). It also creates `~/.config/agent-lanes/config` and `~/.config/agent-lanes/models.conf` from the examples. Edit those for your machine; they are never committed. Re-running is safe.
 
-## A typical round
+Check it: `ao-model ls` prints the model presets, and `batches` runs without errors (empty at first).
+
+### 3. Set up a project
+
+Inside your repository:
+
+1. **Worker header** (rules every build worker gets; read-only reviewers get a short built-in one): `mkdir -p ~/.claude/state/headers`, then copy [templates/worker-header.example.md](templates/worker-header.example.md) to `~/.claude/state/headers/<repo-folder-name>.md` and adapt it: risk tiers, which tests to run, report format. `wk` fills in `{{DIR}}`, `{{URL}}`, `{{BASE}}`, `{{NAME}}`, `{{LOGDIR}}` and `{{GIT}}`.
+2. **Full check** that `land` and `mq` run before merging, one of:
+   - a runner machine: `remote-ci init` (adds `.remote-ci.conf` and a pre-push hook), edit the check command in `.remote-ci.conf`, **commit it** (lanes are made from the branch, so they need it), then `remote-ci setup`;
+   - your own `check:remote` script in `package.json` (it gets `--summary <sha>` as arguments);
+   - no runner: `export LAND_CHECK="pnpm test"` (any command; it runs in the lane's worktree).
+3. **Optional:** an executable `tools/land-preflight.sh` (`chmod +x`) in the repo for cheap checks (format, lint, size limits) that run before the full check.
+4. **Tell the lead.** Add a line to the project's `CLAUDE.md` or `AGENTS.md`: "Delegate bounded tasks with `wk` (see the agent-workers skill); land with `mq`."
+
+### 4. Run a lane
+
+Write a brief (`brief.md`): the task, the files involved, how to check it and what "done" means. Then:
 
 ```sh
-wk invoice-fix -w -o apps/web/modules/invoice -m build-hard < brief.md   # new lane + worker
-batches wait invoice-fix                                                 # run in the background
-batches report invoice-fix                                               # short report
-mq add invoice-fix && mq run                                             # land it (one runner per repo)
-mq ls                                                                    # queue, claims, bounced workers
+wk invoice-fix -w -o "apps/web/invoice" -m build-hard -f brief.md
 ```
+
+- `-w` creates the worktree `invoice-fix` with its own dev server and database copy (`wt-dev ls` shows the port).
+- `-o` claims the paths the worker will edit. A later lane that overlaps them is refused; give that task to the lane's worker after it finishes (`wk NAME -r -` with the new task on stdin), or wait until the lane lands.
+- `-m` picks a preset (`ao-model ls`). Reviewers use a read-only preset and can join any lane: `wk invoice-review -d invoice-fix -m review -f review.md`.
+
+Then follow it:
+
+```sh
+batches                       # running/failed workers of the last 24 h, and this repo's lanes (--all: also finished)
+batches wait invoice-fix      # blocks until it finishes (run it in the background)
+batches report invoice-fix    # the worker's short final report
+```
+
+Workers commit their own work inside the lane with `wtcommit`. Look at the diff (`git -C "$(wt-dev path invoice-fix)" log -p`) and screenshots before landing.
+
+### 5. Land with the merge queue
+
+```sh
+mq add invoice-fix settings-page   # queue finished lanes (they must have no uncommitted work)
+mq run                             # one runner per repo; run it in the background
+mq ls                              # queue, claims, bounced lanes and their workers
+```
+
+`mq` lands one lane at a time: rebase, preflight, full check, fast-forward, then removes the worktree, its dev server and its database copy. A conflict or red check goes back to the lane's worker with the error, and the lane rejoins the queue when the worker finishes with everything committed (uncommitted leftovers park it). After two failed fixes the lane is parked for you (`mq drop NAME` to remove it from the queue). Start `mq run` once; a second runner started at the same moment is not locked out.
+
+### 6. Pause, resume and usage limits
+
+```sh
+batches pause            # stop the running workers (or name them); stalled ones are left alone
+batches resume           # continue them where they stopped
+codex-limit              # Codex plan usage and reset time
+codex-watch 95 &         # pause running workers automatically at 95% usage
+```
+
+`wk` refuses new launches when usage reaches `WK_MAX_PCT` (default 100). A worker cut off by a provider error continues with `wk NAME -r`.
+
+### 7. Change models
+
+Presets are the only place model names live. `ao-model ls` shows them; override a role in `~/.config/agent-lanes/models.conf`, e.g. `build  <new-model>  medium  full-access  codex`. The [model-presets skill](skills/model-presets/SKILL.md) describes how to try a new model before switching.
+
+### 8. When something goes wrong
+
+| Symptom | What to do |
+|---|---|
+| `wk: … claimed by …` | Another lane owns those paths. Give the task to that lane's worker when it finishes (`wk NAME -r -`), or wait for it to land. `WK_FORCE=1` overrides. |
+| A worker shows `DIED` in `batches` | `batches report NAME`, then `wk NAME -r` to continue or `batches ack NAME` to hide it. |
+| A worker shows `STALLED` | Its log has been quiet for a while but the process lives. Check `batches report NAME`; stop it (`batches pause NAME` does not touch stalled workers, so `kill` its pid from `NAME.log.pid` in the log folder) before `wk NAME -r`. |
+| `mq` says `PARKED` | Read `mq ls` and the lane's last report; fix it in the worktree, `wtcommit`, then `mq add NAME` again. |
+| `remote-ci` exits 3 | The runner is unreachable (check the cable, network or VPN and `~/.config/agent-lanes/config`). `land` and `mq` treat this as a failed check; only the pre-push hook falls back to a local run. |
+| `wt-dev: own database not created…` | The lane uses the shared database. When the copy failed the message says why (restore failed, table counts differ); otherwise the URL is not on localhost or the Postgres tools are missing. |
 
 ## Example setup: a MacBook and a Mac mini
 
@@ -69,7 +142,7 @@ flowchart TB
   Q <==>|"full check of one lane over SSH<br/>1. Thunderbolt bridge · 2. LAN or Tailscale"| R
 ```
 
-**Connecting the two machines.** `remote-ci` first tries the direct route, then the SSH host, then gives up with exit code 3 (the caller runs the check locally).
+**Connecting the two machines.** `remote-ci` first tries the direct route, then the SSH host, then gives up with exit code 3.
 
 - **Thunderbolt bridge** (fastest; one cable): on both Macs, System Settings → Network → Thunderbolt Bridge. By default `remote-ci` uses the bridge's router address, so no address is needed.
 - **Local network or Tailscale** (when the cable is unplugged or you're away from the desk): add the Mac mini as an SSH host and point `remote-ci` at it.
@@ -115,7 +188,7 @@ Project-specific pieces stay in each project: the worker header (`~/.claude/stat
 
 ## Status
 
-Extracted from daily use. Expect sharp edges: macOS-first (the remote-ci runner is currently an Apple Silicon Mac, such as a Mac mini), and few tests beyond `session-stats`. `codex-limit` ships as a usage guard: `wk` refuses new launches at `WK_MAX_PCT` (default 100). Issues and small PRs are welcome.
+Extracted from daily use. Expect sharp edges: macOS-first (the remote-ci runner is currently an Apple Silicon Mac, such as a Mac mini), and few tests beyond `session-stats`. `codex-limit` ships as a usage guard: `wk` refuses new launches at `WK_MAX_PCT` (default 100). Issues and small pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

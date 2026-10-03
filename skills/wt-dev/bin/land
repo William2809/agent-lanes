@@ -56,7 +56,9 @@ sha=$(git -C "$wt" rev-parse --short HEAD); tries=0
 check=remote-ci
 if [ -f "$wt/package.json" ] && node -e 'const p = require(process.argv[1]); process.exit(typeof p.scripts?.["check:remote"] === "string" ? 0 : 1)' "$wt/package.json"; then check=pnpm; fi
 while :; do
-  if [ "$check" = pnpm ]; then out=$(cd "$wt" && pnpm -s check:remote --summary "$sha" 2>&1)
+  # LAND_CHECK (environment variable): run this command in the worktree instead, e.g. without a runner machine.
+  if [ -n "${LAND_CHECK:-}" ]; then out=$(cd "$wt" && sh -c "$LAND_CHECK" 2>&1)
+  elif [ "$check" = pnpm ]; then out=$(cd "$wt" && pnpm -s check:remote --summary "$sha" 2>&1)
   else out=$(cd "$wt" && remote-ci check --summary "$sha" 2>&1); fi
   rc=$?
   [ $rc -eq 75 ] || break

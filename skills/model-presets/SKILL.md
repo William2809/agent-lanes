@@ -15,7 +15,7 @@ Model names live in one place: presets. Tools ask for a preset (`wk -m build-har
 1. **Evidence first.** Read the release notes and benchmarks from the current year only (agentic tooling ages fast). Note the price per token and any limits on your plan.
 2. **Trial it as an extra preset:** add a line to the personal override (e.g. `build-next  <new-model>  medium  full-access  codex`). Defaults stay unchanged.
 3. **Compare on real work:** run 3–5 bounded tasks of the same kind on the old and the new preset. Count accepted changes, bugs found after "done", rework and tokens for the whole chain (build + review + fixes), not one run.
-4. **Switch the role:** point `build` (or `review`) at the new model in the override. When it holds up for a week, update `presets/models.conf` and log the change in `docs/workflow-log.md` with the evidence.
+4. **Switch the role:** point `build` (or `review`) at the new model in the override. When it holds up for a week, update `presets/models.conf` and write down the change and the evidence in your workflow notes.
 5. **Smoke test:** `echo "Reply with exactly: OK" | wk zzsmoke -m <preset>`, then `batches wait zzsmoke` and check that the log header shows the expected model, effort and sandbox.
 
 Keep the reviewer on a different model or provider from the builder when you can: different models make different mistakes, so a review by the same model finds less. Different review questions help just as much.
