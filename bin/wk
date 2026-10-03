@@ -19,7 +19,9 @@ if [ "${1:-}" = "-r" ]; then
   logs="$HOME/.claude/state/logs/$(basename "$main")"; log="$logs/$name.log"
   [ -f "$log" ] || { echo "no log $log" >&2; exit 1; }
   if [ -f "$log.pid" ] && { ps -p "$(cat "$log.pid")" -o command= 2>/dev/null | grep -q codex || kill -0 "$(cat "$log.pid")" 2>/dev/null; }; then echo "$name is still running" >&2; exit 1; fi
-  ! grep -q '^tokens used' "$log" && [ $(( $(date +%s) - $(stat -f %m "$log") )) -lt 180 ] && { echo "$name log was written <3 min ago; probably still running (check: batches)" >&2; exit 1; }
+  # A worker stopped by `batches pause` is known dead (pid checked above): skip the recent-log guard.
+  paused=$(awk -F'\t' -v n="$name" '$1==n {f=1} END {print f+0}' "$HOME/.claude/state/paused-workers.tsv" 2>/dev/null)
+  [ "$paused" != 1 ] && ! grep -q '^tokens used' "$log" && [ $(( $(date +%s) - $(stat -f %m "$log") )) -lt 180 ] && { echo "$name log was written <3 min ago; probably still running (check: batches)" >&2; exit 1; }
   hv() { sed -n "1,20s/^$1: //p" "$log" | head -1; }
   sid=$(hv "session id"); model=$(hv model); eff=$(hv "reasoning effort"); sb=$(hv sandbox); dir=$(hv workdir)
   [ -n "$sid" ] && [ -d "$dir" ] || { echo "cannot read session id/workdir from $log" >&2; exit 1; }

@@ -3,18 +3,62 @@
 # ABOUTME: and wt-dev worktrees with work not yet merged. Finished items collapse to one count.
 # Usage: batches            only what needs attention (cheap to run often)
 #        batches --all      every worker of the last 24h
+#        batches pause [NAME…]  pause named workers (no names: all running)
+#        batches resume [NAME…] resume named workers (no names: all paused)
 #        batches ack NAME…  mark a DIED worker/pipeline as handled (hidden afterwards)
 #        batches wait [NAME…] block until those workers exit (no names: until any running one exits), one "NAME finished" line each
 #                           (run as one background command for a notification)
 #        batches report NAME…  final report of finished workers (report.sh on their logs)
 #        batches overlap   unlanded worktrees that touch the same files (future land conflicts)
 # Exit 3 when something needs the lead (DIED, STALLED). Run inside the repo for worktrees.
-state="$HOME/.claude/state"; reg="$state/workers.tsv"; acked="$state/acked"
+state="$HOME/.claude/state"; reg="$state/workers.tsv"; acked="$state/acked"; paused="$state/paused-workers.tsv"
 mkdir -p "$state"; touch "$acked"
+# Import the old dock queue once; keep the source in trash.
+if [ -s "$state/dock/paused.txt" ]; then
+  cat "$state/dock/paused.txt" >>"$paused" && ctrash "$state/dock/paused.txt" >/dev/null || exit 1
+fi
+is_paused() { awk -F'\t' -v n="$1" '$1==n {found=1} END {exit !found}' "$paused" 2>/dev/null; }
 if [ "${1:-}" = "ack" ]; then shift; for n in "$@"; do echo "$n" >>"$acked"; done; exit 0; fi
 # Latest registry row for a worker name (log basename without .log): "pid<TAB>log".
 row() { awk -F'\t' -v n="$1" '{b=$3; sub(/.*\//,"",b); sub(/\.log$/,"",b)} b==n {r=$2"\t"$3} END {if (r) print r}' "$reg"; }
 case "${1:-}" in
+  pause) shift
+    [ -s "$reg" ] || exit 0
+    # Only workers the status listing calls running: an old registry pid may now belong to another process.
+    live=$("$0" 2>/dev/null | awk '$2=="running"{print $1}')
+    [ $# -eq 0 ] && set -- $live
+    for n in "$@"; do
+      printf '%s\n' "$live" | grep -qx "$n" || { echo "$n is not running" >&2; continue; }
+      is_paused "$n" && continue
+      r=$(row "$n"); [ -n "$r" ] || continue
+      pid=${r%%"$(printf '\t')"*}
+      kill -0 "$pid" 2>/dev/null || continue
+      log=${r#*"$(printf '\t')"}
+      dir=$(awk -F'\t' -v target="$log" '$3==target {d=$4} END {print d}' "$reg")
+      if kill "$pid" 2>/dev/null; then
+        printf '%s\t%s\n' "$n" "$dir" >>"$paused"
+        echo "paused $n"
+      fi
+    done
+    exit 0 ;;
+  resume) shift
+    [ -s "$paused" ] || { echo "no paused workers"; exit 0; }
+    cp "$paused" "$paused.$(date +%Y%m%d-%H%M%S).$$" || exit 1
+    left="$paused.new"; : >"$left" || exit 1
+    sort -u "$paused" | while IFS="$(printf '\t')" read -r n dir; do
+      selected=0; [ $# -eq 0 ] && selected=1
+      for wanted in "$@"; do [ "$wanted" = "$n" ] && selected=1; done
+      if [ "$selected" -eq 0 ]; then printf '%s\t%s\n' "$n" "$dir" >>"$left"; continue; fi
+      msg='You were paused. Continue the same task from where you stopped: check git status/diff, finish the remaining steps and checks, then give the final report in the requested format.'
+      if [ -n "$dir" ] && (cd "$dir" && wk "$n" -r "$msg" </dev/null) >/dev/null 2>&1; then
+        echo "resumed $n"
+      else
+        echo "FAILED to resume $n" >&2
+        printf '%s\t%s\n' "$n" "$dir" >>"$left"
+      fi
+    done
+    mv "$left" "$paused"
+    exit $? ;;
   wait) shift
     if [ $# -eq 0 ]; then  # no names: block until ANY running worker exits, name it
       before=$("$0" 2>/dev/null | awk '$2=="running"{print $1}')
@@ -65,7 +109,7 @@ is_acked() { grep -qx "$1" "$acked"; }
   sort -n | while IFS="$(printf '\t')" read -r start pid log dir; do
     name=$(basename "$log" .log)
     mt=$(stat -f %m "$log" 2>/dev/null || echo "$start")
-    if grep -q "^$name	" "$HOME/.claude/state/dock/paused.txt" 2>/dev/null; then st="paused by dock (dock resume)"
+    if is_paused "$name"; then st="paused (batches resume $name)"
     elif alive "$pid" "$log"; then
       if [ $((now - mt)) -gt $((stall * 60)) ]; then st="STALLED log quiet $(age "$mt")"; echo 1 >"$flag"
       else st="running $(age "$start")"; fi

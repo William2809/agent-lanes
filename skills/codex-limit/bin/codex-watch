@@ -1,0 +1,14 @@
+#!/bin/sh
+# ABOUTME: Watches Codex plan usage; at THRESHOLD% (default 97) pauses all running workers with
+# ABOUTME: `batches pause`, so `batches resume` continues them after the usage window resets.
+# Usage: codex-watch [THRESHOLD] [INTERVAL_SECONDS]   (run in background; exits after pausing)
+th=${1:-97}; iv=${2:-60}
+while :; do
+  pct=$(codex-limit --pct 2>/dev/null || echo 0)
+  if [ "$pct" -ge "$th" ]; then
+    echo "codex at ${pct}% ($(date +%H:%M)): $(batches pause | tr '\n' ' ')"
+    echo "after the reset: batches resume"
+    exit 0
+  fi
+  sleep "$iv"
+done

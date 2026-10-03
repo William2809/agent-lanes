@@ -103,7 +103,7 @@ Then once per project: `remote-ci init` (adds `.remote-ci.conf` and a pre-push h
 |---|---|
 | `wk` | Launch a Codex worker in one line: preset, worktree, path claim, the repo's standing header |
 | `mq` | Merge queue over `land` |
-| `batches` | Worker status: running, died, stalled; lanes with work to land |
+| `batches` | Worker status: running, died, stalled; lanes with work to land; `batches pause` / `batches resume` |
 | `wt-dev`, `land`, `wtcommit`, `migcheck`, `devrestart` | Worktrees with their own dev server and database; land one lane; commit by explicit paths |
 | `remote-ci` | Full checks on a runner machine, with slots, caches and a fresh database per run |
 | `ao-model` | Model presets lookup and launch checks |
@@ -115,7 +115,7 @@ Project-specific pieces stay in each project: the worker header (`~/.claude/stat
 
 ## Status
 
-Extracted from daily use. Expect sharp edges: macOS-first (the remote-ci runner is currently an Apple Silicon Mac, such as a Mac mini), and few tests beyond `session-stats`. `wk` and `batches` also call two optional helpers that are not shipped here, `codex-limit` (a usage guard) and `dock` (pausing workers); both are skipped when absent. Issues and small PRs are welcome.
+Extracted from daily use. Expect sharp edges: macOS-first (the remote-ci runner is currently an Apple Silicon Mac, such as a Mac mini), and few tests beyond `session-stats`. `codex-limit` ships as a usage guard: `wk` refuses new launches at `WK_MAX_PCT` (default 100). Issues and small PRs are welcome.
 
 ## License
 

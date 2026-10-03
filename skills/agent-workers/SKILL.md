@@ -37,6 +37,8 @@ A good brief: the goal in one line, the exact files or paths in scope, the accep
 
 ## Track
 
+`batches pause [NAME…]` pauses named workers, or all running workers when no names are given. `batches resume [NAME…]` continues named workers, or all paused workers, from their recorded directories. State lives in `~/.claude/state/paused-workers.tsv`. Resume keeps a timestamped backup and leaves failed launches queued.
+
 - `batches`: what needs you: running / DIED / STALLED workers and lanes with work to land. Exit 3 = attention.
 - `batches wait NAME…` in the background, so a finished or crashed worker wakes you. `batches report NAME…` prints the short report.
 - `wk NAME -r` resumes a worker after a provider capacity error or a cut-off run.

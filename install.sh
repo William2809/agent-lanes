@@ -9,7 +9,7 @@ link() { if [ -e "$2" ] && [ ! -L "$2" ]; then echo "skip $2 (a real file is the
 for t in "$here"/bin/*; do link "$t" "$bin/$(basename "$t")"; done
 for s in "$here"/skills/*/; do s=${s%/}; link "$s" "$skills/$(basename "$s")"; done
 for t in wt-dev/bin/wt-dev wt-dev/bin/land wt-dev/bin/wtcommit wt-dev/bin/migcheck wt-dev/bin/devrestart \
-         remote-ci/bin/remote-ci agent-workers/scripts/batches.sh:batches ui-audit/bin/ui-audit ui-shots/bin/ui-shots \
+         remote-ci/bin/remote-ci codex-limit/bin/codex-limit codex-limit/bin/codex-watch agent-workers/scripts/batches.sh:batches ui-audit/bin/ui-audit ui-shots/bin/ui-shots \
          ui-shots/bin/shot-sheet ui-shots/bin/pw-run wt-compare/bin/wt-compare session-stats/session-stats.py:session-stats; do
   src=${t%%:*}; name=${t#*:}; [ "$name" = "$t" ] && name=$(basename "$src"); link "$here/skills/$src" "$bin/$name"
 done
