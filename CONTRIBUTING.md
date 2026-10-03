@@ -4,6 +4,7 @@ Thanks for helping. agent-lanes is a set of small tools, and the aim is to keep 
 
 ## Before you start
 
+- **Branches:** `main` is the stable release; `dev` is where changes land first. Open pull requests against `dev`.
 - **Bug fixes and doc fixes:** open a pull request directly.
 - **New tools, new options or behaviour changes:** open an issue first and describe the problem you hit. Many ideas fit as a flag or a project-side script instead of a new tool.
 - One change per pull request. Small ones get reviewed fastest.
