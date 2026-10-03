@@ -69,7 +69,16 @@ done
 echo "check green ($sha)"
 
 # 5. Merge and clean up.
+prev=$(git -C "$main" rev-parse HEAD)
 git -C "$main" merge -q --ff-only "$sha" 2>/dev/null || fail "ff-merge ($base moved; rerun land)"
+# Optional repo hook: refresh the main checkout (install, migrate, health) after the merge.
+# Contract: runs in the main checkout as `tools/post-land.sh OLD_SHA NEW_SHA` (env LAND_BRANCH);
+# its lines starting with "refresh:" are shown; a failure is reported, never undoes the land.
+if [ -x "$main/tools/post-land.sh" ]; then
+  out=$(cd "$main" && LAND_BRANCH=$base ./tools/post-land.sh "$prev" "$sha" 2>&1); rc=$?
+  printf '%s\n' "$out" | grep '^refresh:' || true
+  [ $rc -eq 0 ] || echo "refresh: post-land FAILED (rc=$rc): $(printf '%s\n' "$out" | grep -v '^refresh:' | tail -1)"
+fi
 [ $keep -eq 1 ] || for name in $names; do
   cleanup=$(wt-dev rm "$name" 2>&1) || echo "cleanup failed: $name ($(printf '%s\n' "$cleanup" | tail -1))"
 done

@@ -6,6 +6,7 @@
 #   -d WT     run in an existing wt-dev worktree WT (name or path), e.g. a second worker in a batch's worktree
 #   -m        a model preset from `ao-model ls` (default: build). Presets with a read-only sandbox are reviewers.
 #   header    ~/.claude/state/headers/<repo>.md, placeholders {{DIR}} {{URL}} {{BASE}} {{NAME}} {{LOGDIR}}; Astra gets a read-only line instead
+#   -t FEATURE:REASON  tag for loop-stats; REASON = new | rework (after owner feedback) | bounce | review | review-fix | other
 #   -r [MSG|-] resume NAME's codex session (MSG '-' = read it from stdin, use a quoted heredoc) (same model/sandbox/dir) after a capacity error or a cut-off run
 # Then: batches wait NAME… (background) · batches report NAME…
 set -eu
@@ -46,8 +47,10 @@ if command -v codex-limit >/dev/null && [ "${WK_FORCE:-0}" != 1 ]; then
     [ "$pct" -lt "${WK_MAX_PCT:-100}" ] || { echo "wk: Codex plan at ${pct}% used; not launching (WK_FORCE=1 to override)" >&2; exit 1; } ;;
   esac
 fi
-wt=0; m=${WK_DEFAULT_PRESET:-build}; file=""; into=""; own=""
-while [ $# -gt 0 ]; do case "$1" in -w) wt=1 ;; -m) m=$2; shift ;; -f) file=$2; shift ;; -d) into=$2; shift ;; -o) own=$2; shift ;; *) echo "bad arg $1" >&2; exit 2 ;; esac; shift; done
+wt=0; m=${WK_DEFAULT_PRESET:-build}; file=""; into=""; own=""; tag=""
+while [ $# -gt 0 ]; do case "$1" in -w) wt=1 ;; -m) m=$2; shift ;; -f) file=$2; shift ;; -d) into=$2; shift ;; -o) own=$2; shift ;; -t) tag=$2; shift ;; *) echo "bad arg $1" >&2; exit 2 ;; esac; shift; done
+if [ -n "$tag" ]; then case "$tag" in *:new|*:rework|*:bounce|*:review|*:review-fix|*:other) ;;
+  *) echo "wk: -t wants FEATURE:REASON, REASON one of new rework bounce review review-fix other" >&2; exit 2 ;; esac; fi
 preset=$(ao-model get "$m") || exit 2
 set -- $preset; model=$1 eff=$2 sb=$3
 top=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
@@ -93,6 +96,9 @@ else hdr="Working directory: $dir$url. English. Never print secrets. $git."; fi
 printf '%s\n%s\n' "$hdr" "$body" >"$p"
 sh "$skills/agent-workers/scripts/run-worker.sh" "$model" "$eff" "$sb" "$dir" "$p" "$log" >/dev/null || { echo "wk: launch of $name FAILED (run-worker refused; see above)" >&2; exit 1; }
 where=""; [ "$dir" = "$main" ] && [ "$sb" != "read-only" ] && where=" — MAIN CHECKOUT (edits land on the branch; use -w for a worktree)"
+# Tag for loop statistics: "epoch<TAB>repo<TAB>name<TAB>feature<TAB>reason" (own file; workers.tsv keeps 4 columns).
+if [ -n "$tag" ]; then printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$repo" "$name" "${tag%%:*}" "${tag#*:}" >>"$HOME/.claude/state/worker-tags.tsv"
+else echo "wk: no -t FEATURE:REASON tag (loop-stats can't count rework for $name)" >&2; fi
 echo "started $name: $model $eff${url:+ @$name$url}$where"
 # Unlanded worktrees touching the same files conflict at land: say so now, not later.
 (cd "$main" 2>/dev/null && sh "$skills/agent-workers/scripts/batches.sh" overlap) || true

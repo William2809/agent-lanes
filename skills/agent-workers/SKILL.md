@@ -66,3 +66,5 @@ The queue lands one lane at a time and bounces failures back to the lane's worke
 ## Context budget
 
 Every result you read is re-read on each later turn. Keep worker reports to 15 lines with details in a file, view screenshots as one contact sheet (`shot-sheet`), and let workers summarise large files for you.
+
+**Tag every launch** with `-t FEATURE:REASON` (REASON = `new`, `rework` after owner feedback, `bounce`, `review`, `review-fix`, `other`), e.g. `wk arsip-replace -w -o apps/web/arsip -t arsip:rework`. Tags go to `~/.claude/state/worker-tags.tsv`; `mq` tags its own bounce fixes. They let `loop-stats` count rebuild rounds per feature.

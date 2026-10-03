@@ -66,11 +66,12 @@ Inside your repository:
 Write a brief (`brief.md`): the task, the files involved, how to check it and what "done" means. Then:
 
 ```sh
-wk invoice-fix -w -o "apps/web/invoice" -m build-hard -f brief.md
+wk invoice-fix -w -o "apps/web/invoice" -m build-hard -t invoice:new -f brief.md
 ```
 
 - `-w` creates the worktree `invoice-fix` with its own dev server and database copy (`wt-dev ls` shows the port).
 - `-o` claims the paths the worker will edit. A later lane that overlaps them is refused; give that task to the lane's worker after it finishes (`wk NAME -r -` with the new task on stdin), or wait until the lane lands.
+- `-t invoice:new` tags the launch with a feature and a reason (`new`, `rework`, `bounce`, `review`, `review-fix`, `other`) so rework per feature can be counted.
 - `-m` picks a preset (`ao-model ls`). Reviewers use a read-only preset and can join any lane: `wk invoice-review -d invoice-fix -m review -f review.md`.
 
 Then follow it:
