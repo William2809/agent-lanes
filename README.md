@@ -46,6 +46,57 @@ mq add invoice-fix && mq run                                             # land 
 mq ls                                                                    # queue, claims, bounced workers
 ```
 
+## Example setup: a MacBook and a Mac mini
+
+One developer works on a MacBook. A Mac mini on the same desk is the **runner**: it does nothing but full checks, so the laptop stays fast while many workers and dev servers run.
+
+```mermaid
+flowchart TB
+  subgraph MB["MacBook (dev machine)"]
+    direction LR
+    you(["You"]) --> lead["AI lead<br/>Claude Code"]
+    lead -->|"wk -w -o apps/web/invoice"| A["Lane: invoice-fix<br/>worktree · :3001 · DB copy"]
+    lead -->|"wk -w -o apps/web/settings"| B["Lane: settings-page<br/>worktree · :3002 · DB copy"]
+    A -->|"mq add"| Q[["mq merge queue"]]
+    B -->|"mq add"| Q
+    Q -.->|"conflict / red: sent back"| A
+    Q -->|"pass: fast-forward"| br[("feature branch")]
+  end
+  subgraph MM["Mac mini (runner)"]
+    direction LR
+    R["remote-ci<br/>checkout per slot"] --> DB[("fresh PostgreSQL<br/>database per run")]
+  end
+  Q <==>|"full check of one lane over SSH<br/>1. Thunderbolt bridge · 2. LAN or Tailscale"| R
+```
+
+**Connecting the two machines.** `remote-ci` first tries the direct route, then the SSH host, then gives up with exit code 3 (the caller runs the check locally).
+
+- **Thunderbolt bridge** (fastest; one cable): on both Macs, System Settings → Network → Thunderbolt Bridge. By default `remote-ci` uses the bridge's router address, so no address is needed.
+- **Local network or Tailscale** (when the cable is unplugged or you're away from the desk): add the Mac mini as an SSH host and point `remote-ci` at it.
+
+```sh
+# ~/.ssh/config on the MacBook
+Host mac-mini
+  HostName mac-mini.local            # same Wi-Fi / LAN (Bonjour name)
+# HostName mac-mini.<tailnet>.ts.net # or its Tailscale MagicDNS name, from anywhere
+  User you
+  IdentityFile ~/.ssh/id_ed25519
+
+# ~/.config/agent-lanes/config
+REMOTE_CI_HOST=mac-mini              # fallback route; the Thunderbolt bridge is tried first
+```
+
+Then once per project: `remote-ci init` (adds `.remote-ci.conf` and a pre-push hook) and `remote-ci setup` (prepares the Mac mini). `remote-ci info` prints the route it will use.
+
+**A morning with this setup.** You ask the lead to fix an invoice total bug and redesign the settings page.
+
+1. The lead writes two briefs and starts two lanes. `invoice-fix` claims `apps/web/invoice`, `settings-page` claims `apps/web/settings`. Each gets its own worktree, dev server and copy of the local database, so neither worker sees the other's test data.
+2. A third task touching `apps/web/invoice` is refused by `wk` ("claimed by invoice-fix"). The lead adds it to the invoice brief instead of starting a lane that would conflict.
+3. Both workers commit in their worktrees and report. Invoice money math is high risk, so a read-only reviewer checks that diff; the settings page gets screenshots at desktop and phone width.
+4. `mq add invoice-fix settings-page && mq run`. The queue rebases `invoice-fix` onto the branch, sends it to the Mac mini for the full suite, and fast-forwards on a pass. The laptop keeps serving both dev servers meanwhile.
+5. `settings-page` now conflicts with a shared component the invoice lane touched. `mq` sends the conflict back to the settings worker, which rebases and commits; the queue retries it and it lands. `mq ls` shows that state at any moment.
+6. Landing removes each worktree, drops its database copy and releases its claim.
+
 ## Tools
 
 | Tool | Purpose |
@@ -64,7 +115,7 @@ Project-specific pieces stay in each project: the worker header (`~/.claude/stat
 
 ## Status
 
-Extracted from daily use. Expect sharp edges: macOS-first (the remote-ci runner is currently an Apple Silicon Mac), and few tests beyond `session-stats`. `wk` and `batches` also call two optional helpers that are not shipped here, `codex-limit` (a usage guard) and `dock` (pausing workers); both are skipped when absent. Issues and small PRs are welcome.
+Extracted from daily use. Expect sharp edges: macOS-first (the remote-ci runner is currently an Apple Silicon Mac, such as a Mac mini), and few tests beyond `session-stats`. `wk` and `batches` also call two optional helpers that are not shipped here, `codex-limit` (a usage guard) and `dock` (pausing workers); both are skipped when absent. Issues and small PRs are welcome.
 
 ## License
 
