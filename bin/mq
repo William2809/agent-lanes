@@ -184,6 +184,18 @@ check_failure() {
   _sha=$(check_sha "$1"); [ -n "$_sha" ] || return 0
   python3 "$MQ_TOOL_ROOT/bin/mq-diagnostics.py" fail "$_sha" 2>/dev/null
 }
+# Reserve once per lane/head before waiting, so a stopped runner cannot retry twice.
+transient_retry() (
+  _head=$(git -C "$(wt-dev path "$w")" rev-parse HEAD 2>/dev/null) || exit 1
+  _mark="$st/transient.$w.$_head"; [ ! -f "$_mark" ] || exit 1
+  case "$last" in 'FAILED check '*|'FAILED preflight'|'FAILED file-size ratchet') ;; *) exit 1 ;; esac
+  _sha=$(check_sha "$last")
+  _marker=$(printf '%s\n' "$out" | tail -80 |
+    python3 "$MQ_TOOL_ROOT/bin/mq-diagnostics.py" transient "$_sha" 2>/dev/null)
+  [ -n "$_marker" ] || exit 1
+  : >"$_mark" || exit 1
+  printf '%s\n' "$_marker"
+)
 # Observe outcomes before finished fixers can requeue. Each original lane is counted once.
 resolve_train() {
   [ -n "$red_pending" ] || return 0
@@ -537,7 +549,17 @@ while :; do
   fi
   w=${ws# }; [ "$solo" -gt 0 ] && solo=$((solo - 1))
   echo "landing $w"; ev "$w" landing
-  out=$(land "$w" 2>&1); last=$(printf '%s\n' "$out" | tail -1)
+  transient_attempt=0
+  while :; do
+    out=$(land "$w" 2>&1); last=$(printf '%s\n' "$out" | tail -1)
+    case "$last" in LANDED*) break ;; esac
+    [ "$transient_attempt" = 0 ] || break
+    marker=$(transient_retry) || break
+    transient_attempt=1
+    echo "TRANSIENT $w: $marker; retrying once"; ev "$w" transient-retry "$marker"
+    sleep 60
+    ev "$w" landing "transient retry"
+  done
   case "$last" in
     LANDED*) delq "$w"; landed=$((landed + 1)); ev "$w" landed "${last#LANDED }"
       # Show land's post-merge lines (main-checkout refresh, cleanup problems) and log the refresh summary.
