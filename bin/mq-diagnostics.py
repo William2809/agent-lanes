@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # ABOUTME: Bound and redact queue diagnostics; accept only a unique, real blame overlap.
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -93,10 +94,31 @@ def transient(text):
     return ''
 
 
+def local(command, sha, lanes):
+    """A preflight/install failure has no remote log: parse land's raw tail (stdin) like a check log."""
+    if not re.fullmatch(r'[0-9a-f]{7,40}', sha):
+        return ''
+    tail = '\n'.join(line[:300] for line in sys.stdin.read(65536).splitlines()[-80:])
+    result = failure.parse(f'== preflight\n{tail}\n== finished rc=1\n')
+    if command == 'local-fail':
+        return '\n'.join(result['summary'])
+    try:
+        blame = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / 'skills/remote-ci/bin/blame.py'),
+                                os.getcwd(), sha, *lanes], input=json.dumps(result), capture_output=True,
+                               text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+    return blame.stdout if blame.returncode == 0 else ''
+
+
 def main():
     command, sha, *lanes = sys.argv[1:]
-    text = diagnostic('blame' if command == 'suspect' else 'fail', sha,
-                      lanes, tail=command == 'transient')
+    if command.startswith('local-'):
+        text = local(command, sha, lanes)
+        command = command[len('local-'):]
+    else:
+        text = diagnostic('blame' if command == 'suspect' else 'fail', sha,
+                          lanes, tail=command == 'transient')
     if command == 'transient':
         # land can carry errors from local/custom checks without a remote log. Classify each
         # source on its own, so a long local tail cannot push a remote marker out of the window.

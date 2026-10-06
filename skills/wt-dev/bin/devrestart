@@ -2,13 +2,36 @@
 # ABOUTME: Restarts the main checkout's dev server with a clean Next cache (stale HMR after big merges).
 # ABOUTME: Old cache goes to ~/.claude-trash/<date>/; log at ~/.claude/state/logs/<repo>/devserver.log.
 # Usage (inside the main checkout): devrestart [port=3000]
+# Stops only this checkout's server: the process group it started last time, and a listener on the
+# port that runs inside this checkout. Another project's server on the port is left alone.
 set -u
 port=${1:-3000}; top=$(git rev-parse --show-toplevel) || exit 1; repo=$(basename "$top")
 log="$HOME/.claude/state/logs/$repo/devserver.log"; trash="$HOME/.claude-trash/$(date +%F)"; mkdir -p "$trash" "$(dirname "$log")"
-pkill -f "turbo dev" 2>/dev/null; for p in $(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null); do kill "$p"; done; sleep 3
+# Lines: pid (= its process group, setsid below), its start time, the checkout. A reused pid fails the start time.
+rec="$(dirname "$log")/devserver.pid"
+started() { ps -o lstart= -p "$1" 2>/dev/null | awk '{$1=$1; print}'; }
+group=""
+if [ -f "$rec" ]; then
+  { read -r pid; read -r start; read -r dir; } <"$rec"
+  case "$pid" in ''|*[!0-9]*) ;; *)
+    [ "$dir" = "$top" ] && [ "$(started "$pid")" = "$start" ] && group=$pid && kill -TERM "-$pid" 2>/dev/null ;;
+  esac
+fi
+# ours PID: the process works inside this checkout.
+ours() { lsof -a -p "$1" -d cwd -Fn 2>/dev/null | awk -v d="$top" 'sub(/^n/, "") && ($0 == d || index($0, d "/") == 1) {f=1} END {exit !f}'; }
+for p in $(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null); do ours "$p" && kill "$p" 2>/dev/null; done; sleep 3
+for p in $(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null); do
+  ours "$p" || { echo "port $port is held by pid $p outside $top; not restarting"; exit 1; }
+  # Only the server devrestart started (its recorded group) is killed outright.
+  [ -n "$group" ] && [ "$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')" = "$group" ] && kill -KILL "$p" 2>/dev/null
+done
+# The new server must be the one that answers: the port has to be free first.
+sleep 1; p=$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
+[ -z "$p" ] || { echo "port $port is still held by pid $p; not restarting"; exit 1; }
 for c in "$top"/apps/*/.next; do [ -d "$c" ] && mv "$c" "$trash/$(basename "$(dirname "$c")")-next-cache-$(date +%H%M%S)"; done
 [ -f "$log" ] && mv "$log" "$trash/devserver-$(date +%H%M%S).log"
 # Own session (setsid via perl): the server must outlive the calling shell's process group.
-(cd "$top" || exit 1; nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' pnpm dev >"$log" 2>&1 </dev/null &)
+(cd "$top" || exit 1; nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' pnpm dev >"$log" 2>&1 </dev/null &
+ printf '%s\n%s\n%s\n' "$!" "$(started "$!")" "$top" >"$rec")
 i=0; while [ $i -lt 60 ]; do c=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$port/" 2>/dev/null); [ "$c" != 000 ] && { echo "up :$port ($c) log $log"; exit 0; }; sleep 2; i=$((i+1)); done
 echo "not up after 120s; see $log"; exit 1

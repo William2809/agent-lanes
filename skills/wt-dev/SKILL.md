@@ -5,7 +5,7 @@ description: Create a git worktree with its own dev server (own port, framework 
 
 # wt-dev
 
-Run inside the repo. Worktrees live in `~/worktrees/<repo>/<name>`; state and logs in `~/.cache/wt-dev/<repo>/`.
+Run inside the repo. Worktrees live in `~/worktrees/<repo>/<name>`; state and logs in `~/.cache/wt-dev/<repo>/`. A second repo with the same folder name gets `<repo>-<hash>` (the first keeps the plain name).
 
 ```sh
 wt-dev new ui-batch --branch review/ui-batch --from main   # worktree + install + dev server, prints URL
@@ -17,8 +17,8 @@ wt-dev rm ui-batch             # stops the server; refuses if the worktree has c
 wt-dev sleep-idle --minutes 30 -n  # preview idle servers; omit -n to sleep them
 ```
 
-- Settings: an optional `.wt-dev.conf` in the repo (template: `templates/wt-dev.conf`). Without it everything is detected.
-- Links `.env`/`.env.local` (root and `apps/*`). A localhost database in `.env` (`DATABASE_URL`, or `WT_DEV_DB_VAR`) gets a per-worktree copy and the worktree a real `.env` pointing at it: PostgreSQL and MySQL/MariaDB are cloned to `<db>_wt_<name>`, an SQLite file is copied (a relative path into the worktree, an absolute one next to the original). `WT_DEV_DB_CLONE` / `WT_DEV_DB_DROP` handle any other database. `--shared-db` opts out; `wt-dev rm` drops the copy.
+- Settings: an optional `.wt-dev.conf` in the repo (template: `templates/wt-dev.conf`). Without it everything is detected. A lane's commands read the lane's own file (`new`: the one committed at `--from`), so a lane can change and test it.
+- Links `.env`/`.env.local` (root and `apps/*`). A localhost database in `.env` (`DATABASE_URL`, or `WT_DEV_DB_VAR`) gets a per-worktree copy and the worktree a real `.env` pointing at it: PostgreSQL and MySQL/MariaDB are cloned to `<db>_wt_<name>` (a name that loses characters gets a hash; a Postgres copy is marked as its lane's, and an unmarked or foreign one is never dropped), an SQLite file is copied (a relative path into the worktree, an absolute one next to the original). `WT_DEV_DB_CLONE` / `WT_DEV_DB_DROP` handle any other database. `--shared-db` opts out; `wt-dev rm` drops the copy.
 - Installs from the lockfiles at the root (pnpm, npm, yarn, bun, uv, poetry, bundler, composer, mix) or `WT_DEV_INSTALL`. `wt-dev install NAME --if-changed` reinstalls only when a lockfile changed (`land` uses it); `-n` prints the commands.
 - Starts the dev server of the first of `apps/web`, `web` or the root with a known framework (or `--app` / `WT_DEV_APP`): Next.js, Nuxt, SvelteKit, Astro, Angular, Vite, Django, Rails, Laravel, Phoenix; or `WT_DEV_CMD` for anything else (Go, Rust, Express, FastAPI...). `PORT` is set; the server is ready when the port listens. No framework and no command: the worktree has no server. `.env` is loaded through the repo's `dotenv` CLI when it has one, otherwise by wt-dev; `BETTER_AUTH_URL` / `NEXTAUTH_URL` / `AUTH_URL` (Laravel: also `APP_URL`; or `WT_DEV_URL_VARS`) point at the worktree's port so login works. `stop` ends the whole process tree.
 - Screenshot it with `ui-shots --base http://localhost:<port>` and audit with `ui-audit --base …`.

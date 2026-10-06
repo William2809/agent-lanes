@@ -250,6 +250,296 @@ class WtDev(unittest.TestCase):
         self.assertIn('ready:', self.new('b1').stdout)
         self.assertNotIn('--strictPort', open(self.env['STUB_OUT']).read())  # started via manage.py, not vite
 
+    # A lane's own .wt-dev.conf (review 2026-10-06, P3)
+    def test_lane_commands_use_the_lanes_own_config(self):
+        self.write('.wt-dev.conf', "WT_DEV_INSTALL='printf main > config.used'\n")
+        self.commit()
+        self.new('c1', '--no-install')
+        open(os.path.join(self.path('c1'), '.wt-dev.conf'), 'w').write("WT_DEV_INSTALL='printf lane > config.used'\n")
+        self.wt('install', 'c1', '--if-changed')
+        self.assertEqual(open(os.path.join(self.path('c1'), 'config.used')).read(), 'lane')
+
+    def test_new_uses_the_config_committed_at_from(self):
+        self.write('.wt-dev.conf', "WT_DEV_INSTALL='printf main > config.used'\n")
+        self.commit()
+        self.git('switch', '-q', '-c', 'cfg')
+        self.write('.wt-dev.conf', "WT_DEV_INSTALL='printf cfg > config.used'\n")
+        self.commit()
+        self.git('switch', '-q', 'main')
+        self.new('c2', '--from', 'cfg')
+        self.assertEqual(open(os.path.join(self.path('c2'), 'config.used')).read(), 'cfg')
+
+    def test_rm_drops_with_the_command_recorded_at_new(self):
+        self.write('.wt-dev.conf', textwrap.dedent('''\
+            WT_DEV_DB_CLONE='echo "mongodb://localhost/app_$WT_DEV_NAME"'
+            WT_DEV_DB_DROP='touch "$(dirname "$WT_DEV_WORKTREE")/dropped-recorded"'
+        '''))
+        self.commit()
+        self.write('.env', 'DATABASE_URL=mongodb://localhost/app\n')
+        self.new('h2')
+        lane = self.path('h2')
+        open(os.path.join(lane, '.wt-dev.conf'), 'w').write("WT_DEV_DB_DROP='touch \"$(dirname \"$WT_DEV_WORKTREE\")/dropped-edited\"'\n")
+        subprocess.run(['git', '-C', lane, '-c', 'user.name=t', '-c', 'user.email=user@example.invalid', 'commit', '-qam', 'edit'], check=True)
+        self.write('.wt-dev.conf', "WT_DEV_DB_DROP='touch \"$(dirname \"$WT_DEV_WORKTREE\")/dropped-main\"'\n")
+        self.commit()
+        self.wt('rm', 'h2'); self.names.remove('h2')
+        root = os.path.dirname(lane)
+        self.assertEqual(sorted(f for f in os.listdir(root) if f.startswith('dropped-')), ['dropped-recorded'])
+
+    def test_rm_of_a_lane_made_before_recording_uses_the_main_settings(self):
+        self.write('.wt-dev.conf', textwrap.dedent('''\
+            WT_DEV_DB_CLONE='echo "mongodb://localhost/app_$WT_DEV_NAME"'
+            WT_DEV_DB_DROP='touch "$(dirname "$WT_DEV_WORKTREE")/dropped-main"'
+        '''))
+        self.commit()
+        self.write('.env', 'DATABASE_URL=mongodb://localhost/app\n')
+        self.new('h3')
+        for f in ('h3.dbvar', 'h3.dbdrop'):  # what an older wt-dev left behind
+            os.remove(os.path.join(self.home, '.cache/wt-dev/repo', f))
+        lane = self.path('h3')
+        open(os.path.join(lane, '.wt-dev.conf'), 'w').write("WT_DEV_DB_DROP='touch \"$(dirname \"$WT_DEV_WORKTREE\")/dropped-edited\"'\n")
+        subprocess.run(['git', '-C', lane, '-c', 'user.name=t', '-c', 'user.email=user@example.invalid', 'commit', '-qam', 'edit'], check=True)
+        self.wt('rm', 'h3'); self.names.remove('h3')
+        root = os.path.dirname(lane)
+        self.assertEqual(sorted(f for f in os.listdir(root) if f.startswith('dropped-')), ['dropped-main'])
+
+    # Postgres copies: distinct names and an owner mark (review 2026-10-06, 1A)
+    PSQL = textwrap.dedent('''\
+        #!/usr/bin/env python3
+        import json, os, re, sys
+        path = os.environ['PG_STATE']; dbs = json.load(open(path)) if os.path.exists(path) else {}
+        args = sys.argv[1:]; sql = next(a for a in args[1:] if ' ' in a)
+        open(path + '.log', 'a').write(sql + '\\n')
+        if 'pg_database' in sql and os.path.exists(path + '.down'): sys.exit(2)
+        if m := re.match(r'drop database if exists "([^"]+)"', sql): dbs.pop(m[1], None)
+        elif m := re.match(r"comment on database \\"([^\\"]+)\\" is '([^']*)'", sql): dbs[m[1]] = m[2]
+        elif m := re.search(r"from pg_database where datname = '([^']*)'", sql):
+            if m[1] in dbs: print('x' + dbs[m[1]])
+        elif 'from pg_class' in sql: print('public|1')
+        json.dump(dbs, open(path, 'w'))
+    ''')
+
+    def postgres(self, dbs=None):
+        shims = os.path.join(self.tmp.name, 'pgshims'); os.makedirs(shims, exist_ok=True)
+        self.pg = os.path.join(self.tmp.name, 'pg.json')
+        json.dump(dbs or {}, open(self.pg, 'w'))
+        stubs = {'psql': self.PSQL, 'pg_dump': '#!/bin/sh\nexit 0\n', 'pg_restore': '#!/bin/sh\ncat >/dev/null\n',
+                 'createdb': '#!/usr/bin/env python3\nimport json, os, sys\np = os.environ["PG_STATE"]; d = json.load(open(p)); d[sys.argv[-1]] = ""; json.dump(d, open(p, "w"))\n'}
+        for name, text in stubs.items():
+            open(os.path.join(shims, name), 'w').write(text); os.chmod(os.path.join(shims, name), 0o755)
+        self.env.update(PG_STATE=self.pg, PATH=shims + ':' + self.env['PATH'])
+        self.write('.wt-dev.conf', 'WT_DEV_INSTALL=""\n')
+        self.git('add', '-A'); self.git('commit', '-qm', 'x', '--allow-empty')
+        self.write('.env', 'DATABASE_URL=postgresql://localhost/main\n')
+
+    def dbs(self):
+        return json.load(open(self.pg))
+
+    def test_postgres_names_that_lose_characters_stay_apart(self):
+        self.postgres()
+        self.new('review-a'); self.new('review_a')
+        dbs = self.dbs()
+        self.assertEqual(len(dbs), 2, dbs)
+        self.assertIn('main_wt_review_a', dbs)
+        self.assertTrue(all(mark.startswith('wt-dev ') for mark in dbs.values()), dbs)
+        self.assertNotIn('drop database', open(self.pg + '.log').read())
+
+    def test_postgres_database_without_this_lanes_mark_is_never_dropped(self):
+        for mark in ('', 'wt-dev 000000000000 p1'):
+            with self.subTest(mark=mark):
+                self.postgres({'main_wt_p1': mark})
+                r = self.wt('new', 'p1', check=False)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("main_wt_p1 exists and is not this lane's", r.stderr)
+                self.assertEqual(self.dbs(), {'main_wt_p1': mark})
+                self.assertFalse(os.path.exists(self.path('p1')))
+
+    def test_postgres_leftover_of_this_lane_is_replaced_and_rm_drops_it(self):
+        self.postgres()
+        self.new('p2')
+        mark = self.dbs()['main_wt_p2']
+        subprocess.run(['git', '-C', self.repo, 'worktree', 'remove', '--force', self.path('p2')], check=True)
+        self.new('p2')  # the leftover carries this lane's mark
+        self.assertEqual(self.dbs(), {'main_wt_p2': mark})
+        self.wt('rm', 'p2'); self.names.remove('p2')
+        self.assertEqual(self.dbs(), {})
+
+    def test_rm_keeps_a_database_marked_as_another_lanes(self):
+        self.postgres()
+        self.new('p3')
+        json.dump({'main_wt_p3': 'wt-dev 000000000000 p3'}, open(self.pg, 'w'))
+        out = self.wt('rm', 'p3').stdout; self.names.remove('p3')
+        self.assertIn("not dropping database main_wt_p3", out)
+        self.assertEqual(self.dbs(), {'main_wt_p3': 'wt-dev 000000000000 p3'})
+
+    def test_legacy_rm_never_runs_the_lanes_drop_command(self):
+        self.write('.wt-dev.conf', textwrap.dedent('''\
+            WT_DEV_DB_CLONE='echo "mongodb://localhost/app_$WT_DEV_NAME"'
+            WT_DEV_DB_DROP='true'
+        '''))
+        self.commit()
+        self.write('.env', 'DATABASE_URL=mongodb://localhost/app\n')
+        self.new('h4')
+        for f in ('h4.dbvar', 'h4.dbdrop'):  # what an older wt-dev left behind
+            os.remove(os.path.join(self.home, '.cache/wt-dev/repo', f))
+        self.write('.wt-dev.conf', "WT_DEV_INSTALL=''\n")  # main no longer sets a drop command
+        self.commit()
+        lane = self.path('h4')
+        open(os.path.join(lane, '.wt-dev.conf'), 'w').write("WT_DEV_DB_DROP='touch \"$(dirname \"$WT_DEV_WORKTREE\")/dropped-edited\"'\n")
+        subprocess.run(['git', '-C', lane, '-c', 'user.name=t', '-c', 'user.email=user@example.invalid', 'commit', '-qam', 'edit'], check=True)
+        self.wt('rm', 'h4'); self.names.remove('h4')
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(lane), 'dropped-edited')))
+
+    def test_rm_keeps_a_database_whose_owner_cannot_be_checked(self):
+        self.postgres()
+        self.new('p4')
+        open(self.pg + '.down', 'w').close()
+        out = self.wt('rm', 'p4').stdout; self.names.remove('p4')
+        self.assertIn('not dropping database main_wt_p4: could not check', out)
+        self.assertIn('main_wt_p4', self.dbs())
+
+    # Two repos with the same folder name (review 2026-10-06, 1A)
+    def other_repo(self):
+        other = os.path.join(self.tmp.name, 'elsewhere', 'repo')
+        os.makedirs(other)
+        subprocess.run(['git', 'init', '-q', '-b', 'main', other], check=True)
+        return other
+
+    def wt_in(self, cwd, *a):
+        return subprocess.run(['wt-dev', *a], cwd=cwd, env=self.env, capture_output=True, text=True, timeout=60)
+
+    def test_repos_with_the_same_folder_name_get_separate_lanes(self):
+        self.commit()
+        other = self.other_repo()
+        mine, theirs = self.wt('path', 'a').stdout.strip(), self.wt_in(other, 'path', 'a').stdout.strip()
+        self.assertEqual(mine, self.path('a'))
+        self.assertNotEqual(mine, theirs)
+        self.assertRegex(theirs, r'/worktrees/repo-[0-9a-f]{8}/a$')
+        self.assertEqual(self.wt_in(other, 'path', 'a').stdout.strip(), theirs)
+
+    def test_claim_of_a_moved_repo_is_taken_over_but_a_live_one_is_kept(self):
+        self.commit()
+        claim = os.path.join(self.home, '.cache/wt-dev/repo/.repo')
+        os.makedirs(os.path.dirname(claim), exist_ok=True)
+        open(claim, 'w').write(os.path.join(self.tmp.name, 'moved-away', 'repo') + '\n')
+        self.assertEqual(self.wt('path', 'a').stdout.strip(), self.path('a'))
+        open(claim, 'w').write(self.other_repo() + '\n')
+        self.assertRegex(self.wt('path', 'a').stdout.strip(), r'/worktrees/repo-[0-9a-f]{8}/a$')
+
+    def test_a_claim_leaves_no_lock_behind(self):
+        self.commit()
+        self.wt('path', 'a')
+        self.assertEqual(sorted(os.listdir(os.path.join(self.home, '.cache/wt-dev/repo'))), ['.repo'])
+
+    def test_unclaimed_lane_folder_stays_with_the_repo_whose_lanes_it_holds(self):
+        self.write('.wt-dev.conf', 'WT_DEV_INSTALL=""\n')
+        self.commit()
+        self.new('n1')
+        os.remove(os.path.join(self.home, '.cache/wt-dev/repo/.repo'))  # lanes made before claims existed
+        theirs = self.wt_in(self.other_repo(), 'path', 'n1').stdout.strip()
+        self.assertNotEqual(theirs, self.path('n1'))
+        self.assertEqual(self.wt('path', 'n1').stdout.strip(), self.path('n1'))
+
+
+class DevRestart(unittest.TestCase):
+    """devrestart stops only this checkout's server, never another project's (real processes)."""
+    LISTEN = 'import http.server, sys; http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_forever()'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='devrestart-test-')
+        self.addCleanup(self.tmp.cleanup)
+        t = self.tmp.name
+        self.home, self.repo, self.other = (os.path.join(t, d) for d in ('home', 'repo', 'other'))
+        shims = os.path.join(t, 'shims')
+        for d in (self.home, self.repo, self.other, shims):
+            os.makedirs(d)
+        subprocess.run(['git', 'init', '-q', self.repo], check=True)
+        self.repo = subprocess.run(['git', '-C', self.repo, 'rev-parse', '--show-toplevel'], capture_output=True, text=True).stdout.strip()
+        import socket
+        with socket.socket() as s:
+            s.bind(('127.0.0.1', 0)); self.port = str(s.getsockname()[1])
+        # pnpm dev: a child that must die with the group, then the listener.
+        with open(os.path.join(shims, 'pnpm'), 'w') as f:
+            f.write(f'#!/bin/sh\nsleep 300 &\necho $! >"{t}/child.$$"\n[ -z "${{IGNORE_TERM:-}}" ] || trap "" TERM\nexec python3 -c \'{self.LISTEN}\' {self.port}\n')
+        os.chmod(os.path.join(shims, 'pnpm'), 0o755)
+        self.env = dict(os.environ, HOME=self.home, PATH=shims + ':' + BIN + ':' + os.environ['PATH'])
+        self.procs = []
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self):
+        for p in self.procs:
+            if p.poll() is None: p.kill(); p.wait()
+        rec = os.path.join(self.home, '.claude/state/logs/repo/devserver.pid')
+        if os.path.exists(rec):
+            subprocess.run(['kill', '-KILL', '-' + self.read(rec).splitlines()[0]], capture_output=True)
+        for f in os.listdir(self.tmp.name):
+            if f.startswith('child.'):
+                subprocess.run(['kill', '-KILL', self.read(os.path.join(self.tmp.name, f))], capture_output=True)
+
+    def read(self, path):
+        with open(path) as f:
+            return f.read().strip()
+
+    def spawn(self, *args, cwd):
+        p = subprocess.Popen(args, cwd=cwd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.procs.append(p)
+        return p
+
+    def restart(self):
+        return subprocess.run(['devrestart', self.port], cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=60)
+
+    def alive(self, pid):
+        return subprocess.run(['kill', '-0', str(pid)], capture_output=True).returncode == 0
+
+    def test_only_this_checkouts_server_is_stopped(self):
+        other = self.spawn('python3', '-c', self.LISTEN, self.port, cwd=self.other)
+        for _ in range(50):
+            if subprocess.run(['lsof', '-tiTCP:' + self.port, '-sTCP:LISTEN'], capture_output=True).stdout.strip(): break
+            time.sleep(0.1)
+        r = self.restart()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn('outside', r.stdout)
+        self.assertIsNone(other.poll(), 'another project\'s server on the port was killed')
+        other.kill(); other.wait()
+        turbo = self.spawn('python3', '-c', 'import time; time.sleep(300)', 'turbo dev', cwd=self.other)
+        r = self.restart()
+        self.assertIn('up :' + self.port, r.stdout)
+        rec = os.path.join(self.home, '.claude/state/logs/repo/devserver.pid')
+        first = self.read(rec).splitlines()[0]
+        child = self.read(os.path.join(self.tmp.name, 'child.' + first))
+        self.assertTrue(self.alive(first) and self.alive(child))
+        r = self.restart()
+        self.assertIn('up :' + self.port, r.stdout)
+        second = self.read(rec).splitlines()[0]
+        self.assertNotEqual(first, second)
+        time.sleep(0.5)
+        self.assertFalse(self.alive(first), 'the old server was left running')
+        self.assertFalse(self.alive(child), 'the old server\'s child was left running')
+        self.assertIsNone(turbo.poll(), 'an unrelated "turbo dev" process was killed')
+
+    def test_a_stray_listener_in_the_checkout_that_ignores_term_is_not_killed(self):
+        stray = self.spawn('python3', '-c', 'import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); ' + self.LISTEN, self.port, cwd=self.repo)
+        for _ in range(50):
+            if subprocess.run(['lsof', '-tiTCP:' + self.port, '-sTCP:LISTEN'], capture_output=True).stdout.strip(): break
+            time.sleep(0.1)
+        r = self.restart()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn('still held', r.stdout)
+        self.assertIsNone(stray.poll(), 'a listener devrestart did not start was killed')
+
+    def test_a_server_that_ignores_term_is_replaced_not_reported_as_new(self):
+        self.env['IGNORE_TERM'] = '1'
+        self.assertIn('up :' + self.port, self.restart().stdout)
+        rec = os.path.join(self.home, '.claude/state/logs/repo/devserver.pid')
+        first = self.read(rec).splitlines()[0]
+        self.env.pop('IGNORE_TERM')
+        r = self.restart()
+        self.assertIn('up :' + self.port, r.stdout)
+        time.sleep(0.5)
+        self.assertFalse(self.alive(first), 'the old server still answers on the port')
+        listener = subprocess.run(['lsof', '-tiTCP:' + self.port, '-sTCP:LISTEN'], capture_output=True, text=True).stdout.split()
+        self.assertEqual(listener, [self.read(rec).splitlines()[0]])
+
 
 if __name__ == '__main__':
     unittest.main()
