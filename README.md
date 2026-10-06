@@ -2,7 +2,7 @@
 
 Small shell tools for running **many AI coding agents in parallel on one repository** without them tripping over each other. One human decides, one AI lead plans and reviews, and many workers build in their own *lanes*.
 
-Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the lead and the [Codex CLI](https://github.com/openai/codex) for workers, on macOS, in Node/pnpm projects (some tools assume Next.js and PostgreSQL). Each tool is a few hundred lines of shell or JavaScript, so it's easy to read and adapt.
+Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the lead and the [Codex CLI](https://github.com/openai/codex) for workers, on macOS. Lanes work with any git repository; per-lane dev servers and database copies know common web stacks (see [Supported stacks](#supported-stacks)). Each tool is a few hundred lines of shell or JavaScript, so it's easy to read and adapt.
 
 ## The problem
 
@@ -54,10 +54,10 @@ More detail and the reasoning: [docs/concepts.md](docs/concepts.md).
 
 ### 1. Prerequisites
 
-- macOS with `git`, Node.js with `pnpm`, and `python3`.
-- A Next.js app in the repo (`apps/web`, `web` or the root; `--app` for another folder) for `wt-dev`'s per-lane dev server. The app's `.env` is loaded through the project's `dotenv` CLI (`dotenv-cli` as a dev dependency), which is also what points a lane at its own database.
+- macOS with `git` and `python3`, plus your project's own toolchain (Node, Python, Ruby, ...).
+- Optional, for a dev server per lane: a framework `wt-dev` knows, or a dev command in `.wt-dev.conf` (see [Supported stacks](#supported-stacks)). Without one, lanes still get their own worktree, just no server.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for the lead and the [Codex CLI](https://github.com/openai/codex), logged in, for workers.
-- For a database copy per lane: a local PostgreSQL with `psql`, `createdb`, `pg_dump` and `pg_restore` on your PATH, and a `DATABASE_URL` on `localhost` in the repo's root `.env`. Without them, lanes share the database and `wt-dev new` reports why the copy was skipped.
+- Optional, for a database copy per lane: a `DATABASE_URL` on `localhost` in the repo's root `.env` and that database's client tools (PostgreSQL: `psql`, `createdb`, `pg_dump`, `pg_restore`; MySQL/MariaDB: `mysql`, `mysqldump`; SQLite: nothing). Without a `DATABASE_URL`, lanes have no database; a remote one stays shared.
 - For screenshots (`ui-shots`, `wt-compare`): Playwright installed in the project.
 - For the check runner: Homebrew on Apple Silicon (it installs PostgreSQL for test databases when you ask for one). The runner is this machine ([Standalone setup](#standalone-setup-one-machine)) or a second Mac you can SSH into ([Example setup](#example-setup-a-macbook-and-a-mac-mini)).
 
@@ -145,7 +145,35 @@ Presets are the only place model names live. `ao-model ls` shows them; override 
 | A worker shows `STALLED` | Its log has been quiet for a while but the process lives. Check `batches report NAME`; stop it with `batches pause --stalled NAME` before `wk NAME -r`. `batches ack NAME` hides it from the default listing while leaving the process alive. |
 | `mq` says `PARKED` | Read `mq ls` and the lane's last report; fix it in the worktree, `wtcommit`, then `mq add NAME` again. |
 | `remote-ci` exits 3 | The runner is unreachable. `remote-ci info` still shows configured direct/alias and SSH routes; check the cable, network or VPN and `~/.config/agent-lanes/config`. `land` and `mq` treat this as a failed check; only the pre-push hook falls back to a local run. |
-| `wt-dev new` stops with a database error | The copy of the local database failed (missing Postgres tools, `createdb` failure, dump/restore failure or different table counts), so the new worktree was removed. Fix the cause, or rerun with `--shared-db` to use the main database on purpose. No `DATABASE_URL` means no database; a remote one stays shared with a warning. |
+| `wt-dev new` stops with a database error | The copy of the local database failed (missing client tools, a failed create or dump/restore, different table counts, or a database without a built-in adapter: set `WT_DEV_DB_CLONE`/`WT_DEV_DB_DROP`), so the new worktree was removed. Fix the cause, or rerun with `--shared-db` to use the main database on purpose. No `DATABASE_URL` means no database; a remote one stays shared with a warning. |
+
+## Supported stacks
+
+Lanes, claims, the merge queue and the check runner work with any git repository and any test command. Only `wt-dev`'s per-lane dev server, install and database copy need to know your stack. It detects them; an optional `.wt-dev.conf` in the repo overrides anything ([template](skills/wt-dev/templates/wt-dev.conf)).
+
+**Dev servers.** `wt-dev` looks in `apps/web`, `web` and the root (or `--app`), sets `PORT`, and calls the server ready when the port listens.
+
+| Stack | Command `wt-dev` runs | Status |
+|---|---|---|
+| Next.js | `next dev -p $PORT` | Tested (daily use) |
+| Vite (React, Vue, Svelte, Solid, vanilla) | `vite --port $PORT --strictPort` | Tested (a fresh `create vite` app) |
+| Django | `manage.py runserver 127.0.0.1:$PORT` | Tested (a fresh `startproject` app with uv) |
+| Nuxt, SvelteKit, Astro, Angular | `nuxi dev` / `vite dev` / `astro dev` / `ng serve` with the port | Preset, not yet tested |
+| Rails, Laravel, Phoenix | `bin/rails server -p` / `php artisan serve --port` / `mix phx.server` | Preset, not yet tested |
+| Anything else: Express, Fastify, NestJS, FastAPI, Flask, Go, Rust... | `WT_DEV_CMD` in `.wt-dev.conf` (read `PORT`) | Works with any command that listens on `PORT` |
+
+**Installs** follow the lockfiles at the root: pnpm, npm, yarn, bun, uv, poetry, bundler, composer and mix (or `WT_DEV_INSTALL`). `land` reinstalls only when a lockfile changed.
+
+**Databases.** A database on `localhost` in `.env` gets a copy per lane; the lane's `.env` points at it, and removing the lane drops it.
+
+| Database | How a lane gets its copy | Status |
+|---|---|---|
+| PostgreSQL | `createdb` + `pg_dump \| pg_restore`, table counts compared | Tested (daily use) |
+| MySQL / MariaDB | `CREATE DATABASE` + `mysqldump \| mysql`, table counts compared | Tested on MySQL 8.4; MariaDB not yet |
+| SQLite | file copy (a relative path into the worktree, an absolute one next to the original) | Tested |
+| Anything else (MongoDB, SQL Server, a Docker service...) | your `WT_DEV_DB_CLONE` / `WT_DEV_DB_DROP` commands | Tested with a sample hook; the template has a MongoDB example |
+
+The check runner's own database is PostgreSQL (`REMOTE_CI_POSTGRES`). For other databases, start one in `REMOTE_CI_PREPARE` or let the tests use SQLite. Linux support is planned. Pull requests for more presets or adapters are welcome, especially with a smoke test.
 
 ## Standalone setup: one machine
 

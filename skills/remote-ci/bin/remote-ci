@@ -14,7 +14,7 @@ user=${REMOTE_CI_USER:-$(id -un)}
 usage() {
   cat <<'USAGE'
 remote-ci check [--force] [--worktree] [--run "<cmd>"] [--summary] [<commit>]   run the check on the runner
-remote-ci fail [SHA|latest]                                             redacted failure summary + log path
+remote-ci fail [--tail] [SHA|latest]                                    redacted summary or last 80 log lines
 remote-ci blame SHA LANE...                                            rank failing-file overlaps (read-only)
 remote-ci status                                                       lock, runs, disk, Postgres
 remote-ci log [-C n] <regex>                                           grep the latest run's log (no colors)
@@ -28,6 +28,8 @@ cmd=${1:-}; shift || true
 [ "$cmd" = init ] && exec bash "$kit/bin/remote-ci-init" "$@"
 case "$cmd" in check | fail | blame | status | setup | info | log) ;; *) usage; exit 2 ;; esac
 
+tail_flag=""
+if [ "$cmd" = fail ] && [ "${1:-}" = --tail ]; then tail_flag=--tail; shift; fi
 if [ "$cmd" = fail ] || [ "$cmd" = blame ]; then
   target=${1:-latest}
   [ "$cmd" != blame ] || [ $# -ge 2 ] || exit 1
@@ -106,7 +108,7 @@ sync_kit() {
 case "$cmd" in
 fail)
   # Parser runs on SSH stdin: no remote script/config writes or raw log output.
-  "${ssh_cmd[@]}" "python3 - --logs $p/logs '$target'" <"$kit/bin/fail-summary.py" 2>/dev/null
+  "${ssh_cmd[@]}" "python3 - --logs $p/logs $tail_flag '$target'" <"$kit/bin/fail-summary.py" 2>/dev/null
   rc=$?; [ "$rc" = 0 ] && exit 0; exit 1 ;;
 blame)
   failure=$("${ssh_cmd[@]}" "python3 - --logs $p/logs --json '$target'" <"$kit/bin/fail-summary.py" 2>/dev/null) || exit 1

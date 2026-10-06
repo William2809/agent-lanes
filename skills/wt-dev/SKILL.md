@@ -1,6 +1,6 @@
 ---
 name: wt-dev
-description: Create a git worktree with its own Next.js dev server (own port, .env linked, auth URL pointed at the port) so an agent session or worker batch can edit and screenshot without touching another session's working folder. Use for multi-file work when another session shares the repo.
+description: Create a git worktree with its own dev server (own port, framework preset or custom command) and its own copy of the local database (PostgreSQL, MySQL/MariaDB, SQLite or a custom hook), so an agent session or worker batch can edit and screenshot without touching another session's working folder. Use for multi-file work when another session shares the repo.
 ---
 
 # wt-dev
@@ -17,9 +17,11 @@ wt-dev rm ui-batch             # stops the server; refuses if the worktree has c
 wt-dev sleep-idle --minutes 30 -n  # preview idle servers; omit -n to sleep them
 ```
 
-- Links `.env`/`.env.local` (root and `apps/*`); when `.env` has a localhost `DATABASE_URL`, the worktree instead gets its own database (`<db>_wt_<name>`, a copy of the main one) and a real `.env` pointing at it (`--shared-db` opts out; `wt-dev rm` drops it). Runs `pnpm install --frozen-lockfile --prefer-offline` (seconds with pnpm's store).
-- Starts `next dev` in the first of `apps/web`, `web` or the repo root whose package.json depends on `next` (or `--app`), loading `.env` through the repo's `dotenv` CLI and overriding `BETTER_AUTH_URL` / `NEXTAUTH_URL` / `AUTH_URL` to the worktree's port so login works.
+- Settings: an optional `.wt-dev.conf` in the repo (template: `templates/wt-dev.conf`). Without it everything is detected.
+- Links `.env`/`.env.local` (root and `apps/*`). A localhost database in `.env` (`DATABASE_URL`, or `WT_DEV_DB_VAR`) gets a per-worktree copy and the worktree a real `.env` pointing at it: PostgreSQL and MySQL/MariaDB are cloned to `<db>_wt_<name>`, an SQLite file is copied (a relative path into the worktree, an absolute one next to the original). `WT_DEV_DB_CLONE` / `WT_DEV_DB_DROP` handle any other database. `--shared-db` opts out; `wt-dev rm` drops the copy.
+- Installs from the lockfiles at the root (pnpm, npm, yarn, bun, uv, poetry, bundler, composer, mix) or `WT_DEV_INSTALL`. `wt-dev install NAME --if-changed` reinstalls only when a lockfile changed (`land` uses it); `-n` prints the commands.
+- Starts the dev server of the first of `apps/web`, `web` or the root with a known framework (or `--app` / `WT_DEV_APP`): Next.js, Nuxt, SvelteKit, Astro, Angular, Vite, Django, Rails, Laravel, Phoenix; or `WT_DEV_CMD` for anything else (Go, Rust, Express, FastAPI...). `PORT` is set; the server is ready when the port listens. No framework and no command: the worktree has no server. `.env` is loaded through the repo's `dotenv` CLI when it has one, otherwise by wt-dev; `BETTER_AUTH_URL` / `NEXTAUTH_URL` / `AUTH_URL` (Laravel: also `APP_URL`; or `WT_DEV_URL_VARS`) point at the worktree's port so login works. `stop` ends the whole process tree.
 - Screenshot it with `ui-shots --base http://localhost:<port>` and audit with `ui-audit --base …`.
 - Each database starts as a copy of the main local database. Data and migrations stay there. Nothing migrates on dev start. Clone failures remove the fresh worktree and stop setup. Rerun with `--shared-db` or `WT_DEV_SHARED_DB=1` to share on purpose. No `DATABASE_URL` means no database. Remote databases stay shared with a warning.
 - Setups share `max(1, logical CPUs / 2)` machine-wide slots until the server is ready or setup fails. `WT_DEV_MAX_SETUPS` overrides the limit. Dead slots are reclaimed. Running servers do not count. Slot coordination requires `python3`.
-- `sleep-idle` sleeps running servers after 30 minutes without log writes and with no outside process working inside the worktree. `--minutes N` changes the timeout. `-n` prints `would sleep NAME`. `new` runs this quietly first. `ls` shows `sleeping`; `start NAME` wakes it. Cwd checks use `lsof`.
+- `sleep-idle` sleeps running servers (dropping their build caches) after 30 minutes without log writes and with no outside process working inside the worktree. `--minutes N` changes the timeout. `-n` prints `would sleep NAME`. `new` runs this quietly first. `ls` shows `sleeping`; `start NAME` wakes it. Cwd checks use `lsof`.
