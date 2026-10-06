@@ -6,6 +6,7 @@
 #   wtdev_db.py drop sqlite|mysql REPO WT STATE VAR
 #   wtdev_db.py env-set SRC DST VAR < VALUE               -> copy SRC to DST (mode 600) with VAR=VALUE (stdin)
 #   wtdev_db.py env-exec ENVFILE -- CMD...                -> exec CMD with ENVFILE's vars (existing env wins)
+#   wtdev_db.py pgname SRC NAME                           -> the lane's Postgres database name
 import hashlib, os, re, shutil, sqlite3, subprocess, sys, tempfile
 from urllib.parse import urlsplit, urlunsplit, unquote
 
@@ -67,6 +68,14 @@ def suffix(name):
     """Per-lane suffix; names that lose characters get a hash, so a-b and a_b never share a copy."""
     s = re.sub(r'[^a-z0-9]', '_', name.lower())
     return s if s == name else f'{s}_{hashlib.sha1(name.encode()).hexdigest()[:6]}'
+
+
+def pgname(src, name):
+    """SRC_wt_<suffix>, within Postgres's 63-byte limit (a longer name gets a hash, never a silent cut)."""
+    dst = f'{src}_wt_{suffix(name)}'
+    if len(dst.encode()) > 63:
+        dst = dst.encode()[:54].decode(errors='ignore') + '_' + hashlib.sha1(dst.encode()).hexdigest()[:8]
+    return dst
 
 
 def inside(path, root):
@@ -269,6 +278,9 @@ def main(argv):
             if k and k not in os.environ:
                 os.environ[k] = v
         os.execvp(rest[0], rest)
+    if cmd == 'pgname':
+        print(pgname(argv[2], argv[3]))
+        return
     if cmd == 'env-set':
         src, dst, var = argv[2:5]
         value = sys.stdin.read().rstrip('\n')

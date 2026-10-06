@@ -16,18 +16,44 @@ target=$(git -C "$main" symbolic-ref -q HEAD) || target=""
 [ -z "${LAND_TARGET:-}" ] || [ "$target" = "$LAND_TARGET" ] ||
   { echo "FAILED target moved (main checkout is on $base, not ${LAND_TARGET#refs/heads/})"; exit 1; }
 [ -n "$target" ] || { echo "FAILED main checkout is not on a branch"; exit 1; }
-restore=""
 # LAND_TAIL (environment variable, set by mq): file that gets a bounded raw tail of a failed step's output,
 # so mq can classify transient faults the short summary below drops. Same trust as the runner's own logs.
 [ -z "${LAND_TAIL:-}" ] || : >"$LAND_TAIL"
 keep_tail() { [ -z "${LAND_TAIL:-}" ] || printf '%s\n' "$out" | tail -80 | cut -c1-300 >"$LAND_TAIL"; }
-# On failure, put every stacked worktree back on its own original commit, so a failed
-# train never leaves one batch carrying another's commits.
-fail() {
-  for pair in $restore; do git -C "${pair%%=*}" reset -q --hard "${pair#*=}" 2>/dev/null; done
-  [ -n "$restore" ] && echo "restored worktrees to their original commits"
-  echo "FAILED $*"; exit 1
+# On failure or interruption, put every stacked worktree back on its own original commit, so a
+# failed train never leaves one batch carrying another's commits. One "dir<TAB>sha" per line.
+tab=$(printf '\t')
+restore=$(mktemp "${TMPDIR:-/tmp}/land-restore.XXXXXX") || { echo "FAILED no temp file"; exit 1; }
+rebasing() {
+  for _r in rebase-merge rebase-apply; do
+    _p=$(git -C "$1" rev-parse --git-path "$_r" 2>/dev/null) && [ -d "$_p" ] && return 0
+  done
+  return 1
 }
+restore_all() {
+  _ok=0; _bad=""
+  while IFS=$tab read -r _dir _sha; do
+    rebasing "$_dir" && git -C "$_dir" rebase --abort 2>/dev/null
+    # Restored = no rebase left, the reset worked and HEAD is the original commit.
+    if ! rebasing "$_dir" && git -C "$_dir" reset -q --hard "$_sha" 2>/dev/null &&
+       [ "$(git -C "$_dir" rev-parse HEAD 2>/dev/null)" = "$_sha" ]; then _ok=$((_ok + 1)); else _bad="$_bad ${_dir##*/}"; fi
+  done <"$restore"
+  : >"$restore"
+  [ "$_ok" = 0 ] || echo "restored $_ok worktree(s) to their original commits"
+  [ -z "$_bad" ] || echo "NOT restored (check by hand):$_bad"
+}
+fail() { trap - EXIT INT TERM HUP; restore_all; rm -f "$restore"; echo "FAILED $*"; exit 1; }
+# A stopped runner (INT/TERM/HUP, or an error exit) restores too. A signal waits for the running step.
+interrupted() {
+  trap - EXIT INT TERM HUP
+  # Stopped right after the merge: the lanes landed; putting them back would undo nothing and confuse mq.
+  if [ -n "${full:-}" ] && git -C "$main" merge-base --is-ancestor "$full" "$target" 2>/dev/null; then
+    rm -f "$restore"; echo "LANDED $sha on $base (interrupted after the merge; post-land and cleanup skipped)"; exit 0
+  fi
+  restore_all; rm -f "$restore"; echo "FAILED interrupted ($1)"; exit "$2"
+}
+trap 'interrupted exit 1' EXIT
+trap 'interrupted INT 130' INT; trap 'interrupted TERM 143' TERM; trap 'interrupted HUP 129' HUP
 
 # 1. Stack: each worktree rebases onto the previous one's tip (the first onto the branch).
 onto=$base; last=""; last_name=""
@@ -35,17 +61,24 @@ for name in $names; do
   wt=$(wt-dev path "$name") || fail "no worktree $name"
   [ -z "$(git -C "$wt" status --porcelain -- . ':!.reviews')" ] || fail "$name dirty (commit first)"
   [ "$(git -C "$wt" rev-list --count "$base..HEAD")" -gt 0 ] || fail "$name has nothing to land"
-  restore="$restore $wt=$(git -C "$wt" rev-parse HEAD)"
+  printf '%s\t%s\n' "$wt" "$(git -C "$wt" rev-parse HEAD)" >>"$restore"
   git -C "$wt" rebase -q "$onto" >/dev/null 2>&1 || { git -C "$wt" rebase --abort 2>/dev/null; fail "$name conflicts onto $onto"; }
   onto=$(git -C "$wt" rev-parse HEAD); last=$wt; last_name=$name
   echo "stacked $name"
 done
 wt=$last
-command -v migcheck >/dev/null && { migcheck "$wt" || fail "migration journal (renumber with a newer when)"; }
+# at: the candidate (stack tip) every failure from here names, so mq can blame a lane from it.
+at() { _s=$(git -C "$wt" rev-parse --short HEAD); echo "on $_s ($base..$_s)"; }
+# tree_clean STEP: a step that edits tracked files would make the checked tree differ from the commit.
+tree_clean() {
+  changed=$(git -C "$wt" status --porcelain --untracked-files=no)
+  [ -z "$changed" ] || { printf '%s\n' "$changed" | head -5; fail "$1 changed tracked files $(at)"; }
+}
+command -v migcheck >/dev/null && { migcheck "$wt" || fail "migration journal (renumber with a newer when) $(at)"; }
 
 # 2. Baseline once, on the tip.
 if [ -f "$wt/tools/check-file-size.mjs" ]; then
-  out=$(cd "$wt" && node tools/check-file-size.mjs --update 2>&1) || { printf "%s\n" "$out" | tail -8; fail "file-size ratchet"; }
+  out=$(cd "$wt" && node tools/check-file-size.mjs --update 2>&1) || { keep_tail; printf "%s\n" "$out" | tail -8; fail "file-size ratchet $(at)"; }
   git -C "$wt" diff --quiet -- tools/file-size-baseline.json ||
     { git -C "$wt" commit -q -m "chore(tooling): lower file-size baseline" -- tools/file-size-baseline.json; echo "baseline lowered"; }
 fi
@@ -54,10 +87,13 @@ fi
 # Install when dependencies are missing (--no-install worktree) or a lockfile differs from the
 # one last installed here (the rebase picked up a new dependency: without this, lanes fail
 # typecheck after another lane added a package). wt-dev picks the commands from the lockfiles.
-out=$(wt-dev install "$last_name" --if-changed 2>&1) || { printf '%s\n' "$out" | tail -6; fail "install"; }
+out=$(wt-dev install "$last_name" --if-changed 2>&1) || { keep_tail; printf '%s\n' "$out" | tail -6; fail "install $(at)"; }
 [ -z "$out" ] || printf '%s\n' "$out"
+tree_clean install
 if [ -x "$main/tools/land-preflight.sh" ]; then
-  out=$(cd "$wt" && sh "$main/tools/land-preflight.sh" "$base" 2>&1) || { keep_tail; printf '%s\n' "$out" | tail -8; fail "preflight"; }
+  out=$(cd "$wt" && sh "$main/tools/land-preflight.sh" "$base" 2>&1); rc=$?
+  [ $rc -eq 0 ] || { keep_tail; printf '%s\n' "$out" | tail -8; fail "preflight rc=$rc $(at)"; }
+  tree_clean preflight
   echo "preflight ok"
 fi
 
@@ -77,17 +113,16 @@ while :; do
 done
 [ $rc -eq 0 ] || { keep_tail; printf '%s\n' "$out" | grep -E "FAIL|Failed:|rror" | head -8; fail "check rc=$rc on $sha ($base..$sha)"; }
 # Only the tree that was checked may land: a check that edits tracked files or commits tested something else.
-changed=$(git -C "$wt" status --porcelain --untracked-files=no)
-if [ -n "$changed" ] || [ "$(git -C "$wt" rev-parse HEAD)" != "$full" ]; then
-  [ -z "$changed" ] || printf '%s\n' "$changed" | head -5
-  fail "check changed tracked files (the checked tree is not commit $sha)"
-fi
+[ "$(git -C "$wt" rev-parse HEAD)" = "$full" ] || fail "check changed tracked files (the checked tree is not commit $sha)"
+tree_clean check
 echo "check green ($sha)"
 
 # 5. Merge and clean up.
 [ "$(git -C "$main" symbolic-ref -q HEAD)" = "$target" ] || fail "target moved (main checkout left $base during the check)"
 prev=$(git -C "$main" rev-parse HEAD)
 git -C "$main" merge -q --ff-only "$sha" 2>/dev/null || fail "ff-merge ($base moved; rerun land)"
+# Landed: the stacked commits are on the branch now; nothing to put back.
+trap - EXIT INT TERM HUP; rm -f "$restore"
 # Optional repo hook: refresh the main checkout (install, migrate, health) after the merge.
 # Contract: runs in the main checkout as `tools/post-land.sh OLD_SHA NEW_SHA` (env LAND_BRANCH);
 # its lines starting with "refresh:" are shown; a failure is reported, never undoes the land.

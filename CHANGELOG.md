@@ -4,6 +4,21 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-06
+
+### Changed
+
+- A lane's `wt-dev` commands (`start`, `install`, `stop`, removal) read the lane's own `.wt-dev.conf`, and `wt-dev new` reads the one committed at `--from`. Before, every lane used the main checkout's file, so a lane could not test a change to it, and `land` installed with the main checkout's settings. Removal drops the database with the settings recorded at `new`.
+- `land` names the candidate commit on every failed step: `FAILED preflight rc=N on SHA (main..SHA)`, and the same for `install`, `file-size ratchet` and `migration journal`. `mq` blames a lane for a red preflight from its output, with the same ranking as a red check, and keeps landing one at a time when no lane stands out.
+- Lanes of a second repo whose folder has the same name as another repo's get their own folder, `~/worktrees/<name>-<hash>`. The first repo keeps `~/worktrees/<name>`, so existing lanes do not move.
+
+### Fixed
+
+- `wt-dev new` gives each lane its own Postgres database name: a name that loses characters gets a hash (`review-a` -> `main_wt_review_a_3da35f`), and a name longer than 63 bytes is hashed, not cut. Each copy is marked as its lane's (`COMMENT ON DATABASE`). `wt-dev new` refuses an existing database without its lane's mark instead of dropping it, and removal keeps a database marked as another lane's. Before, `review-a` and `review_a` shared one database, and creating one dropped the other's.
+- `land` restores stacked lanes when it is interrupted (INT, TERM, HUP) and reports only the lanes it really restored. Before, a stopped train left a lane carrying another lane's commits, and lanes whose path held a space were not restored although land said they were. `mq run` stops with the lanes still queued when `land` was interrupted.
+- `land` fails as `install changed tracked files` or `preflight changed tracked files` when those steps edit a tracked file. Before, the check reported it under its own name.
+- `devrestart` stops only the server it started for this checkout (its process group) and listeners running inside the checkout. Before, it ran `pkill -f "turbo dev"` and killed whatever listened on the port, including other projects' servers.
+
 ## [0.6.0] - 2026-10-06
 
 ### Changed

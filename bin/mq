@@ -180,8 +180,9 @@ disk_low() {
   awk -v f="$gb" -v t="${DISKGUARD_PAUSE:-5}" 'BEGIN{exit !(f<t)}'
 }
 
-# Only the final full-check failure carries a diagnostic SHA.
+# Only the final full-check failure has remote diagnostics; earlier steps name the candidate too.
 check_sha() { printf '%s\n' "$1" | sed -n 's/^FAILED check rc=[0-9][0-9]* on \([0-9a-f][0-9a-f]*\) (.*)$/\1/p'; }
+step_sha() { printf '%s\n' "$1" | sed -n 's/^FAILED [a-z][a-z -]* .*on \([0-9a-f]\{7,40\}\) ([^ ]*)$/\1/p'; }
 check_failure() {
   _sha=$(check_sha "$1"); [ -n "$_sha" ] || return 0
   python3 "$MQ_TOOL_ROOT/bin/mq-diagnostics.py" fail "$_sha" 2>/dev/null
@@ -195,7 +196,7 @@ transient_retry() (
   done
   if [ $# -eq 1 ]; then _id=${_heads# }; else _id=$(printf '%s\n' "$@" $_heads | shasum | cut -c1-16); fi
   _mark="$st/transient.$_key.$_id"; [ ! -f "$_mark" ] || exit 1
-  case "$last" in 'FAILED check '*|'FAILED preflight'|'FAILED file-size ratchet') ;; *) exit 1 ;; esac
+  case "$last" in 'FAILED check '*|'FAILED preflight'|'FAILED preflight '*|'FAILED file-size ratchet'*|'FAILED install'*) ;; *) exit 1 ;; esac
   _sha=$(check_sha "$last")
   # Classify land's raw tail; a land without LAND_TAIL support leaves only its printed summary.
   if [ -s "$LAND_TAIL" ]; then _text=$(cat "$LAND_TAIL"); else _text=$(printf '%s\n' "$out" | tail -80); fi
@@ -205,10 +206,11 @@ transient_retry() (
   : >"$_mark" || exit 1
   printf '%s\n' "$_marker"
 )
-# The main checkout left the pinned branch: stop, keep the lanes queued (no bounce, no retry).
-target_moved() {
-  case "$last" in 'FAILED target moved'*) ;; *) return 1 ;; esac
-  echo "mq: stopping, ${last#FAILED }; lanes stay queued"; ev mq target-moved "${last#FAILED }" || true
+# The main checkout left the pinned branch, or land was interrupted (it restored the lanes):
+# stop, keep the lanes queued (no bounce, no retry).
+land_stopped() {
+  case "$last" in 'FAILED target moved'*) _ev=target-moved ;; 'FAILED interrupted'*) _ev=interrupted ;; *) return 1 ;; esac
+  echo "mq: stopping, ${last#FAILED }; lanes stay queued"; ev mq "$_ev" "${last#FAILED }" || true
   return 0
 }
 # Observe outcomes before finished fixers can requeue. Each original lane is counted once.
@@ -260,11 +262,18 @@ red_train() {
   red_pending=$ws; red_landed=""; red_bounced=""; red_parked=""
   suspect=""; blame_reason=""; solo=$n
   _failure=$(check_failure "$last")
-  _test=$(printf '%s\n' "$_failure" | awk '/^File: / && !f {f=substr($0,7)} /^Test: / && !t {t=substr($0,7)} END {print t ? t : (f ? f : "unknown")}')
   _hint=""; _sha=$(check_sha "$last")
   if [ -n "$_sha" ]; then
     _hint=$(python3 "$MQ_TOOL_ROOT/bin/mq-diagnostics.py" suspect "$_sha" $ws 2>/dev/null)
+  else
+    # Preflight/install/ratchet: blame from land's local output, with the same ranking.
+    _sha=$(step_sha "$last")
+    if [ -n "$_sha" ] && [ -s "$LAND_TAIL" ]; then
+      _failure=$(python3 "$MQ_TOOL_ROOT/bin/mq-diagnostics.py" local-fail "$_sha" <"$LAND_TAIL" 2>/dev/null)
+      _hint=$(python3 "$MQ_TOOL_ROOT/bin/mq-diagnostics.py" local-suspect "$_sha" $ws <"$LAND_TAIL" 2>/dev/null)
+    fi
   fi
+  _test=$(printf '%s\n' "$_failure" | awk '/^File: / && !f {f=substr($0,7)} /^Test: / && !t {t=substr($0,7)} END {print t ? t : (f ? f : "unknown")}')
   if [ -n "$_hint" ]; then
     suspect=${_hint%%: *}; blame_reason=${_hint#*: }; next_lanes=""
     for _lane in $ws; do [ "$_lane" = "$suspect" ] || next_lanes="$next_lanes $_lane"; done
@@ -570,7 +579,7 @@ while :; do
         r=$(printf '%s\n' "$out" | grep '^refresh:' | head -1); [ -z "$r" ] || ev train refresh "${r#refresh: }"
         echo "train$ws: $last"; continue ;;
     esac
-    target_moved && break
+    land_stopped && break
     why=${last#FAILED }; ev train train-failed "$why"
     red_train
     # Preserve the conflict pick path even when the remaining subgroup conflicts.
@@ -596,7 +605,7 @@ while :; do
       printf '%s\n' "$out" | grep -E '^(refresh:|cleanup failed)' | sed "s/^/$w: /"
       r=$(printf '%s\n' "$out" | grep '^refresh:' | head -1); [ -z "$r" ] || ev "$w" refresh "${r#refresh: }"; echo "$w: $last"; printf '%s\t%s\t%s\n' "$(date +%FT%T)" "$w" "$last" >>"$st/history"; continue ;;
   esac
-  target_moved && break
+  land_stopped && break
   why=${last#FAILED }; b=$(( $(field "$w" 3) + 1 ))
   # Already merged (e.g. the runner died after landing it): drop it instead of bouncing.
   case "$why" in *"has nothing to land"*) delq "$w"; ev "$w" dropped "already on branch"; echo "$w: already on the branch; dropped"; continue ;; esac
