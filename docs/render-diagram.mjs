@@ -1,7 +1,9 @@
-// Regenerate the SVGs from a scene: node docs/render-diagram.mjs [pipeline|standalone] [--png DIR]   (needs network; temp-installs Playwright if missing)
+// Regenerate a scene's SVGs and 2x PNGs: node docs/render-diagram.mjs [pipeline|standalone] [--png DIR]   (needs network; temp-installs Playwright if missing)
 //
 // Loads Excalidraw in headless Chromium and calls its own exportToSvg, once light and once
-// with exportWithDarkMode. Fonts are inlined as data: URLs so GitHub can render the SVG.
+// with exportWithDarkMode. Fonts are inlined as data: URLs so GitHub can render the SVG in the README.
+// The PNGs (next to the SVGs unless --png DIR) are the README's click-to-open full-size targets:
+// raw.githubusercontent.com's CSP blocks the SVG's embedded font, so an opened SVG falls back to a serif font.
 // --png DIR also writes 2x PNG previews there (for checking the result; not committed).
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -16,7 +18,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const sceneName = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : "pipeline";
 const scene = JSON.parse(readFileSync(join(here, `${sceneName}.excalidraw`), "utf8"));
 const pngIdx = process.argv.indexOf("--png");
-const pngDir = pngIdx > 0 ? process.argv[pngIdx + 1] : null;
+const pngDir = pngIdx > 0 ? process.argv[pngIdx + 1] : here;
 
 async function loadPlaywright() {
   try {
