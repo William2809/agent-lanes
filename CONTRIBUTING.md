@@ -32,6 +32,12 @@ done
 
 Then try the changed tool for real (for example, launch a worker with `wk`, or land a test lane with `mq`). Say in the pull request what you ran and on which OS, and what you could not test.
 
+## Versions and the changelog
+
+- Versions follow [Semantic Versioning](https://semver.org/). Before 1.0, a minor version (0.x.0) adds features or changes behaviour, and a patch version (0.x.y) only fixes things.
+- Every pull request that changes behaviour adds a line under `## [Unreleased]` in `CHANGELOG.md` (Added, Changed, Fixed or Removed).
+- A release moves those lines under a new version heading, sets `VERSION`, and tags `vX.Y.Z` on `main` with a GitHub release.
+
 ## Pull requests
 
 - Describe the problem first, then the change.

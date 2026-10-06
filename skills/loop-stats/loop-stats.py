@@ -193,7 +193,7 @@ def url_timeouts(output):
 
 
 def categories(command):
-    """Timebudget families, extended with explicit browser executions."""
+    """Command families, plus explicit browser executions."""
     found = {6} if node_browser_heredoc(command) else set()
     for words in shell_segments(command):
         while words and (re.match(r'^[A-Za-z_][\w]*=', words[0]) or
@@ -383,7 +383,7 @@ def parse_session(path):
             call = calls.pop(payload.get('call_id'), None)
             if call:
                 a, cats, name, keys = call
-                # Tools with no shell command remain other, as in timebudget.
+                # Tools with no shell command stay in other.
                 output = payload.get('output', '')
                 timeouts = locator_timeouts(output) if 6 in cats and isinstance(output, str) else 0
                 tools.append(dict(start=a, end=at, cats=cats, call_id=payload.get('call_id'), command_keys=keys, sleep='sleep' in name, locator_timeouts=timeouts,
