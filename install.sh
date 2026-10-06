@@ -6,7 +6,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 bin=${BIN_DIR:-$HOME/.local/bin}; skills=${SKILLS_DIR:-$HOME/.claude/skills}; cfg=$HOME/.config/agent-lanes
 mkdir -p "$bin" "$skills" "$cfg" "$HOME/.claude/state/headers"
 link() { if [ -e "$2" ] && [ ! -L "$2" ]; then echo "skip $2 (a real file is there)"; else ln -sfn "$1" "$2"; echo "linked $2"; fi; }
-for t in "$here"/bin/*; do link "$t" "$bin/$(basename "$t")"; done
+for t in "$here"/bin/*; do case $(basename "$t") in *.py|test_*) continue ;; esac; link "$t" "$bin/$(basename "$t")"; done
 for s in "$here"/skills/*/; do s=${s%/}; link "$s" "$skills/$(basename "$s")"; done
 for t in wt-dev/bin/wt-dev wt-dev/bin/land wt-dev/bin/wtcommit wt-dev/bin/migcheck wt-dev/bin/devrestart \
          remote-ci/bin/remote-ci codex-limit/bin/codex-limit codex-limit/bin/codex-watch agent-workers/scripts/batches.sh:batches ui-audit/bin/ui-audit ui-shots/bin/ui-shots \

@@ -1,10 +1,15 @@
 #!/usr/bin/env node
-// ABOUTME: Logs in to a local app as a role (like ui-shots) and runs a Playwright step script against it.
-// ABOUTME: Usage (from project root): pw-run --base URL --as ROLE [--width 1440] script.mjs  (script default-exports async ({page, base, shot}) => {})
+// ABOUTME: Runs a role-authenticated Playwright script; first locator failure saves diagnostics and exits 1.
+// ABOUTME: Usage (project root): pw-run --base URL --as ROLE [--width 1440] script.mjs (default async ({page, base, shot}) => {})
 import { createRequire } from "node:module"
-import { readFileSync, existsSync } from "node:fs"
+import { readFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { join, resolve } from "node:path"
+import { tmpdir } from "node:os"
 import { pathToFileURL } from "node:url"
+import { authenticatedState, authCounts, authLine, redact } from "./auth-cache.mjs"
+import { readyTimeout, waitReady } from "./readiness.mjs"
+import { guardLocators } from "./locator-guard.mjs"
+
 const args = process.argv.slice(2)
 const opt = { base: "http://localhost:3000", width: 1440, role: "ADMIN", script: "" }
 for (let i = 0; i < args.length; i++) {
@@ -12,7 +17,14 @@ for (let i = 0; i < args.length; i++) {
   if (a === "--base") opt.base = args[++i]
   else if (a === "--as") opt.role = args[++i].toUpperCase()
   else if (a === "--width") opt.width = Number(args[++i])
-  else opt.script = a
+  else if (a === "--auth-ttl") opt.authTtl = args[++i]
+  else if (a === "--ready") opt.ready = args[++i]
+  else if (a === "--ready-timeout") opt.readyTimeout = args[++i]
+  else if (a === "--timeout") opt.timeout = args[++i]
+  else if (a === "-h" || a === "--help") {
+    console.log("usage: pw-run --base URL --as ROLE [--width N] [--auth-ttl SECONDS] [--timeout MS] [--ready CSS] [--ready-timeout MS] script.mjs\nPW_ACTION_TIMEOUT_MS defaults to 5000; PW_OUT is the run folder (default a unique /tmp/pw-run-* folder).")
+    process.exit(0)
+  } else opt.script = a
 }
 if (!opt.script) { console.error("usage: pw-run --base URL --as ROLE [--width N] script.mjs"); process.exit(2) }
 const base = new URL(opt.base)
@@ -20,66 +32,86 @@ if (!['http:', 'https:'].includes(base.protocol) ||
     (!['localhost', '127.0.0.1', '[::1]'].includes(base.hostname) && process.env.UI_SHOTS_ALLOW_REMOTE !== '1')) {
   console.error("pw-run: refusing credentials for remote base; set UI_SHOTS_ALLOW_REMOTE=1"); process.exit(2)
 }
-
-async function fillLogin(page, login, emailSel, passwordSel, email, password) {
-  let redirected = false
-  const crossOrigin = request => request.isNavigationRequest() && request.frame() === page.mainFrame() && new URL(request.url()).origin !== base.origin
-  // Request events include every HTTP redirect; route handlers see only the first URL.
-  const observe = request => { if (crossOrigin(request)) redirected = true }
-  page.on("request", observe)
-  const guard = async route => {
-    const request = route.request()
-    if (crossOrigin(request)) {
-      redirected = true; await route.abort()
-    } else await route.continue()
-  }
-  await page.route("**/*", guard)
-  try {
-    await page.goto(opt.base + login)
-    if (new URL(page.url()).origin !== base.origin) redirected = true
-    if (!redirected) await page.fill(emailSel, email)
-    if (!redirected) await page.fill(passwordSel, password)
-  } catch (error) {
-    if (!redirected) throw error
-  } finally {
-    await page.unroute("**/*", guard)
-    page.off("request", observe)
-  }
-  if (redirected) {
-    const error = new Error("pw-run: refusing credentials: login redirected to another origin")
-    error.credentialRefusal = true; throw error
-  }
-}
-
+const timeout = Number(opt.timeout ?? process.env.PW_ACTION_TIMEOUT_MS ?? 5000)
+if (!Number.isFinite(timeout) || timeout <= 0) { console.error("pw-run: timeout must be positive milliseconds"); process.exit(2) }
 const env = {}
 if (existsSync(".env")) for (const line of readFileSync(".env", "utf8").split("\n")) {
   const m = line.match(/^([A-Z0-9_]+)=(.*)$/); if (m) env[m[1]] = m[2].replace(/^["']|["']$/g, "")
 }
-const val = (k) => process.env[k] ?? env[k]
+const val = k => process.env[k] ?? env[k]
 const login = val("UI_SHOTS_LOGIN") || "/login"
 let pre = val("UI_SHOTS_ROLE_PREFIX")
-if (pre === undefined) { const k = Object.keys(env).filter((k) => k.endsWith(`_${opt.role}_EMAIL`) || k === `${opt.role}_EMAIL`); if (k.length === 1) pre = k[0].slice(0, -`${opt.role}_EMAIL`.length) }
+if (pre === undefined) {
+  const k = Object.keys(env).filter(k => k.endsWith(`_${opt.role}_EMAIL`) || k === `${opt.role}_EMAIL`)
+  if (k.length === 1) pre = k[0].slice(0, -`${opt.role}_EMAIL`.length)
+}
 if (pre === undefined) { console.error(`pw-run: no single .env key ends in _${opt.role}_EMAIL; set UI_SHOTS_ROLE_PREFIX`); process.exit(2) }
+const secrets = [val(`${pre}${opt.role}_EMAIL`), val(`${pre}${opt.role}_PASSWORD`)].filter(Boolean)
 const require = createRequire(join(process.cwd(), "package.json"))
 let chromium
 try { ({ chromium } = require("@playwright/test")) } catch { ({ chromium } = require("playwright")) }
-const browser = await chromium.launch()
+const counts = authCounts()
+const out = process.env.PW_OUT ? resolve(process.env.PW_OUT) : mkdtempSync(join(tmpdir(), "pw-run-"))
+mkdirSync(out, { recursive: true })
+let browser, page, failing = false, counted = false
+const report = () => { if (!counted) { console.log(authLine("pw-run", counts)); counted = true } }
+const diagnostics = async () => {
+  const snapshot = join(out, "failure.aria.yml"), screenshot = join(out, "failure.png")
+  try {
+    const text = await page.locator("body").ariaSnapshot({ timeout: 5000 })
+    writeFileSync(snapshot, redact(text, secrets), { mode: 0o600 })
+    console.error(`pw-run: snapshot=${snapshot}`)
+  } catch { console.error("pw-run: accessibility snapshot unavailable") }
+  try {
+    await page.screenshot({ path: screenshot, fullPage: true, caret: "initial", timeout: 5000,
+      mask: [page.locator('input[type="password"], input[name="password"], input[type="email"], input[name="email"]')] })
+    console.error(`pw-run: screenshot=${screenshot}`)
+  } catch { console.error("pw-run: failure screenshot unavailable") }
+}
+const failLocator = async (error, failedPage) => {
+  if (!failing) {
+    failing = true
+    process.exitCode = 1
+    page = failedPage || page
+    console.error(`pw-run: locator failed: ${redact(error.message, secrets).split("\n")[0]}`)
+    await diagnostics()
+    report()
+    // Exit even if browser shutdown fails: worker catch/retry must never resume.
+    try { await browser.close() } finally { process.exit(1) }
+  }
+  return new Promise(() => {})
+}
 try {
-  const context = await browser.newContext({ viewport: { width: opt.width, height: 900 }, deviceScaleFactor: 1 })
-  const page = await context.newPage()
+  const readiness = readyTimeout(opt.readyTimeout ?? process.env.PW_READY_TIMEOUT_MS)
+  browser = await chromium.launch()
+  const { storageState, landingUrl } = await authenticatedState(browser, {
+    base: opt.base, role: opt.role, login, ttl: opt.authTtl,
+    emailSel: 'input[type="email"], input[name="email"]', passwordSel: 'input[type="password"]', submitSel: 'button[type="submit"]',
+    credentials: () => ({ email: val(`${pre}${opt.role}_EMAIL`), password: val(`${pre}${opt.role}_PASSWORD`) }),
+  }, counts)
+  const context = await browser.newContext({ viewport: { width: opt.width, height: 900 }, deviceScaleFactor: 1, storageState })
+  context.setDefaultTimeout(timeout)
+  context.setDefaultNavigationTimeout(30000)
+  page = await context.newPage()
   const errors = []
-  page.on("console", (m) => { if (m.type() === "error") errors.push(m.text().split("\n")[0].slice(0, 300)) })
-  page.on("pageerror", (e) => errors.push("pageerror: " + String(e.message).split("\n")[0]))
-  const email = val(`${pre}${opt.role}_EMAIL`), password = val(`${pre}${opt.role}_PASSWORD`)
-  await fillLogin(page, login, 'input[type="email"], input[name="email"]', 'input[type="password"]', email, password)
-  await Promise.all([page.waitForURL((u) => !u.pathname.startsWith(login), { timeout: 20000 }), page.click('button[type="submit"]')])
+  page.on("console", m => { if (m.type() === "error") errors.push(m.text().split("\n")[0].slice(0, 300)) })
+  page.on("pageerror", e => errors.push("pageerror: " + String(e.message).split("\n")[0]))
+  // Preserve the old entry point: scripts start on the authenticated landing page.
+  await page.goto(landingUrl, { waitUntil: "domcontentloaded" })
+  await waitReady(page, opt.ready, readiness)
   const { default: run } = await import(pathToFileURL(resolve(opt.script)).href)
   let n = 0
-  const shot = async (name) => { const f = resolve(process.env.PW_OUT || "/tmp", `${name || "shot" + ++n}.png`); await page.screenshot({ path: f, fullPage: true }); console.log(f) }
-  try { await run({ page, base: opt.base, shot }) }
-  catch (e) { console.log("FAILED:", String(e.message).split("\n").slice(0, 3).join(" | ")); await shot("failure") }
-  finally { for (const e of [...new Set(errors)]) console.log("console:", e) }
+  const shot = async name => {
+    const file = join(out, `${name || "shot" + ++n}.png`)
+    await page.screenshot({ path: file, fullPage: true, caret: "initial" }); console.log(file)
+  }
+  try { await run({ page: guardLocators(page, failLocator, readiness, opt.ready), base: opt.base, shot }) }
+  catch (error) {
+    console.error(`pw-run: FAILED: ${redact(error.message, secrets).split("\n")[0]}`)
+    process.exitCode = 1
+    await diagnostics()
+  } finally { for (const error of [...new Set(errors)]) console.log("console:", redact(error, secrets)) }
 } catch (error) {
-  if (!error.credentialRefusal) throw error
-  console.error(error.message); process.exitCode = 2
-} finally { await browser.close() }
+  console.error(`pw-run: ${redact(error.message, secrets).split("\n")[0]}`)
+  process.exitCode = error.credentialRefusal ? 2 : 1
+} finally { report(); if (browser) await browser.close() }

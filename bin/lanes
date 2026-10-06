@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+# ABOUTME: One attention view per repo: each lane (worker / wt-dev worktree / mq entry, joined by name)
+# ABOUTME: on one line with worker state, queue state, dev server, dirty files and age. Read-only.
+"""Usage (inside a repo):
+  lanes            this repo's lanes: needs-you first, then in progress, then done in the last hour
+  lanes --all      every repo that has merge-queue state
+  lanes --done     also list done lanes older than an hour
+Exit 3 when anything needs attention (same as batches)."""
+import os
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser('~')
+STATE = os.path.join(HOME, '.claude', 'state')
+NOW = int(time.time())
+TTY = sys.stdout.isatty()
+
+
+def run(cmd, cwd=None, env=None):
+    try:
+        return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=120).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+
+def git(*args, cwd):
+    return run(['git', *args], cwd=cwd).strip()
+
+
+def age(t):
+    m = max(0, NOW - t) // 60
+    return f'{m}m' if m < 60 else (f'{m // 60}h{m % 60:02d}m' if m < 1440 else f'{m // 1440}d')
+
+
+def mtime(path, default=0):
+    try:
+        return int(os.stat(path).st_mtime)
+    except OSError:
+        return default
+
+
+def lines(path):
+    try:
+        with open(path, errors='replace') as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+def pid_alive(path):
+    for p in (os.path.join(path, 'run.lock', 'pid'),):
+        try:
+            pid = int(open(p).read().strip())
+        except (OSError, ValueError):
+            continue
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+                return True
+            except PermissionError:
+                return True
+            except OSError:
+                pass
+    return False
+
+
+def batches_rows(proc):
+    """Worker lines of `batches --all`: name -> status text (without the @worktree suffix)."""
+    out = proc.communicate()[0] if proc else ''
+    rows = {}
+    for line in out.splitlines():
+        if line.startswith(('wt ', '(')) or not line.strip():
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        name, rest = parts
+        if '  @' in rest:
+            rest = rest.rsplit('  @', 1)[0]
+        rows[name] = rest.strip()
+    return rows
+
+
+def registry():
+    """Latest registry row per log (as batches does): name -> (start, log, dir), last 24h."""
+    last = {}
+    for line in lines(os.path.join(STATE, 'workers.tsv')):
+        f = line.split('\t')
+        if len(f) < 4 or not f[0].isdigit() or NOW - int(f[0]) > 86400:
+            continue
+        last[f[2]] = (int(f[0]), f[2], f[3])
+    out = {}
+    for start, log, d in sorted(last.values()):
+        name = os.path.basename(log)
+        name = name[:-4] if name.endswith('.log') else name
+        out[name] = (start, log, d)
+    return out
+
+
+def repo_lanes(main, bstat, reg, acked, show_old):
+    repo = os.path.basename(main)
+    wtroot = os.path.join(HOME, 'worktrees', repo.replace(' ', '-'))
+    mqdir = os.path.join(STATE, 'mq', repo)
+    base = git('rev-parse', '--abbrev-ref', 'HEAD', cwd=main)
+    lanes = {}
+
+    def lane(n):
+        return lanes.setdefault(n, dict(workers=[], wt=None, mq=None, act=0, landed=0, notes=[]))
+
+    # Workers of this repo (registry dir = main checkout or one of its worktrees).
+    for name, (start, log, d) in reg.items():
+        d = os.path.normpath(d)
+        if d == os.path.normpath(main) or d == wtroot:
+            ln = name
+        elif d.startswith(wtroot + os.sep):
+            ln = d[len(wtroot) + 1:].split(os.sep)[0]
+        else:
+            continue
+        st = bstat.get(name)
+        if st is None:
+            continue  # acked DIED/ERRORED: batches hides it, so do we
+        L = lane(ln)
+        L['workers'].append((name, st))
+        L['act'] = max(L['act'], mtime(log, start))
+    # Pipelines that died: batches names them by output prefix.
+    for name, st in bstat.items():
+        if st.startswith('pipeline') and any(n.startswith(name + '.') for n in reg) and name not in lanes:
+            ds = [reg[n][2] for n in reg if n.startswith(name + '.')]
+            if any(os.path.normpath(x) == os.path.normpath(main) or x.startswith(wtroot) for x in ds):
+                lane(name)['workers'].append((name, st))
+
+    # Worktrees (wt-dev ls is read-only).
+    for line in run(['wt-dev', 'ls'], cwd=main).splitlines():
+        f = line.split()
+        if len(f) < 4:
+            continue
+        name, url, dirty = f[0], f[2], f[3]
+        path = os.path.join(wtroot, name)
+        ahead = git('rev-list', '--count', f'{base}..HEAD', cwd=path) if base else ''
+        ct = git('log', '-1', '--format=%ct', cwd=path)
+        L = lane(name)
+        L['wt'] = dict(url=url, dirty=int(dirty.split(':', 1)[1] or 0) if ':' in dirty else 0,
+                       ahead=int(ahead) if ahead.isdigit() else 0, committed=int(ct) if ct.isdigit() else 0)
+        if ct.isdigit():
+            L['act'] = max(L['act'], int(ct))
+
+    # Merge queue: queue file, events, live waiting check (mq waiting is read-only).
+    events = {}
+    for line in lines(os.path.join(mqdir, 'events')):
+        f = line.split('\t')
+        if len(f) >= 3 and f[0].isdigit():
+            events.setdefault(f[1], []).append((int(f[0]), f[2]))
+    runner = pid_alive(mqdir)
+    waiting = set()
+    queue = [l.split('\t') for l in lines(os.path.join(mqdir, 'queue')) if l.strip()]
+    if any(len(q) > 1 and q[1] == 'ready' for q in queue):
+        mq = run(['sh', '-c', 'command -v mq'], cwd=main).strip()
+        if mq:
+            mq = os.path.realpath(mq)
+            env = dict(os.environ, MQ_COPY=mq)  # run in place: no temp copy left behind
+            for l in run(['sh', mq, 'waiting'], cwd=main, env=env).splitlines():
+                if ' waits on ' in l:
+                    waiting.add(l.split()[0])
+    alerts = []
+    ready = sum(1 for q in queue if len(q) > 1 and q[1] == 'ready')
+    if ready and not runner:
+        alerts.append(f'QUEUE STALLED: {ready} ready, no runner (mq run)')
+    disk = lines(os.path.join(STATE, 'diskguard'))
+    if disk:
+        f = disk[0].split()
+        if len(f) >= 2 and f[0] in ('warn', 'paused'):
+            label = f[0]
+            if label == 'paused':
+                count = sum(bool(n.strip()) for n in lines(os.path.join(STATE, 'diskguard.paused')))
+                label = f'paused {count}'
+            alerts.append(f'DISK: {f[1].split(".")[0]} GB free ({label})')
+    for q in queue:
+        q += [''] * (4 - len(q))
+        name, state, _bounces, fixer = q[:4]
+        L = lane(name)
+        evs = events.get(name, [])
+        lastev = evs[-1][1] if evs else ''
+        if state == 'ready' and name in waiting:
+            L['mq'] = 'waiting on main edits'
+        elif state == 'ready' and lastev == 'landing':
+            L['mq'] = 'landing' if runner else 'landing, runner gone'
+        elif state == 'ready':
+            L['mq'] = 'queued'
+        elif state == 'bounced':
+            fx = bstat.get(fixer, '') if fixer else ''
+            L['mq'] = f'bounced to {fixer}' if fx.startswith('running') else \
+                f'bounced, fixer {fixer + " " + fx.split()[0] if fx else "none"}'
+            if lastev == 'fixer-retry':
+                L['mq'] += ' (fixer retry)'
+        else:
+            reason = lines(os.path.join(mqdir, f'parked.{name}'))
+            L['mq'] = state + (f': {reason[0]}' if reason and reason[0] else '')
+    for name, evs in events.items():
+        landed = [t for t, e in evs if e == 'landed']
+        for t, _ in evs:
+            if name in lanes:
+                lanes[name]['act'] = max(lanes[name]['act'], t)
+        if landed:
+            if name in lanes:
+                lanes[name]['landed'] = landed[-1]
+            elif NOW - landed[-1] < 3600:
+                lane(name).update(landed=landed[-1], act=landed[-1])
+
+    out = []
+    for name, L in lanes.items():
+        need, prog, bits = [], False, []
+        wl = []
+        m, wt = L['mq'], L['wt']
+        queue_owns = bool(m and (m in ('queued', 'landing', 'waiting on main edits', 'landing, runner gone') or m.startswith('bounced to ')))
+        old_death = False
+        for wn, st in L['workers']:
+            word = st.split()[0]
+            st = st.replace(' (no report)', '')
+            label = short(st if wn == name else f'{wn} {st}', 60)
+            # A later worker death still needs attention after an older landing.
+            covered_by_land = bool(L['landed'] and not m and wn in reg and mtime(reg[wn][1], reg[wn][0]) <= L['landed'])
+            if word in ('DIED', 'ERRORED', 'pipeline') and (queue_owns or covered_by_land):
+                old_death = True
+            elif word in ('DIED', 'ERRORED', 'pipeline') or (word == 'STALLED' and wn not in acked):
+                need.append(label)
+            elif word in ('running', 'STALLED', 'paused'):
+                prog = True
+                wl.append(label)
+            # done workers stay quiet
+        if len(need) > 1:  # one worker problem in full, the rest as a count
+            need = [need[0], f'+{len(need) - 1} more']
+        running = any(st.startswith('running') for _, st in L['workers'])
+        if old_death:
+            bits.append('worker died earlier')
+        if m:
+            if m in ('waiting on main edits', 'landing, runner gone') or m.startswith(('parked', 'bounced,')):
+                need.append(f'mq {m}')
+            elif m != 'landed':
+                prog = True
+                wl.append(f'mq {m}')
+        if wt and not running and not m:
+            if wt['dirty']:
+                need.append('uncommitted, idle')
+            elif wt['ahead'] and (not old_death or wt['committed'] > L['landed']):
+                need.append('finished, not queued')
+        if wt:
+            if wt['ahead']:
+                bits.append(f"{wt['ahead']} to land")
+            if wt['dirty']:
+                bits.append(f"dirty {wt['dirty']}")
+            bits.append(wt['url'].replace('http://localhost', '') if wt['url'].startswith('http') else wt['url'])
+        elif L['workers'] and not L['landed']:
+            bits.append('no worktree')
+        if L['landed'] and NOW - L['landed'] < 86400:
+            bits.append(f"landed {age(L['landed'])} ago")
+        bits.append(age(L['act']) if L['act'] else '?')
+        rank = 0 if need else (1 if prog else 2)
+        if rank == 2 and not show_old and NOW - L['act'] >= 3600 and not wt:
+            out.append((rank, name, None))
+            continue
+        if rank == 2 and wt and not wt['ahead'] and not wt['dirty']:
+            bits.insert(0, 'empty')
+        text = need + wl
+        out.append((rank, name, ' · '.join(text + bits)))
+    return out, running_count(lanes), sum(1 for L in lanes.values() if L['mq'] in ('queued', 'landing')), alerts
+
+
+def running_count(lanes):
+    return sum(1 for L in lanes.values() if any(st.startswith('running') for _, st in L['workers']))
+
+
+def short(s, n=120):
+    return s if len(s) <= n else s[:n - 1] + '…'
+
+
+def show(repo, out, running, queued, alerts, header):
+    need = len(alerts) + sum(1 for r, _, _ in out if r == 0)
+    hidden = sum(1 for _, _, t in out if t is None)
+    if header:
+        print(f'== {repo}')
+    for alert in alerts:
+        print(alert)
+    print(f'needs you: {need} · running: {running} · queued: {queued}')
+    width = min(16, max([len(n) for _, n, t in out if t is not None] + [4]))
+    red, dim, off = ('\033[31m', '\033[2m', '\033[0m') if TTY else ('', '', '')
+    for rank, name, text in sorted(out, key=lambda x: (x[0], x[1])):
+        if text is None:
+            continue
+        mark, col = ('!', red) if rank == 0 else ('>', '') if rank == 1 else (' ', dim)
+        text = short(text)
+        if TTY:
+            text = text.replace('worker died earlier', dim + 'worker died earlier' + (col or off))
+        print(f'{col}{mark} {name:<{width}} {text}{off if col else ""}')
+    if hidden:
+        print(f'({hidden} done lanes older than 1h; lanes --done lists them)')
+    return need
+
+
+def resolve(repo, reg):
+    """Main checkout of an mq repo name, from the worker registry or its wt-dev worktrees."""
+    cands = [os.path.normpath(d) for _, _, d in reg.values()]
+    for line in lines(os.path.join(STATE, 'workers.tsv')):
+        f = line.split('\t')
+        if len(f) >= 4:
+            cands.append(os.path.normpath(f[3]))
+    root = os.path.join(HOME, 'worktrees', repo.replace(' ', '-'))
+    if os.path.isdir(root):
+        cands += [os.path.join(root, x) for x in sorted(os.listdir(root))]
+    for d in dict.fromkeys(reversed(cands)):
+        if not os.path.isdir(d):
+            continue
+        if os.path.basename(d) != repo and not d.startswith(root + os.sep):
+            continue
+        c = git('rev-parse', '--path-format=absolute', '--git-common-dir', cwd=d)
+        if c:
+            m = os.path.dirname(c.rstrip('/'))
+            if os.path.basename(m) == repo:
+                return m
+    return None
+
+
+def main():
+    args = sys.argv[1:]
+    if any(a in ('-h', '--help') for a in args) or any(a not in ('--all', '--done') for a in args):
+        print(__doc__.strip())
+        return 0 if any(a in ('-h', '--help') for a in args) else 2
+    # batches is global and slow: start it once, outside any repo so it skips its own worktree section.
+    proc = None
+    try:
+        proc = subprocess.Popen(['batches', '--all'], cwd='/', stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        pass
+    reg = registry()
+    acked = set(lines(os.path.join(STATE, 'acked')))
+    show_old = '--done' in args
+    if '--all' in args:
+        repos = []
+        mqroot = os.path.join(STATE, 'mq')
+        for r in sorted(os.listdir(mqroot)) if os.path.isdir(mqroot) else []:
+            m = resolve(r, reg)
+            if m:
+                repos.append(m)
+            else:
+                print(f'(skipped {r}: no repo found)')
+    else:
+        c = git('rev-parse', '--path-format=absolute', '--git-common-dir', cwd=os.getcwd())
+        if not c:
+            print('lanes: not in a git repo (lanes --all for every repo)', file=sys.stderr)
+            return 2
+        repos = [os.path.dirname(c.rstrip('/'))]
+    bstat = batches_rows(proc)
+    need = 0
+    for i, m in enumerate(repos):
+        if i:
+            print()
+        out, running, queued, alerts = repo_lanes(m, bstat, reg, acked, show_old)
+        need += show(os.path.basename(m), out, running, queued, alerts, len(repos) > 1 or '--all' in args)
+    return 3 if need else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
