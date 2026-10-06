@@ -5,7 +5,7 @@ description: Run a project's heavy checks (full lint, typecheck and test suites,
 
 # remote-ci
 
-Heavy checks run on a runner machine (currently an Apple Silicon Mac with Homebrew that you can SSH into); the dev machine runs only targeted tests and changed-file lint. Nothing runs on the runner between checks.
+Heavy checks run on a runner machine (currently an Apple Silicon Mac with Homebrew that you can SSH into, or the dev machine itself with `REMOTE_CI_HOST=local`); the dev machine runs only targeted tests and changed-file lint. Nothing runs on the runner between checks.
 
 ## Commands (inside a repo with `.remote-ci.conf`)
 
@@ -14,6 +14,8 @@ Heavy checks run on a runner machine (currently an Apple Silicon Mac with Homebr
 | `remote-ci check [--force] [<commit>]` | Check HEAD, automatically snapshotting a dirty checkout; pass a commit SHA or use a clean tree to check exactly a commit |
 | `remote-ci check --worktree --summary` | Include uncommitted files (snapshot); print only counts and failures |
 | `remote-ci check --run "<cmd>"` | Run one heavy command instead (never cached) |
+| `remote-ci fail [SHA\|latest]` | Read-only redacted failure summary, at most 15 lines plus log path; exit 0 for red, 1 for green/unknown |
+| `remote-ci blame SHA LANE...` | Read-only suspects ranked by actual file > directory > package overlap, using `wt-dev path` |
 | `remote-ci log [-C n] <regex>` | Grep the latest run's log (cheap failure lookup) |
 | `remote-ci info` | Selected route, ssh command, ports, paths; configured routes if unreachable |
 | `remote-ci status` / `remote-ci setup` | Runner state / idempotent setup for this project |
@@ -21,10 +23,15 @@ Heavy checks run on a runner machine (currently an Apple Silicon Mac with Homebr
 
 Exit codes: the check's own; `3` runner unreachable (the caller runs the check locally); `75` all slots busy after five minutes. A code tree that already passed is not checked again unless you pass `--force`. A dirty checkout is snapshotted automatically; pass a commit SHA or use a clean tree to check exactly a commit. Agents: run `remote-ci check --worktree --summary` in the background and keep working.
 
+`fail` selects the newest matching runner log, including green/incomplete runs. `blame` compares each lane with the main checkout branch (its reflog fork-point when available) using `git diff --name-only BASE...LANE`; missing evidence and no overlap stay explicit. These inspections never synchronize scripts/config or submit checks.
+
+The merge queue puts `fail` lines in bounce prompts and splits full-check trains only for a unique highest real `blame` overlap. Queue diagnostics have a 45-second deadline and bounded, redacted output.
+
 ## Connecting
 
 Settings live in `~/.config/agent-lanes/config` (see `config/config.example`):
 
+0. **Standalone:** `REMOTE_CI_HOST=local` makes this machine its own runner. No SSH and no second machine: the same `~/ci` checkout, Postgres (port 5400+major, apart from a dev database on 5432), pass cache and logs, started with a clean environment (no `DATABASE_URL` or `PATH` from the lane). The other routes are not tried. Checks share the CPU with your dev servers, so keep `REMOTE_CI_SLOTS=1` and cap test workers (e.g. `VITEST_MAX_WORKERS`).
 1. **Direct route:** `REMOTE_CI_DIRECT_HOST` (default: the `bridge0` router, e.g. a Thunderbolt bridge between two Macs), with an optional `REMOTE_CI_HOSTKEY_ALIAS`.
 2. **Fallback route:** `REMOTE_CI_HOST`, an SSH host from `~/.ssh/config` (e.g. reachable over a VPN).
 3. Otherwise exit 3.

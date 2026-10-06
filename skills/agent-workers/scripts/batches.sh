@@ -81,7 +81,7 @@ case "${1:-}" in
     exit 0 ;;
   overlap)
     command -v wt-dev >/dev/null && git rev-parse --git-dir >/dev/null 2>&1 || exit 0
-    base=$(git rev-parse --abbrev-ref HEAD); tmp=$(mktemp -d); trap 'rm -r "$tmp"' EXIT
+    base=$(git rev-parse --abbrev-ref HEAD); tmp=$(mktemp -d); trap 'ctrash "$tmp" >/dev/null' EXIT
     wt-dev ls 2>/dev/null | while read -r name _; do
       path=$(wt-dev path "$name" 2>/dev/null) || continue
       { git -C "$path" diff --name-only "$base...HEAD" 2>/dev/null
@@ -98,13 +98,19 @@ case "${1:-}" in
 esac
 all=0; [ "${1:-}" = "--all" ] && all=1
 now=$(date +%s); stall=${BATCHES_STALL_MIN:-12}
-flag=$(mktemp); done_n=$(mktemp); trap 'rm -f "$flag" "$done_n"' EXIT
+flag=$(mktemp); done_n=$(mktemp); trap 'ctrash "$flag" "$done_n" >/dev/null' EXIT
 age() { m=$(( (now - $1) / 60 )); [ $m -lt 60 ] && echo "${m}m" || echo "$((m / 60))h$((m % 60))m"; }
 # A pid counts only while it is still a codex process (pids get reused).
 # ps can be blind inside a sandboxed shell, so also trust kill -0 and a log written in the last 3 minutes.
 alive() { ps -p "$1" -o command= 2>/dev/null | grep -q codex || kill -0 "$1" 2>/dev/null \
   || { [ -n "${2:-}" ] && ! grep -q '^tokens used' "$2" && [ $((now - $(stat -f %m "$2" 2>/dev/null || echo 0))) -lt 180 ]; }; }
 is_acked() { grep -qx "$1" "$acked"; }
+# Why a worker stopped: last error-looking line of its log (secret-looking lines skipped), ~80 chars.
+cause() { m=$(tail -200 "$1" 2>/dev/null | grep -E "${2:-ERROR|[Ee]rror:|panic|Killed|capacity|usage limit|rate limit|exit code|stream disconnected}")
+  [ -n "$m" ] || { echo "no error in log"; return; }
+  c=$(printf '%s\n' "$m" | grep -viE 'token|secret|password|api[_-]?key|authorization' | tail -1 | tr -d '\033\r' |
+  sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? *//; s/^ +//' | tr -s ' ' | cut -c1-80)
+  echo "${c:-error line withheld (looks like a secret)}"; }
 
 [ -s "$reg" ] && awk -F'\t' -v n="$now" 'n-$1<=86400 {last[$3]=$0} END {for (k in last) print last[k]}' "$reg" |
   sort -n | while IFS="$(printf '\t')" read -r start pid log dir; do
@@ -117,11 +123,11 @@ is_acked() { grep -qx "$1" "$acked"; }
         st="STALLED log quiet $(age "$mt")"; is_acked "$name" || echo 1 >"$flag"
       else st="running $(age "$start")"; fi
     elif tail -5 "$log" 2>/dev/null | grep -q '^ERROR:' && ! is_acked "$name"; then
-      st="ERRORED ($(tail -5 "$log" | grep '^ERROR:' | tail -1 | cut -c8-60)) -> wk $name -r"; echo 1 >"$flag"
+      st="ERRORED ($(tail -5 "$log" | cause /dev/stdin '^ERROR:' | sed 's/^ERROR: //')) -> wk $name -r"; echo 1 >"$flag"
     elif grep -q '^tokens used' "$log" 2>/dev/null; then
       echo x >>"$done_n"; [ $all -eq 1 ] || continue; st="done"
     elif is_acked "$name"; then continue
-    else st="DIED (no report)"; echo 1 >"$flag"; fi
+    else st="DIED (no report): $(cause "$log")"; echo 1 >"$flag"; fi
     case "$dir" in */worktrees/*) st="$st  @${dir##*/}" ;; esac
     printf '%-26s %s\n' "$name" "$st"
   done
@@ -141,7 +147,7 @@ is_acked() { grep -qx "$1" "$acked"; }
 if git rev-parse --git-dir >/dev/null 2>&1 && command -v wt-dev >/dev/null; then
   base=$(git rev-parse --abbrev-ref HEAD)
   # Worktree dirs that still host a live worker are busy, never "remove?".
-  busy=$(mktemp); trap 'rm -f "$flag" "$done_n" "$busy"' EXIT
+  busy=$(mktemp); trap 'ctrash "$flag" "$done_n" "$busy" >/dev/null' EXIT
   [ -s "$reg" ] && awk -F'\t' '{print $2"\t"$4}' "$reg" | while IFS="$(printf '\t')" read -r pid dir; do
     alive "$pid" && echo "$dir"; done >"$busy"
   wt-dev ls 2>/dev/null | while read -r name _ url dirty _rest; do

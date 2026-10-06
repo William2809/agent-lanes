@@ -1,61 +1,443 @@
 #!/bin/sh
-# ABOUTME: Merge queue over `land`: lands wt-dev worktrees ONE at a time, bounces a conflicting or red
-# ABOUTME: batch back to its worker, and keeps going; also holds per-worktree file claims used by `wk -o`.
+# ABOUTME: Merge queue over `land`: lands wt-dev worktrees in trains of up to MQ_TRAIN (one full check),
+# ABOUTME: bounces a conflicting or red batch back to its worker; also holds file claims used by `wk -o`.
 # Usage (inside the repo):
 #   mq add WT...            queue committed worktrees (refuses dirty ones: commit with wtcommit first)
 #   mq run                  process the queue until nothing is ready (run as ONE background command; one runner per repo)
 #   mq ls                   queue + claims
 #   mq claim WT PATH...     add path prefixes to WT's claim      mq who PATH...  owner of each path (exit 1 if owned)
 #   mq drop WT              remove WT from the queue
+#   mq waiting              ready lanes blocked by uncommitted main-checkout edits (silent when none)
 # A claim is live while its worktree exists, so land's `wt-dev rm` releases it. Output: one line per event.
 set -u
 # Run from a private copy: sh parses as it runs, so in-place edits can break a live runner.
-if [ -z "${MQ_COPY:-}" ]; then t=$(mktemp "${TMPDIR:-/tmp}/mq.XXXXXX") && cp "$0" "$t" && MQ_COPY=$t exec sh "$t" "$@"; fi
+if [ -z "${MQ_COPY:-}" ]; then
+  MQ_TOOL_ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+  MQ_TOOL_REV=$(git -C "$MQ_TOOL_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+  export MQ_TOOL_ROOT MQ_TOOL_REV
+  t=$(mktemp "${TMPDIR:-/tmp}/mq.XXXXXX") && cp "$0" "$t" && MQ_COPY=$t exec sh "$t" "$@"
+fi
+tool_rev=$MQ_TOOL_REV
+. "$MQ_TOOL_ROOT/skills/agent-workers/scripts/state.sh"
 main=$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd) || { echo "mq: not in a git repo" >&2; exit 2; }
-st="$HOME/.claude/state/mq/$(basename "$main")"; mkdir -p "$st/claims"; q="$st/queue"; touch "$q"
+st="$HOME/.claude/state/mq/$(basename "$main")"; mkdir -p "$st/claims"; q="$st/queue"
 MAX_BOUNCES=${MQ_MAX_BOUNCES:-2}
+# Lanes landed together per train (one full check for all). MQ_TRAIN=1 restores one-at-a-time.
+TRAIN=${MQ_TRAIN:-4}; solo=0; pick=""; next_lanes=""; held=""
+red_pending=""; red_landed=""; red_bounced=""; red_parked=""; suspect=""; blame_reason=""
+COOLDOWN=${MQ_REQUEUE_COOLDOWN:-300}; disk_wait=0
 # Event log for loop statistics (loop-stats): "epoch<TAB>lane<TAB>event<TAB>detail".
-ev() { printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "${3:-}" >>"$st/events"; }
+ev() { printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "${3:-}${3:+; }tool=$tool_rev" >>"$st/events"; }
 alive() { [ -n "$(wt-dev path "$1" 2>/dev/null)" ] && [ -d "$(wt-dev path "$1")" ]; }
 # Queue lines: "WT<TAB>state<TAB>bounces<TAB>worker"; state = ready | bounced | parked.
-setq() { awk -F'\t' -v OFS='\t' -v w="$1" -v s="$2" -v b="$3" -v k="$4" '$1==w{$2=s;$3=b;$4=k} {print}' "$q" >"$q.tmp" && mv "$q.tmp" "$q"; }
-delq() { awk -F'\t' -v w="$1" '$1!=w' "$q" >"$q.tmp" && mv "$q.tmp" "$q"; }
+# Every queue/claim write shares this lock, including check-and-reserve and add's extension.
+mutate() (
+  ops_lock "$st/state.lock" || exit 1
+  trap 'ops_unlock "$st/state.lock"' EXIT
+  trap 'exit 1' HUP INT TERM
+  "$@"
+)
+_setq() { _qt=$(mktemp "$st/queue.XXXXXX") || return 1
+  awk -F'\t' -v OFS='\t' -v w="$1" -v s="$2" -v b="$3" -v k="$4" '$1==w{$2=s;$3=b;$4=k} {print}' "$q" >"$_qt" && mv "$_qt" "$q"; }
+setq() { mutate _setq "$@"; }
+_delq() { _qt=$(mktemp "$st/queue.XXXXXX") || return 1
+  awk -F'\t' -v w="$1" '$1!=w' "$q" >"$_qt" && mv "$_qt" "$q" || return 1
+  ctrash "$st/bounce-head.$1" "$st/deferred.$1" >/dev/null; }
+delq() { mutate _delq "$@"; }
 field() { awk -F'\t' -v w="$1" -v f="$2" '$1==w{print $f}' "$q"; }
 # Prefix overlap in either direction.
 clash() { case "$1/" in "$2"/*) return 0 ;; esac; case "$2/" in "$1"/*) return 0 ;; esac; return 1; }
 changed() { _p=$(wt-dev path "$1") && _b=$(git -C "$main" rev-parse --abbrev-ref HEAD) &&
   { git -C "$_p" diff --name-only "$_b...HEAD"; git -C "$_p" status --porcelain=v1 -uall | cut -c4- | sed 's/.* -> //'; } 2>/dev/null |
   grep -v -e '^\.reviews/' -e '^tools/file-size-baseline\.json$' | sort -u; }
-# Latest registered worker whose directory is this worktree.
-worker_of() { d=$(wt-dev path "$1") || return; awk -F'\t' -v d="$d" '$4==d {l=$3} END {if (l) {sub(/.*\//,"",l); sub(/\.log$/,"",l); print l}}' "$HOME/.claude/state/workers.tsv" 2>/dev/null; }
-# Feature of a worker or lane from wk -t tags (falls back to the lane name).
-feat_of() { awk -F'\t' -v a="$1" -v b="$2" '$3==a || $3==b {f=$4} END {print f}' "$HOME/.claude/state/worker-tags.tsv" 2>/dev/null | grep . || echo "$2"; }
-tag() { printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(basename "$main")" "$1" "$2" bounce >>"$HOME/.claude/state/worker-tags.tsv"; }
-running() { [ -n "$1" ] && batches 2>/dev/null | awk -v n="$1" '$1==n && $2=="running"{f=1} END{exit !f}'; }
+# Alive = the worker process from its pid file still runs. batches says STALLED for a quiet log, which can be a live worker
+# in a long remote check or a dead one.
+# Files a lane would change that the MAIN checkout holds uncommitted (e.g. a ui-quick session): landing
+# then would fail its fast-forward, so the lane waits instead. Prints up to 3 paths, nothing when clear.
+main_overlap() { _lp=$(wt-dev path "$1" 2>/dev/null) && [ -d "$_lp" ] || return 0
+  _mb=$(git -C "$main" rev-parse --abbrev-ref HEAD)
+  { git -C "$main" status --porcelain=v1 -uall 2>/dev/null | cut -c4- | sed 's/.* -> //' | grep -v '^\.reviews/'
+    echo "--lane--"; git -C "$_lp" diff --name-only "$_mb...HEAD" 2>/dev/null; } |
+    awk 'l && ($0 in d) {print; if (++n == 3) exit} $0 == "--lane--" {l = 1; next} !l {d[$0] = 1}' | tr '\n' ' '; }
+running() { [ -n "$1" ] || return 1; f="$HOME/.claude/state/logs/$(basename "$main")/$1.log.pid"
+  # Alive = the pid exists AND is still a codex process (pids get reused; a stranger would wedge the lane).
+  [ -f "$f" ] && ps -p "$(cat "$f")" -o command= 2>/dev/null | grep -q codex && return 0
+  batches 2>/dev/null | awk -v n="$1" '$1==n && $2=="running"{f=1} END{exit !f}'; }
 
+# Shared by add and run: reserve the same atomic lock before detaching a runner.
+lock="$st/run.lock"
+reserve() { ops_try_lock "$lock"; }
+cooling() {
+  t=$(cat "$st/requeue.$1" 2>/dev/null || echo 0)
+  [ $(( $(date +%s) - t )) -lt "$COOLDOWN" ]
+}
+_legacy_head() {
+  # Old queues have no snapshot. Reconstruct only with unambiguous reflog timing.
+  _worker=$(field "$1" 4); _dir=$(wt-dev path "$1") || return 1
+  _at=$(awk -F'\t' -v w="$1" '$2==w && $3=="bounced" {a=$1} END{print a}' "$st/events" 2>/dev/null)
+  _started=$(awk -F'\t' -v k="$_worker" -v d="$_dir" '{n=$3; sub(/.*\//,"",n); sub(/\.log$/,"",n)} n==k {a=$1; dir=$4} END{if(dir==d) print a}' "$HOME/.claude/state/workers.tsv" 2>/dev/null)
+  case "$_at" in ''|*[!0-9]*) _at=0 ;; esac
+  case "$_started" in ''|*[!0-9]*) ;; *) [ "$_started" -gt 0 ] && [ "$_started" -le "$_at" ] && _at=$_started ;; esac
+  _history=$(git -C "$_dir" reflog show --format='%H%x09%gD' --date=unix HEAD 2>/dev/null) || _history=""
+  _head=$(printf '%s\n' "$_history" | awk -v at="$_at" '{t=$2; sub(/^.*@\{/,"",t); sub(/\}$/, "",t)}
+    t==at {ambiguous=1} t<at && !h {h=$1} END{if(at>0 && !ambiguous) print h}')
+  if [ -n "$_head" ]; then
+    printf '%s\n' "$_head" >"$st/bounce-head.$1" || return 1
+    ev "$1" repair-migrated "baseline from reflog"; return 0
+  fi
+  # Missing/expired or same-second evidence needs a fresh, supervised repair baseline.
+  _fixer_state defer "$1" "$(field "$1" 3)" "$_worker" 2 "legacy bounce lacks a repair baseline" || return 1
+  echo 0 >"$st/requeue.$1" || return 1
+  ev "$1" repair-migrated "fresh repair required"; return 2
+}
+repair_moved() {
+  [ -f "$st/bounce-head.$1" ] || _legacy_head "$1" || return $?
+  _before=$(cat "$st/bounce-head.$1" 2>/dev/null || true)
+  _after=$(git -C "$(wt-dev path "$1")" rev-parse HEAD 2>/dev/null) || return 1
+  [ -n "$_before" ] && [ "$_before" != "$_after" ]
+}
+_ready_again() {
+  repair_moved "$1" || return $?
+  date +%s >"$st/requeue.$1"
+  : >"$st/parked.$1"
+  _setq "$1" ready "$2" "$3"
+}
+ready_again() { mutate _ready_again "$@"; }
+_park() { _setq "$1" parked "$2" "$3" || return 1; echo "$4" >"$st/parked.$1"; ev "$1" parked "$4"; }
+park() { mutate _park "$@"; }
+_fixer_state() {
+  if [ "$1" = accept ]; then
+    printf '%s\n' "$6" >"$st/bounce-head.$2" || return 1
+    [ "$5" != 1 ] || printf '%s\n' "$4" >"$st/retry.$2.$3" || return 1
+    ctrash "$st/deferred.$2" >/dev/null || return 1
+    _setq "$2" bounced "$3" "$4"
+  else
+    printf '%s\n%s\n' "$5" "$6" >"$st/deferred.$2" || return 1
+    date +%s >"$st/requeue.$2" || return 1
+    _park "$2" "$3" "$4" "fixer launch deferred"
+  fi
+}
+_prepare_launch() {
+  [ ! -f "$st/launch.$1" ] || return 1
+  _it=$(mktemp -d "$st/fixer.XXXXXX") || return 1
+  _pt=$(mktemp "$st/launch.XXXXXX") || { ctrash "$_it" >/dev/null; return 1; }
+  _lg="$HOME/.claude/state/logs/$(basename "$main")/$3.log"
+  { printf '%s\t%s\t%s\t%s\t%s\n' "$2" "$3" "$4" "$5" "${6:-unknown bounce reason}" >"$_it/meta" &&
+    echo $$ >"$_it/owner" && : >"$_it/registry" &&
+    { [ ! -f "$HOME/.claude/state/workers.tsv" ] || awk -F'\t' -v l="$_lg" '$3==l{r=$0} END{print r}' "$HOME/.claude/state/workers.tsv" >"$_it/registry"; } &&
+    printf '%s\n' "$_it" >"$_pt" && mv "$_pt" "$st/launch.$1";
+  } || { ctrash "$_it" "$_pt" >/dev/null; return 1; }
+  printf '%s\n' "$_it"
+}
+_clear_launch() { ctrash "$2" "$st/launch.$1" >/dev/null; }
+_reconcile_launch() {
+  _it=$(cat "$st/launch.$1" 2>/dev/null) || return 2
+  [ -z "${2:-}" ] || [ "$2" = "$_it" ] || return 2
+  [ -d "$_it" ] || { ctrash "$st/launch.$1" >/dev/null; return 2; }
+  IFS="$(printf '\t')" read -r _lb _lk _lr _lh _ly <"$_it/meta" || return 1
+  _lg="$HOME/.claude/state/logs/$(basename "$main")/$_lk.log"
+  _row=$(awk -F'\t' -v l="$_lg" -v d="$(wt-dev path "$1")" '$3==l{r=$0; dir=$4} END{if(dir==d) print r}' "$HOME/.claude/state/workers.tsv" 2>/dev/null)
+  if [ "${3:-}" = accept ] || { [ -n "$_row" ] && [ "$_row" != "$(cat "$_it/registry")" ] && ops_writable "$_lg"; }; then
+    _already=0; [ "$(field "$1" 2):$(field "$1" 4)" != "bounced:$_lk" ] || _already=1
+    _fixer_state accept "$1" "$_lb" "$_lk" "$_lr" "$_lh" || return 1
+    if [ "$_already" = 0 ]; then
+      [ "$_lr" = 1 ] && ev "$1" fixer-retry "$_ly" || ev "$1" bounced "$_ly"
+    fi
+    _clear_launch "$1" "$_it"; return $?
+  fi
+  if [ -z "${3:-}" ]; then
+    _owner=$(cat "$_it/owner"); _launcher=$(cat "$_it/pid" 2>/dev/null || true)
+    [ "$_owner" = "$$" ] || ! ops_pid_live "$_owner" || return 2
+    ops_pid_live "$_launcher" && return 2
+    # A child may not have entered wk yet. Cancellation then makes late wk refuse to fork.
+    _mt=$(ops_stat %m %Y "$_it/owner" || echo 0)
+    [ -n "$_launcher" ] || [ $(( $(date +%s) - _mt )) -ge 10 ] || return 2
+  fi
+  # A confirmed refusal leaves the retry available. Resume refusal can try the fresh fallback.
+  if [ -z "${3:-}" ] || [ "${4:-0}" = 1 ]; then
+    _fixer_state defer "$1" "$_lb" "$(field "$1" 4)" "$_lr" "$_ly" || return 1
+  fi
+  _clear_launch "$1" "$_it" || return 1
+  return 1
+}
+reported() {
+  lg=$(awk -F'\t' -v n="$1" '{b=$3; sub(/.*\//,"",b); sub(/\.log$/,"",b)} b==n{l=$3} END{print l}' "$HOME/.claude/state/workers.tsv" 2>/dev/null)
+  [ -n "$lg" ] || lg="$HOME/.claude/state/logs/$(basename "$main")/$1.log"
+  grep -q '^tokens used' "$lg" 2>/dev/null
+}
+paused_worker() { awk -F'\t' -v n="$1" '$1==n{f=1} END{exit !f}' "$HOME/.claude/state/paused-workers.tsv" 2>/dev/null; }
+disk_low() {
+  # status reads df freshly; check would pause workers, which belongs to diskguard's timer.
+  if command -v diskguard >/dev/null 2>&1; then
+    dg=$(diskguard status 2>/dev/null) || return 0
+    gb=$(printf '%s\n' "$dg" | awk '$1=="disk:"{print $2}')
+  else
+    gb=$(df -k "$HOME" 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+$/ {print $4/1048576; exit}')
+  fi
+  [ -n "$gb" ] || return 0
+  awk -v f="$gb" -v t="${DISKGUARD_PAUSE:-5}" 'BEGIN{exit !(f<t)}'
+}
+
+# Only the final full-check failure carries a diagnostic SHA.
+check_sha() { printf '%s\n' "$1" | sed -n 's/^FAILED check rc=[0-9][0-9]* on \([0-9a-f][0-9a-f]*\) (.*)$/\1/p'; }
+check_failure() {
+  _sha=$(check_sha "$1"); [ -n "$_sha" ] || return 0
+  python3 "$MQ_TOOL_ROOT/bin/mq-diagnostics.py" fail "$_sha" 2>/dev/null
+}
+# Observe outcomes before finished fixers can requeue. Each original lane is counted once.
+resolve_train() {
+  [ -n "$red_pending" ] || return 0
+  _pending=""
+  for _lane in $red_pending; do
+    case "$(field "$_lane" 2)" in
+      ready) _pending="$_pending $_lane" ;;
+      bounced) red_bounced="${red_bounced}${red_bounced:+; }$_lane bounced to $(field "$_lane" 4)" ;;
+      parked) if [ -f "$st/deferred.$_lane" ]; then
+          red_parked="${red_parked}${red_parked:+; }$_lane parked, fixer deferred"
+        elif [ -f "$st/launch.$_lane" ]; then _pending="$_pending $_lane"
+        else red_parked="${red_parked}${red_parked:+; }$_lane parked"; fi ;;
+      '') red_landed="$red_landed $_lane" ;;
+    esac
+  done
+  red_pending=$_pending
+  [ -z "$red_pending" ] || [ "${1:-}" = finish ] || return 0
+  _resolved="$red_bounced${red_parked:+${red_bounced:+; }$red_parked}"
+  [ -z "$red_landed" ] || _resolved="${_resolved}${_resolved:+; }${red_landed# } landed"
+  for _lane in $red_pending; do _resolved="${_resolved}${_resolved:+; }$_lane pending"; done
+  echo "mq: train resolved: $_resolved"; ev train train-resolved "$_resolved"
+  red_pending=""; suspect=""; blame_reason=""
+}
+# Keep the other lanes together until they finish; then release the suspect alone.
+advance_split() {
+  [ -n "$next_lanes$held" ] || return 0
+  _next=""
+  for _lane in $next_lanes; do
+    [ "$(field "$_lane" 2)" != ready ] || _next="$_next $_lane"
+  done
+  next_lanes=$_next
+  if [ -z "$next_lanes" ] && [ -n "$held" ]; then
+    if [ "$(field "$held" 2)" = ready ]; then next_lanes=$held; solo=1
+    else next_lanes=""; fi
+    held=""
+  fi
+}
+train_subgroup() {
+  [ -n "$red_pending" ] || return 1
+  for _lane in $ws; do case " $red_pending " in *" $_lane "*) ;; *) return 1 ;; esac; done
+}
+red_train() {
+  # Only a subset of the pending lanes belongs to the same original red train.
+  if train_subgroup; then solo=$n; return; fi
+  resolve_train finish
+  next_lanes=""; held=""
+  red_pending=$ws; red_landed=""; red_bounced=""; red_parked=""
+  suspect=""; blame_reason=""; solo=$n
+  _failure=$(check_failure "$last")
+  _test=$(printf '%s\n' "$_failure" | awk '/^File: / && !f {f=substr($0,7)} /^Test: / && !t {t=substr($0,7)} END {print t ? t : (f ? f : "unknown")}')
+  _hint=""; _sha=$(check_sha "$last")
+  if [ -n "$_sha" ]; then
+    _hint=$(python3 "$MQ_TOOL_ROOT/bin/mq-diagnostics.py" suspect "$_sha" $ws 2>/dev/null)
+  fi
+  if [ -n "$_hint" ]; then
+    suspect=${_hint%%: *}; blame_reason=${_hint#*: }; next_lanes=""
+    for _lane in $ws; do [ "$_lane" = "$suspect" ] || next_lanes="$next_lanes $_lane"; done
+    held=$suspect; solo=0; ev train blame "suspect $_hint"
+    _status="suspect $suspect ($blame_reason); landing $((n - 1)) others first"
+  else _status="no clear suspect; landing one at a time"; fi
+  case "$why" in *" conflicts onto "*) pick=${why%% conflicts onto *}; solo=0
+    _status="$pick conflicts; bouncing it, the rest stay a train" ;; esac
+  _status="train of $n red (test: $_test); $_status"
+  echo "mq: $_status"; ev train train-red "$_status"
+}
+
+# Select once with the split restriction, then retry normally if it cannot progress.
+select_lanes() {
+  { [ "$solo" -gt 0 ] || [ -n "$pick" ]; } && lim=1 || lim=$TRAIN
+  ws=""; n=0; blocked=0; selection_reason="split lanes are not ready"
+  for c in $(awk -F'\t' '$2=="ready"{print $1}' "$q"); do
+    [ -n "$pick" ] && [ "$c" != "$pick" ] && continue
+    if [ -n "$next_lanes" ]; then case " $next_lanes " in *" $c "*) ;; *) continue ;; esac; fi
+    if [ -f "$st/launch.$c" ]; then blocked=1; selection_reason="$c fixer launch pending"; continue; fi
+    h=$(main_overlap "$c")
+    if [ -n "$h" ]; then blocked=1; selection_reason="$c waits on main edits: $h"
+      [ -f "$st/waiting.$c" ] || { echo "WAITING $c: main checkout has uncommitted edits to $h"; ev "$c" waiting-main "$h"; echo "$h" >"$st/waiting.$c"; }
+      continue; fi
+    ctrash "$st/waiting.$c" >/dev/null; ws="$ws $c"; n=$((n + 1)); [ "$n" -ge "$lim" ] && break
+  done
+}
+drop_blocked_split() {
+  [ "$n" = 0 ] && [ -n "$next_lanes" ] || return 0
+  next_lanes=""; held=""; solo=0; pick=""
+  echo "mq: split dropped: $selection_reason"; ev train split-dropped "$selection_reason"
+  select_lanes
+}
+
+# Portable fixer entry point: relaunch_fixer LANE [FAILURE [LAND_OUTPUT]].
+# Owns new bounces, deferred launches and the one accepted dead-fixer retry.
+relaunch_fixer() (
+  w=$1; [ ! -f "$st/launch.$w" ] || exit 0
+  why=${2:-}; out=${3:-}; b=$(field "$w" 3); retry=0; suffix=""; previous=$(field "$w" 4)
+  if [ -f "$st/deferred.$w" ]; then
+    retry=$(head -1 "$st/deferred.$w"); why=$(tail -n +2 "$st/deferred.$w")
+  elif [ "$(field "$w" 2)" = bounced ]; then retry=1
+  else b=$((b + 1)); fi
+  k=$previous
+  if [ "$retry" = 1 ]; then
+    suffix=r; running "$k" && exit 0; paused_worker "$k" && exit 0
+    if [ -f "$st/retry.$w.$b" ]; then
+      park "$w" "$b" "$k" "fixer died twice"; echo "PARKED $w: fixer died twice"; exit 1
+    fi
+    [ -n "$why" ] || why=$(awk -F'\t' -v w="$w" '$2==w && $3=="bounced"{r=$4; sub(/; tool=[^;]*$/, "", r)} END{print r}' "$st/events" 2>/dev/null)
+    failure=$(check_failure "FAILED ${why%%; suspect *}")
+    msg="The merge queue could not land this worktree: ${why:-unknown bounce reason}; the previous fixer died; check git status/diff first. Fix the original bounce in THIS worktree only, run targeted checks and land preflight, commit with wtcommit, and report in the usual format.${failure:+
+Check failure:
+$failure}"
+  else
+    if [ "$b" -gt "$MAX_BOUNCES" ] || ! alive "$w"; then
+      park "$w" "$b" "" "$why"; echo "PARKED $w after $((b - 1)) bounces: $why"
+      printf '%s\n' "$out" | tail -6 | sed 's/^/  /'; exit 1
+    fi
+    # Deduplicate all names before filtering by lane; verify the current session too.
+    d=$(wt-dev path "$w") || exit 1
+    k=$(awk -F'\t' -v d="$d" '{last[$3]=NR"\t"$0; dir[$3]=$4} END{for (l in last) if (dir[l]==d) print last[l]}' "$HOME/.claude/state/workers.tsv" 2>/dev/null |
+      sort -rn | while IFS="$(printf '\t')" read -r ordinal at pid lg dir; do
+        ops_writable "$lg" || continue
+        session_dir=$(sed -n '1,20s/^workdir: //p' "$lg" | head -1)
+        [ "$session_dir" = "$d" ] || continue
+        basename "$lg" .log; break
+      done)
+    base=$(git rev-parse --abbrev-ref HEAD)
+    failure=$(check_failure "$(printf '%s\n' "$out" | tail -1)")
+    [ -n "$out" ] || failure=$(check_failure "FAILED ${why%%; suspect *}")
+    msg="The merge queue could not land this worktree: $why
+${failure:+Check failure:
+$failure
+}Land output (tail):
+$(printf '%s\n' "$out" | tail -12)
+
+Fix it in THIS worktree only. If it conflicts: \`git rebase $base\`, resolve keeping both sides' intent, \`git rebase --continue\` (this rebase is allowed here; never push/reset/force/stash). If a check or preflight is red: fix the cause, not the test. Then run the targeted tests for the touched files and \`sh tools/land-preflight.sh $base\`, commit with \`wtcommit \"type(scope): message\"\`, and report in the usual format."
+  fi
+  before=$(cat "$st/bounce-head.$w" 2>/dev/null || true)
+  if [ "$retry" != 1 ] || [ -z "$before" ]; then before=$(git -C "$(wt-dev path "$w")" rev-parse HEAD) || exit 1; fi
+  f=$(awk -F'\t' -v a="$k" -v b="$w" '$3==a || $3==b {f=$4} END{print f}' "$HOME/.claude/state/worker-tags.tsv" 2>/dev/null | grep . || echo "$w")
+  launched=0
+  if [ "$retry" = 0 ] && [ -n "$k" ] && ! running "$k"; then
+    intent=$(mutate _prepare_launch "$w" "$b" "$k" "$retry" "$before" "$why") || exit 1
+    if printf '%s\n' "$msg" | WK_RESUME_DIR="$d" WK_LAUNCH_INTENT="$intent" wk "$k" -r - >/dev/null 2>&1; then result=accept
+    else result=refuse; fi
+    mutate _reconcile_launch "$w" "$intent" "$result"; accepted=$?
+    [ "$accepted" != 2 ] || exit 1
+    if [ "$accepted" = 0 ]; then
+      launched=1
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$(basename "$main")" "$k" "$f" bounce "$tool_rev" >>"$HOME/.claude/state/worker-tags.tsv"
+    elif [ -f "$st/launch.$w" ]; then exit 1; fi
+  fi
+  if [ "$launched" = 0 ]; then
+    k="$w-mq$b$suffix"
+    intent=$(mutate _prepare_launch "$w" "$b" "$k" "$retry" "$before" "$why") || exit 1
+    if (cd "$(wt-dev path "$w")" && printf '%s\n' "$msg" | WK_LAUNCH_INTENT="$intent" wk "$k" -d "$w" -m build-hard -t "$f:bounce" >/dev/null 2>&1); then result=accept
+    else result=refuse; fi
+    mutate _reconcile_launch "$w" "$intent" "$result" 1 || { echo "PARKED $w: fixer launch deferred ($why)"; exit 1; }
+  fi
+  if [ "$retry" = 1 ]; then echo "BOUNCED $w to $k: fixer retry"
+  else echo "BOUNCED $w to $k: $why"; fi
+)
+
+# A direct claim is a single transaction: validate all paths, then publish their union.
+claims_hit() (
+  _self=$1; shift; _rc=0
+  for _path in "$@"; do _path=${_path%/}
+    for _cf in "$st"/claims/*; do [ -f "$_cf" ] || continue; _owner=${_cf##*/}
+      [ "$_owner" != "$_self" ] && alive "$_owner" || continue
+      while IFS= read -r _cp; do clash "$_path" "$_cp" && { echo "$_path claimed by $_owner ($_cp)"; _rc=1; }; done <"$_cf"
+    done
+  done; exit "$_rc"
+)
+who_paths() (
+  _rc=0; claims_hit "${MQ_SELF:-}" "$@" || _rc=1
+  for _path in "$@"; do _path=${_path%/}
+    for _owner in $(wt-dev ls 2>/dev/null | awk '{print $1}'); do
+      [ "$_owner" != "${MQ_SELF:-}" ] || continue
+      changed "$_owner" | while IFS= read -r _cp; do clash "$_path" "$_cp" && echo "$_path touched by $_owner ($_cp)"; done | head -1 | grep . && _rc=1
+    done
+  done; exit "$_rc"
+)
+_extend_claim() (
+  _cw=$1; shift
+  _raw=$(mktemp "$st/claims/.claim.XXXXXX") || exit 1
+  _ct=$(mktemp "$st/claims/.claim.XXXXXX") || { ctrash "$_raw" >/dev/null; exit 1; }
+  trap 'ctrash "$_raw" "$_ct" >/dev/null' EXIT
+  trap 'exit 1' HUP INT TERM
+  # Separate generation from sorting: POSIX pipelines hide failed input writes.
+  if [ -f "$st/claims/$_cw" ]; then cat "$st/claims/$_cw" >"$_raw" || exit 1; fi
+  for _path in "$@"; do printf '%s\n' "${_path%/}" >>"$_raw" || exit 1; done
+  sort -u "$_raw" >"$_ct" || exit 1
+  mv "$_ct" "$st/claims/$_cw"
+)
+_claim() {
+  w=$1; shift; alive "$w" || { echo "no worktree $w" >&2; return 1; }
+  [ "${MQ_FORCE:-0}" = 1 ] || MQ_SELF=$w who_paths "$@" || return 1
+  _extend_claim "$w" "$@"
+}
+_queue_add() {
+  w=$1; alive "$w" || { echo "mq: no worktree $w" >&2; return 1; }
+  if [ -f "$st/launch.$w" ]; then
+    _reconcile_launch "$w" || :
+    [ ! -f "$st/launch.$w" ] || { echo "mq: $w repair launch pending" >&2; return 1; }
+  fi
+  s=$(field "$w" 2)
+  p=$(wt-dev path "$w"); [ -z "$(git -C "$p" status --porcelain -- . ':!.reviews')" ] || { echo "mq: $w has uncommitted work (wtcommit $w \"msg\")" >&2; return 1; }
+  # Retain the warning metric; refuse overlaps with another live claim before extending ours.
+  out=$(changed "$w" | while IFS= read -r c; do ok=0
+      if [ -f "$st/claims/$w" ]; then
+        while IFS= read -r cl; do clash "$c" "$cl" && ok=1; done <"$st/claims/$w"
+      fi
+      [ "$ok" = 1 ] || echo "$c"; done)
+  if [ -n "$out" ]; then
+    ev "$w" outside-claim "$(printf '%s\n' "$out" | wc -l | tr -d ' ') files"
+    echo "mq: $w changed files outside its claim: $(printf '%s\n' "$out" | head -5 | tr '\n' ' ')" >&2
+    # Path lists here use newlines so an individual filename may contain spaces.
+    hit=$(printf '%s\n' "$out" | while IFS= read -r c; do claims_hit "$w" "$c"; done)
+    [ -z "$hit" ] || { printf 'mq: refusing %s: %s\n' "$w" "$hit" >&2; return 1; }
+  fi
+  case "$s" in bounced|parked)
+    if [ ! -f "$st/deferred.$w" ] && { [ -f "$st/bounce-head.$w" ] || [ "$s" = bounced ] || [ -n "$(field "$w" 4)" ]; }; then
+      repair_moved "$w" || { [ "$?" = 2 ] || { echo "mq: refusing $w: repair has no new commit" >&2; return 1; }; }
+    fi ;; esac
+  if [ -n "$out" ]; then
+    _extend_claim "$w" "$out" || return 1
+    ev "$w" claim-extended "$(printf '%s\n' "$out" | wc -l | tr -d ' ') files"
+  fi
+  case "$s" in bounced|parked)
+    if [ -f "$st/deferred.$w" ]; then
+      # A manual add retries the launch, rather than landing an unattempted repair.
+      echo 0 >"$st/requeue.$w"; ev "$w" queued; echo "queued $w"; return 0
+    fi
+    date +%s >"$st/requeue.$w"; : >"$st/parked.$w"; _setq "$w" ready "$(field "$w" 3)" "" ;;
+    ready) ;; *) _qt=$(mktemp "$st/queue.XXXXXX") || return 1
+      { cat "$q"; printf '%s\tready\t0\t\n' "$w"; } >"$_qt" && mv "$_qt" "$q" || return 1 ;; esac
+  ev "$w" queued; echo "queued $w"
+}
+_init_queue() { [ -e "$q" ] || : >"$q"; }
+mutate _init_queue || exit 1
 cmd=${1:-ls}; [ $# -gt 0 ] && shift
 case "$cmd" in
-  claim) w=${1:?mq claim WT PATH...}; shift; alive "$w" || { echo "no worktree $w" >&2; exit 1; }
-    for p in "$@"; do p=${p%/}; echo "$p"; done >>"$st/claims/$w"; sort -u -o "$st/claims/$w" "$st/claims/$w"; exit 0 ;;
-  who) rc=0; for p in "$@"; do p=${p%/}
-      for f in "$st"/claims/*; do [ -f "$f" ] || continue; w=${f##*/}; [ "$w" = "${MQ_SELF:-}" ] && continue; alive "$w" || continue
-        while read -r c; do clash "$p" "$c" && { echo "$p claimed by $w ($c)"; rc=1; }; done <"$f"; done
-      for w in $(wt-dev ls 2>/dev/null | awk '{print $1}'); do [ -n "${MQ_SELF:-}" ] && [ "$w" = "$MQ_SELF" ] && continue
-        changed "$w" | while read -r c; do clash "$p" "$c" && echo "$p touched by $w ($c)"; done | head -1 | grep . && rc=1; done
-    done; exit $rc ;;
-  add) for w in "$@"; do alive "$w" || { echo "mq: no worktree $w" >&2; continue; }
-      p=$(wt-dev path "$w"); [ -z "$(git -C "$p" status --porcelain -- . ':!.reviews')" ] || { echo "mq: $w has uncommitted work (wtcommit $w \"msg\")" >&2; continue; }
-      # Scope check: changes outside the batch's claim are how overlaps start; warn, don't block.
-      if [ -f "$st/claims/$w" ]; then out=$(changed "$w" | while read -r c; do ok=0
-          while read -r cl; do clash "$c" "$cl" && ok=1; done <"$st/claims/$w"; [ $ok = 1 ] || echo "$c"; done)
-        [ -z "$out" ] || { ev "$w" outside-claim "$(printf '%s\n' "$out" | wc -l | tr -d ' ') files"; echo "mq: $w changed files outside its claim: $(printf '%s\n' "$out" | head -5 | tr '\n' ' ')" >&2; }; fi
-      grep -q "^$w	" "$q" && setq "$w" ready "$(field "$w" 3)" "" || printf '%s\tready\t0\t\n' "$w" >>"$q"; ev "$w" queued; echo "queued $w"; done; exit 0 ;;
+  claim) w=${1:?mq claim WT PATH...}; shift; mutate _claim "$w" "$@"; exit $? ;;
+  who) mutate who_paths "$@"; exit $? ;;
+  add) rc=0; for w in "$@"; do mutate _queue_add "$w" || rc=1; done
+    if [ "${MQ_NO_AUTORUN:-0}" != 1 ] && [ -s "$q" ] && reserve; then
+      echo $$ >"$lock/handoff"
+      MQ_COPY= MQ_LOCK_HANDOFF=$$ nohup mq run >>"$st/run.log" 2>&1 </dev/null &
+      echo "mq: runner started (log: $st/run.log)"
+    fi
+    exit "$rc" ;;
   drop) delq "${1:?}"; echo "dropped $1"; exit 0 ;;
+  waiting) for w in $(awk -F'\t' '$2=="ready"{print $1}' "$q"); do h=$(main_overlap "$w"); [ -z "$h" ] || echo "$w waits on main-checkout edits: $h"; done; exit 0 ;;
   ls) if [ -s "$q" ]; then b=$(batches --all 2>/dev/null)
       while IFS="$(printf '\t')" read -r w s n k; do x=""
         [ "$s" = bounced ] && [ -n "$k" ] && x=$(printf '%s\n' "$b" | awk -v k="$k" '$1==k {$1=""; print; exit}')
         echo "$w  $s  $n  $k${x:+ ($(echo $x))}"; done <"$q"; else echo "queue empty"; fi
-    for f in "$st"/claims/*; do [ -f "$f" ] || continue; alive "${f##*/}" || { mv "$f" "$st/claims/.released.${f##*/}"; continue; }
+    for f in "$st"/claims/*; do [ -f "$f" ] || continue; alive "${f##*/}" || continue
       echo "claim ${f##*/}: $(tr '\n' ' ' <"$f")"; done
     pid=$(cat "$st/run.lock/pid" 2>/dev/null || cat "$st/run.pid" 2>/dev/null || true)
     case "$pid" in ''|*[!0-9]*|0) ;; *) kill -0 "$pid" 2>/dev/null && echo "runner pid $pid" ;; esac; exit 0 ;;
@@ -63,32 +445,97 @@ case "$cmd" in
   *) sed -n '4,10p' "$MQ_COPY"; exit 2 ;;
 esac
 
-# --- run: one runner per repo. mkdir is atomic, so only one starter gets the lock; a lock whose
-# pid is dead (or still empty after 10 s) is stale and taken over.
-lock="$st/run.lock"
-pid_live() { case "$1" in ''|*[!0-9]*|0) return 1 ;; esac; kill -0 "$1" 2>/dev/null; }
-if ! mkdir "$lock" 2>/dev/null; then
-  pid=$(cat "$lock/pid" 2>/dev/null || true)
-  if pid_live "$pid" || { [ -z "$pid" ] && [ $(( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || echo 0) )) -lt 10 ]; }; then
-    echo "mq: runner already active (pid ${pid:-starting}); mq add is enough"; exit 0; fi
-  mv "$lock" "$lock.stale.$$" 2>/dev/null && rm -r "$lock.stale.$$"
-  mkdir "$lock" 2>/dev/null || { echo "mq: another runner just started; mq add is enough"; exit 0; }
+# A detached add hands its reservation to run; every other starter uses the same lock.
+if [ -n "${MQ_LOCK_HANDOFF:-}" ] && [ "$(cat "$lock/handoff" 2>/dev/null)" = "$MQ_LOCK_HANDOFF" ]; then :
+elif ! reserve; then
+  pid=$(cat "$lock/pid" 2>/dev/null || echo starting)
+  echo "mq: runner already active (pid ${pid:-starting}); mq add is enough"; exit 0
 fi
-echo $$ >"$lock/pid"; trap 'rm -r "$lock"' EXIT; trap 'exit 1' HUP INT TERM
+echo $$ >"$lock/pid"; trap 'ops_unlock "$lock"' EXIT; trap 'exit 1' HUP INT TERM
 cd "$main" || exit 1
 landed=0
 while :; do
-  # Bounced entries come back once their worker stops: new commits and a clean tree -> ready, else park.
-  for w in $(awk -F'\t' '$2=="bounced"{print $1}' "$q"); do k=$(field "$w" 4); running "$k" && continue
-    p=$(wt-dev path "$w" 2>/dev/null)
-    if [ -n "$p" ] && [ -z "$(git -C "$p" status --porcelain -- . ':!.reviews')" ]; then setq "$w" ready "$(field "$w" 3)" "$k"; ev "$w" requeued "$k"; echo "requeued $w (worker $k done)"
-    else setq "$w" parked "$(field "$w" 3)" "$k"; ev "$w" parked "uncommitted"; echo "PARKED $w: worker $k left uncommitted work"; fi
+  resolve_train; advance_split
+  # Complete journaled launches before any landing or dead-fixer decision.
+  for w in $(awk -F'\t' '{print $1}' "$q"); do
+    [ ! -f "$st/launch.$w" ] || mutate _reconcile_launch "$w"
   done
-  w=$(awk -F'\t' '$2=="ready"{print $1; exit}' "$q")
-  if [ -z "$w" ]; then
-    awk -F'\t' '$2=="bounced"' "$q" | grep -q . || break
+  # A dead fixer without a report gets exactly one fresh retry per bounce, durably marked.
+  for w in $(awk -F'\t' '$2=="bounced"{print $1}' "$q"); do
+    [ ! -f "$st/launch.$w" ] || continue
+    k=$(field "$w" 4); running "$k" && continue; paused_worker "$k" && continue
+    b=$(field "$w" 3)
+    if ! reported "$k"; then relaunch_fixer "$w"; continue; fi
+    cooling "$w" && continue
+    p=$(wt-dev path "$w" 2>/dev/null)
+    if [ -n "$p" ] && [ -d "$p" ] && [ -z "$(git -C "$p" status --porcelain -- . ':!.reviews')" ]; then
+      ready_again "$w" "$b" "$k"; repair_status=$?
+      if [ "$repair_status" != 0 ]; then
+        [ "$repair_status" != 2 ] || continue
+        park "$w" "$b" "$k" "no new commit"; echo "PARKED $w: worker $k produced no new commit"; continue
+      fi
+      ev "$w" requeued "$k"; echo "requeued $w (worker $k done)"
+    else
+      date +%s >"$st/requeue.$w"
+      park "$w" "$b" "$k" uncommitted; echo "PARKED $w: worker $k left uncommitted work"
+    fi
+  done
+  # Deferred launches and uncommitted parks are checked outside the cool-down.
+  retry_wait=0
+  for w in $(awk -F'\t' '$2=="parked"{print $1}' "$q"); do
+    if [ -f "$st/launch.$w" ]; then retry_wait=1; continue; fi
+    if [ -f "$st/deferred.$w" ]; then
+      retry_wait=1
+      cooling "$w" || relaunch_fixer "$w"
+      continue
+    fi
+    [ "$(cat "$st/parked.$w" 2>/dev/null)" = uncommitted ] || continue
+    cooling "$w" && continue
+    k=$(field "$w" 4); running "$k" && continue; paused_worker "$k" && continue
+    p=$(wt-dev path "$w" 2>/dev/null)
+    if [ -n "$p" ] && [ -d "$p" ] && [ -z "$(git -C "$p" status --porcelain -- . ':!.reviews')" ]; then
+      ready_again "$w" "$(field "$w" 3)" "$k"; repair_status=$?
+      if [ "$repair_status" != 0 ]; then
+        [ "$repair_status" != 2 ] || continue
+        park "$w" "$(field "$w" 3)" "$k" "no new commit"; echo "PARKED $w: repair produced no new commit"; continue
+      fi
+      ev "$w" requeued "$k"; echo "requeued $w (committed)"
+    else date +%s >"$st/requeue.$w"; fi
+  done
+  # First ready lanes (up to the train size; 1 while a red train lands solo) whose files the main
+  # checkout doesn't hold uncommitted; others wait (said once).
+  select_lanes; drop_blocked_split
+  if [ "$n" = 0 ]; then
+    [ $blocked = 1 ] || [ "$retry_wait" = 1 ] || awk -F'\t' '$2=="bounced"' "$q" | grep -q . || break
     sleep 30; continue
   fi
+  if disk_low; then
+    if [ "$disk_wait" = 0 ]; then
+      for c in $ws; do ev "$c" disk-low "below ${DISKGUARD_PAUSE:-5} GB"; done
+      echo "mq: disk low; landing paused (< ${DISKGUARD_PAUSE:-5} GB)"; disk_wait=1
+    fi
+    sleep 60; continue
+  fi
+  disk_wait=0; pick=""
+  # Land restores red stacks. A unique overlap holds the suspect for a solo check;
+  # unknown blame and a second red subgroup use the existing solo order.
+  if [ "$n" -gt 1 ]; then
+    echo "landing train:$ws"; for c in $ws; do ev "$c" landing "train of $n"; done
+    out=$(land $ws 2>&1); last=$(printf '%s\n' "$out" | tail -1)
+    case "$last" in
+      LANDED*) for c in $ws; do delq "$c"; landed=$((landed + 1)); ev "$c" landed "${last#LANDED } (train)"
+          printf '%s\t%s\t%s\n' "$(date +%FT%T)" "$c" "$last" >>"$st/history"; done
+        printf '%s\n' "$out" | grep -E '^(refresh:|cleanup failed)' | sed 's/^/train: /'
+        r=$(printf '%s\n' "$out" | grep '^refresh:' | head -1); [ -z "$r" ] || ev train refresh "${r#refresh: }"
+        echo "train$ws: $last"; continue ;;
+    esac
+    why=${last#FAILED }; ev train train-failed "$why"
+    red_train
+    # Preserve the conflict pick path even when the remaining subgroup conflicts.
+    case "$why" in *" conflicts onto "*) pick=${why%% conflicts onto *}; solo=0 ;; esac
+    continue
+  fi
+  w=${ws# }; [ "$solo" -gt 0 ] && solo=$((solo - 1))
   echo "landing $w"; ev "$w" landing
   out=$(land "$w" 2>&1); last=$(printf '%s\n' "$out" | tail -1)
   case "$last" in
@@ -102,18 +549,8 @@ while :; do
   case "$why" in *"has nothing to land"*) delq "$w"; ev "$w" dropped "already on branch"; echo "$w: already on the branch; dropped"; continue ;; esac
   # ff-merge also fails on a dirty main checkout touching the same files: retry once, then park (never loop).
   case "$why" in "ff-merge"*) if [ "$b" -le 1 ]; then setq "$w" ready "$b" ""; echo "$w: ff-merge failed (branch moved?); retrying once"
-    else setq "$w" parked "$b" ""; echo "PARKED $w: ff-merge keeps failing (main checkout dirty on its files?)"; fi; continue ;; esac
-  if [ "$b" -gt "$MAX_BOUNCES" ] || ! alive "$w"; then setq "$w" parked "$b" ""; ev "$w" parked "$why"; echo "PARKED $w after $((b - 1)) bounces: $why"; printf '%s\n' "$out" | tail -6 | sed 's/^/  /'; continue; fi
-  base=$(git rev-parse --abbrev-ref HEAD)
-  msg="The merge queue could not land this worktree: $why
-Land output (tail):
-$(printf '%s\n' "$out" | tail -12)
-
-Fix it in THIS worktree only. If it conflicts: \`git rebase $base\`, resolve keeping both sides' intent, \`git rebase --continue\` (this rebase is allowed here; never push/reset/force/stash). If a check or preflight is red: fix the cause, not the test. Then run the targeted tests for the touched files and \`sh tools/land-preflight.sh $base\`, commit with \`wtcommit \"type(scope): message\"\`, and report in the usual format."
-  k=$(worker_of "$w")
-  f=$(feat_of "$k" "$w")
-  if [ -n "$k" ] && ! running "$k" && printf '%s\n' "$msg" | wk "$k" -r - >/dev/null 2>&1; then tag "$k" "$f"
-  else k="$w-mq$b"; (cd "$(wt-dev path "$w")" && printf '%s\n' "$msg" | wk "$k" -d "$w" -m build-hard -t "$f:bounce" >/dev/null 2>&1) || { setq "$w" parked "$b" ""; echo "PARKED $w: could not start a fixer ($why)"; continue; }; fi
-  setq "$w" bounced "$b" "$k"; ev "$w" bounced "$why"; echo "BOUNCED $w to $k: $why"
+    else park "$w" "$b" "" "ff-merge"; echo "PARKED $w: ff-merge keeps failing (main checkout dirty on its files?)"; fi; continue ;; esac
+  [ "$w" != "$suspect" ] || why="$why; suspect $suspect: $blame_reason"
+  relaunch_fixer "$w" "$why" "$out"
 done
 echo "mq done: landed $landed; $(awk -F'\t' '$2=="parked"' "$q" | wc -l | tr -d ' ') parked$(awk -F'\t' '$2=="parked"{printf " %s", $1}' "$q")"

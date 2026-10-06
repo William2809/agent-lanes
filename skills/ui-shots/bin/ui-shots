@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // ui-shots: log in to a local web app with headless Playwright and save
-// screenshots of pages at several widths. Prints only the saved file paths.
+// screenshots of pages at several widths. Prints saved paths and one auth counter line.
 // Uses the Playwright installed in the current project (run from its root).
 import { createRequire } from "node:module"
 import { readFileSync, mkdirSync, existsSync } from "node:fs"
 import { join, resolve } from "node:path"
+import { waitReady, readyTimeout, clickControl } from "./readiness.mjs"
+import { authenticatedState, authCounts, authLine, redact } from "./auth-cache.mjs"
 
 const args = process.argv.slice(2)
 const opt = {
@@ -24,11 +26,15 @@ for (let i = 0; i < args.length; i++) {
     case "--env-file": opt.envFile = next(); break
     case "--email-env": opt.emailEnv = next(); break
     case "--password-env": opt.passwordEnv = next(); break
+    case "--auth-ttl": opt.authTtl = next(); break
     case "--as": { const r = next().toUpperCase(); opt.role = r; opt.tag ||= r.toLowerCase(); break }
     case "--widths": opt.widths = next(); break
     case "--out": opt.out = next(); break
     case "--full": opt.full = true; break
     case "--theme": opt.theme = next(); break
+    case "--ready": opt.ready = next(); break
+    case "--loaded": opt.loaded = next(); break
+    case "--ready-timeout": opt.readyTimeout = next(); break
     case "--wait": opt.wait = Number(next()); break
     case "--click": opt.click.push(next()); break
     case "--tag": opt.tag = next(); break
@@ -44,10 +50,15 @@ for (let i = 0; i < args.length; i++) {
   [--allow-remote] [--out DIR] [--full] [--theme dark|light] [--click "button text"]... [--tag name] [--console] [--no-js] [--cookie name=value]... PATH...
 PATH may be a full URL (sets --base). Reads credentials from --env-file (default .env) by variable name; never prints them.
 --as ROLE reads <PREFIX><ROLE>_EMAIL/_PASSWORD: PREFIX = UI_SHOTS_ROLE_PREFIX (env or .env), else the one .env key ending in _<ROLE>_EMAIL.
+Auth: shared origin + role storageState cache; --auth-ttl SECONDS / UI_SHOTS_AUTH_TTL_SECONDS (default 21600).
 Login page: --login, else UI_SHOTS_LOGIN (env or .env), else /login.
 Credentials require localhost/127.0.0.1/[::1], unless --allow-remote or UI_SHOTS_ALLOW_REMOTE=1; cross-origin login redirects are refused.
---click clicks the first visible element with that exact text (role button/link/tab/combobox/textbox) after load, in order; "~text" matches a name containing text;
+--click uses the exact accessible name, preferring button/link/tab/combobox/textbox in that order; sr-only inputs are excluded;
+  "role:button:Select date" selects an explicit role and exact name; ambiguous matches fail; "~text" matches a name containing text;
   "type:abc" types into the focused control, "press:Enter" presses a key (keyboard flows; they really submit if the keys do).
+--ready-timeout MS / UI_SHOTS_READY_TIMEOUT_MS sets the discovery budget (default 15000); actions remain 5000 ms.
+--loaded CSS adds a loaded-content signal alongside network-idle readiness.
+--ready CSS waits for that visible selector before actions/probes; --ready networkidle waits for network idle (both bounded at 15 s).
 --console prints browser console errors/warnings and page errors per shot (one line each, deduplicated); --verbose prints full messages.
 --cookie name=value sets a cookie on the base URL before loading (e.g. a remembered UI choice).
 --hover CSS / --focus CSS hover or keyboard-focus the first match just before the shot (cards, tooltips).
@@ -83,49 +94,30 @@ if (opt.emailEnv && (!['http:', 'https:'].includes(base.protocol) ||
   console.error("ui-shots: refusing credentials for remote base; use --allow-remote or UI_SHOTS_ALLOW_REMOTE=1"); process.exit(2)
 }
 
-async function fillLogin(page, login, emailSel, passwordSel, email, password) {
-  let redirected = false
-  const crossOrigin = request => request.isNavigationRequest() && request.frame() === page.mainFrame() && new URL(request.url()).origin !== base.origin
-  // Request events include every HTTP redirect; route handlers see only the first URL.
-  const observe = request => { if (crossOrigin(request)) redirected = true }
-  page.on("request", observe)
-  const guard = async route => {
-    const request = route.request()
-    if (crossOrigin(request)) {
-      redirected = true; await route.abort()
-    } else await route.continue()
-  }
-  await page.route("**/*", guard)
-  try {
-    await page.goto(opt.base + login)
-    if (new URL(page.url()).origin !== base.origin) redirected = true
-    if (!redirected) await page.fill(emailSel, email)
-    if (!redirected) await page.fill(passwordSel, password)
-  } catch (error) {
-    if (!redirected) throw error
-  } finally {
-    await page.unroute("**/*", guard)
-    page.off("request", observe)
-  }
-  if (redirected) {
-    const error = new Error("ui-shots: refusing credentials: login redirected to another origin")
-    error.credentialRefusal = true; throw error
-  }
-}
-
 const require = createRequire(join(process.cwd(), "package.json"))
 let chromium
 try { ({ chromium } = require("@playwright/test")) } catch { ({ chromium } = require("playwright")) }
 
 const out = resolve(opt.out || join(process.env.TMPDIR || "/tmp", "ui-shots"))
 mkdirSync(out, { recursive: true })
-const browser = await chromium.launch()
+const counts = authCounts()
+const secrets = [cred(opt.emailEnv), cred(opt.passwordEnv)].filter(Boolean)
+let browser
 try {
+  const readiness = readyTimeout(opt.readyTimeout)
+  browser = await chromium.launch()
+  const auth = opt.emailEnv ? await authenticatedState(browser, {
+    base: opt.base, role: opt.role || `env:${opt.emailEnv}:${opt.passwordEnv}`, login: opt.login,
+    emailSel: opt.emailSel, passwordSel: opt.passwordSel, submitSel: opt.submitSel, ttl: opt.authTtl,
+    credentials: () => ({ email: cred(opt.emailEnv), password: cred(opt.passwordEnv) }),
+  }, counts) : undefined
+  const storageState = auth?.storageState
   for (const width of opt.widths.split(",").map(Number)) {
     const context = await browser.newContext({
       viewport: { width, height: width < 600 ? 844 : 900 },
       deviceScaleFactor: 1,
       colorScheme: opt.theme || undefined,
+      storageState,
     })
     if (opt.cookies.length) {
       await context.addCookies(opt.cookies.map((c) => {
@@ -139,16 +131,10 @@ try {
       page.on("console", (m) => { if (m.type() === "error" || m.type() === "warning") logs.add(`${m.type()}: ${(opt.verbose ? m.text().slice(0, 4000) : m.text().split("\n")[0].slice(0, 300))}`) })
       page.on("pageerror", (e) => logs.add(`pageerror: ${String(e.message).split("\n")[0].slice(0, 300)}`))
     }
-    if (opt.emailEnv) {
-      const email = cred(opt.emailEnv), password = cred(opt.passwordEnv)
-      if (!email || !password) throw new Error(`missing ${opt.emailEnv} or ${opt.passwordEnv}`)
-      await fillLogin(page, opt.login, opt.emailSel, opt.passwordSel, email, password)
-      await Promise.all([page.waitForURL((u) => !u.pathname.startsWith(opt.login), { timeout: 20000 }), page.click(opt.submitSel)])
-    }
-    let shooter = page
+    let shooter = page, bare
     if (opt.noJs) {
       const state = await context.storageState()
-      const bare = await browser.newContext({
+      bare = await browser.newContext({
         viewport: { width, height: width < 600 ? 844 : 900 },
         deviceScaleFactor: 1,
         colorScheme: opt.theme || undefined,
@@ -161,20 +147,13 @@ try {
     }
     for (const p of paths) {
       logs.clear()
-      await shooter.goto(opt.base + p, { waitUntil: "networkidle" })
+      await shooter.goto(opt.base + p, { waitUntil: "domcontentloaded" })
+      await waitReady(shooter, opt.ready, readiness, opt.loaded)
       for (const text of opt.noJs ? [] : opt.click) {
         // "type:abc" types into the focused control; "press:Enter" presses a key.
         if (text.startsWith("type:")) { await page.keyboard.type(text.slice(5), { delay: 20 }); await page.waitForTimeout(300); continue }
         if (text.startsWith("press:")) { await page.keyboard.press(text.slice(6)); await page.waitForTimeout(400); continue }
-        // "~text" matches a name that contains text (buttons with a description line).
-        const loose = text.startsWith("~")
-        const name = { name: loose ? text.slice(1) : text, exact: !loose }
-        const target = page.getByRole("button", name)
-          .or(page.getByRole("link", name))
-          .or(page.getByRole("tab", name))
-          .or(page.getByRole("combobox", name))
-          .or(page.getByRole("textbox", name)).first()
-        await target.click()
+        await clickControl(page, text, readiness)
         await page.waitForTimeout(600)
       }
       await page.waitForTimeout(opt.wait)
@@ -183,16 +162,18 @@ try {
       const slug = p.replace(/^\//, "").replace(/[^a-zA-Z0-9=-]+/g, "_").slice(0, 80) || "root"
       const extra = opt.noJs ? "_nojs" : opt.hover.length || opt.focus.length ? "_hover" : opt.click.length ? "_" + opt.click.join("-").replace(/[^a-zA-Z0-9]+/g, "").slice(0, 40) : ""
       const file = join(out, `${opt.tag ? opt.tag + "_" : ""}${slug}${extra}_${width}.png`)
-      await shooter.screenshot({ path: file, fullPage: opt.full })
+      await shooter.screenshot({ path: file, fullPage: opt.full, caret: "initial" })
       console.log(file)
-      for (const line of logs) console.log(`  ${line}`)
-      for (const expr of opt.evals) console.log(`  eval: ${JSON.stringify(await page.evaluate(expr))}`)
+      for (const line of logs) console.log(redact(`  ${line}`, secrets))
+      for (const expr of opt.evals) console.log(redact(`  eval: ${JSON.stringify(await page.evaluate(expr))}`, secrets))
     }
+    if (bare) await bare.close()
     await context.close()
   }
 } catch (error) {
-  if (!error.credentialRefusal) throw error
-  console.error(error.message); process.exitCode = 2
+  console.error(`ui-shots: ${redact(error.message, secrets).split("\n")[0]}`)
+  process.exitCode = error.credentialRefusal ? 2 : 1
 } finally {
-  await browser.close()
+  console.log(authLine("ui-shots", counts))
+  if (browser) await browser.close()
 }

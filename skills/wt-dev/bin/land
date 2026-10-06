@@ -41,10 +41,15 @@ if [ -f "$wt/tools/check-file-size.mjs" ]; then
 fi
 
 # 3. Preflight: seconds-cheap guards that otherwise cost a full remote round.
-# A worktree made with --no-install has no prettier/eslint; install before the guards.
-if [ -f "$wt/pnpm-lock.yaml" ] && [ ! -d "$wt/node_modules" ]; then
-  (cd "$wt" && pnpm install --frozen-lockfile --prefer-offline >/dev/null 2>&1) || fail "pnpm install"
-  echo "installed deps"
+# Install when node_modules is missing (--no-install worktree) or the lockfile differs from the
+# one last installed here (the rebase picked up a new dependency: 2026-10-05, six lanes failed
+# typecheck after one lane added a package).
+if [ -f "$wt/pnpm-lock.yaml" ]; then
+  lock=$(git -C "$wt" hash-object pnpm-lock.yaml); stamp="$wt/node_modules/.land-lock"
+  if [ ! -d "$wt/node_modules" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$lock" ]; then
+    (cd "$wt" && pnpm install --frozen-lockfile --prefer-offline >/dev/null 2>&1) || fail "pnpm install"
+    echo "$lock" >"$stamp"; echo "installed deps"
+  fi
 fi
 if [ -x "$main/tools/land-preflight.sh" ]; then
   out=$(cd "$wt" && sh "$main/tools/land-preflight.sh" "$base" 2>&1) || { printf '%s\n' "$out" | tail -8; fail "preflight"; }

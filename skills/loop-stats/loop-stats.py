@@ -105,9 +105,9 @@ def read_tags(home, repo):
     result = defaultdict(list)
     for line in lines(home / '.claude/state/worker-tags.tsv'):
         fields = line.rstrip('\n').split('\t')
-        if len(fields) != 5:
+        if len(fields) not in (5, 6):
             continue
-        at, project, name, feature, reason = fields
+        at, project, name, feature, reason = fields[:5]
         at = epoch(at)
         if at is not None and project == repo and reason in REASONS:
             result[name].append((at, feature, reason))
@@ -187,6 +187,11 @@ def locator_timeouts(output):
     return len(re.findall(r'(?:locator\.[\w.]+: Timeout|Timeout[^\n]*locator|locator[^\n]*timed out)', output, re.I))
 
 
+def url_timeouts(output):
+    # A page.waitForURL marker alone cannot prove that the wait was a login.
+    return len(re.findall(r'(?:page\.waitForURL:\s*Timeout|Timeout[^\n]*page\.waitForURL|page\.waitForURL[^\n]*timed out)', output, re.I))
+
+
 def categories(command):
     """Timebudget families, extended with explicit browser executions."""
     found = {6} if node_browser_heredoc(command) else set()
@@ -237,23 +242,23 @@ def categories(command):
         elif name == 'next' and any(a in ('build', 'dev') for a in args) or (
                 name == 'wt-dev' and any(a in ('new', 'start', 'restart', 'stop') for a in args)):
             found.add(5)
-        elif name in ('playwright', 'pw-run', 'ui-shots', 'agent-browser'):
+        elif name in ('playwright', 'pw-run', 'ui-shots', 'ui-audit', 'agent-browser'):
             found.add(6)
-        elif name in ('node', 'nodejs') and any(browser_code(a) or (
-                not a.startswith('-') and re.fullmatch(r'[\w/.-]*(?:playwright|pw-run|ui-shots)[\w/.-]*\.(?:js|mjs|cjs)', a)) for a in args):
+        elif name in ('node', 'nodejs') and not any(a in ('--check', '-c') for a in args) and any(browser_code(a) or Path(a).name in ('pw-run', 'ui-shots', 'ui-audit') or (
+                not a.startswith('-') and re.fullmatch(r'[\w/.-]*(?:playwright|pw-run|ui-shots|ui-audit)[\w/.-]*\.(?:js|mjs|cjs)', a)) for a in args):
             found.add(6)
     return sorted(found) or [7]
 
 
-def tool_command(value):
+def tool_commands(value):
     if isinstance(value, dict):
-        return value.get('cmd', '') if isinstance(value.get('cmd', ''), str) else ''
+        return [value['cmd']] if isinstance(value.get('cmd'), str) else []
     if not isinstance(value, str):
-        return ''
+        return []
     try:
         obj = json.loads(value)
         if isinstance(obj, dict):
-            return obj.get('cmd', '') if isinstance(obj.get('cmd', ''), str) else ''
+            return [obj['cmd']] if isinstance(obj.get('cmd'), str) else []
     except ValueError:
         pass
     # functions.exec wraps exec_command calls in JS string literals.
@@ -264,7 +269,15 @@ def tool_command(value):
                             match[1][1:-1].replace("\\'", "'").replace('\\n', '\n'))
         except ValueError:
             pass
-    return '\n'.join(commands)
+    return commands
+
+
+def tool_command(value):
+    return '\n'.join(tool_commands(value))
+
+
+def command_key(cmd):
+    return hashlib.sha256(cmd.encode()).hexdigest() if isinstance(cmd, str) and cmd else None
 
 
 def session_index(home, runs, until):
@@ -351,26 +364,36 @@ def parse_session(path):
             hashes = re.findall(r'^\[[^\]\n]+\s([0-9a-f]{7,40})\]', output, re.M)
             cats = categories(cmd) if isinstance(cmd, str) else [7]
             timeouts = locator_timeouts(output) if 6 in cats else 0
-            commands[item.get('id', str(at))] = dict(start=at-duration, end=at,
+            command_id = item.get('id', str(at))
+            commands[command_id] = dict(start=at-duration, end=at, id=command_id,
+                call_id=item.get('call_id', payload.get('call_id')), command_key=command_key(cmd),
                 cats=cats,
                 sleep=isinstance(cmd, str) and any(Path(s[0]).name == 'sleep' for s in shell_segments(cmd)),
                 status=item.get('status'), exit=item.get('exit_code'), hashes=hashes,
-                locator_timeouts=timeouts)
+                locator_timeouts=timeouts, url_timeouts=url_timeouts(output) if 6 in cats else 0)
         if kind in ('function_call', 'custom_tool_call'):
             name = payload.get('name', '')
             name = name if isinstance(name, str) else ''
-            cats = categories(tool_command(payload.get('arguments', payload.get('input', ''))))
-            if re.search(r'(?:playwright|pw_run|ui_shots|agent_browser|node_repl|cua_repl)', name, re.I):
+            cmds = tool_commands(payload.get('arguments', payload.get('input', '')))
+            cats = categories('\n'.join(cmds))
+            if re.search(r'(?:playwright|pw_run|ui_shots|ui[_-]audit|agent_browser|node_repl|cua_repl)', name, re.I):
                 cats = [6]
-            calls[payload.get('call_id')] = (at, cats, name)
+            calls[payload.get('call_id')] = (at, cats, name, [command_key(cmd) for cmd in cmds])
         if kind in ('function_call_output', 'custom_tool_call_output'):
             call = calls.pop(payload.get('call_id'), None)
             if call:
-                a, cats, name = call
+                a, cats, name, keys = call
                 # Tools with no shell command remain other, as in timebudget.
                 output = payload.get('output', '')
-                timeouts = locator_timeouts(output) if cats == [6] and isinstance(output, str) else 0
-                tools.append(dict(start=a, end=at, cats=cats, sleep='sleep' in name, locator_timeouts=timeouts))
+                timeouts = locator_timeouts(output) if 6 in cats and isinstance(output, str) else 0
+                tools.append(dict(start=a, end=at, cats=cats, call_id=payload.get('call_id'), command_keys=keys, sleep='sleep' in name, locator_timeouts=timeouts,
+                                  url_timeouts=url_timeouts(output) if 6 in cats and isinstance(output, str) else 0))
+    # Link output wrappers to opaque command identities, not coincidental intervals alone.
+    # Older records lack call IDs; matching source hashes plus containment is an estimate.
+    for tool in tools:
+        tool['command_ids'] = [c['id'] for c in commands.values()
+            if (c['call_id'] is not None and c['call_id'] == tool['call_id']) or
+               (c['command_key'] is not None and c['command_key'] in tool['command_keys'] and tool['start'] <= c['start'] and c['end'] <= tool['end'])]
     return list(commands.values()), tools, finishes
 
 
@@ -427,7 +450,8 @@ def measure_runs(runs, sessions, until):
             intervals = [(c['start'], c['end'], c['cats'], 2) for c in cs]
             intervals += [(t['start'], t['end'], t['cats'], 1) for t in ts]
             run.update(status='complete', end=end, seconds=allocate(run['start'], end, intervals),
-                       locator_timeouts=sum(c['locator_timeouts'] for c in cs) + sum(t['locator_timeouts'] for t in ts if not any(c['start'] <= t['start'] and c['end'] >= t['end'] for c in cs)),
+                       locator_timeouts=sum(c['locator_timeouts'] for c in cs) + sum(t['locator_timeouts'] for t in ts if not any(c['id'] in t['command_ids'] for c in cs)),
+                       url_timeouts=sum(c['url_timeouts'] for c in cs) + sum(t['url_timeouts'] for t in ts if not any(c['id'] in t['command_ids'] for c in cs)),
                        hashes=[h for c in cs for h in c['hashes']])
 
 
@@ -539,9 +563,35 @@ def daily(runs, events, reflog, start, end, day):
         fallback_matches=sum(r['match'] == 'cwd/start estimate' for r in cohort),
         bucket_seconds={name: sum(r['seconds'][i] for r in complete) for i, name in enumerate(BUCKETS)},
         locator_timeouts=sum(r['locator_timeouts'] for r in complete),
+        url_timeouts=sum(r.get('url_timeouts', 0) for r in complete),
         reasons={k: reasons[k] for k in (*REASONS, 'untagged')},
         rebuild_rounds=dict(sorted(rebuilds.items()))), queue=queue_stats(events, start, end),
         features=features, landings=landed, unlinked_landings=unlinked)
+
+
+def snapshot_path(home, repo, day):
+    return home / '.claude/state/loop-stats' / repo / f'{day}.json'
+
+
+def keep_history(home, repo, computed, now):
+    """Finished days are saved once per run; raw logs can move or rotate later, so a saved day
+    with more evidence (worker runs, then landings) wins over a thinner recomputation."""
+    if date.fromisoformat(computed['day']) >= date.fromtimestamp(now):
+        return computed  # today is still partial
+    path = snapshot_path(home, repo, computed['day'])
+    weight = lambda x: (x['workers']['runs'], x['landings'])
+    try:
+        saved = json.loads(path.read_text())
+    except (OSError, ValueError):
+        saved = None
+    if saved and weight(saved) > weight(computed):
+        return dict(saved, source='snapshot')
+    if saved != computed and (computed['workers']['runs'] or computed['landings']):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(computed, indent=1, sort_keys=True))
+        tmp.replace(path)
+    return computed
 
 
 def report(home, repo, root, day, days, now=None):
@@ -560,6 +610,7 @@ def report(home, repo, root, day, days, now=None):
     trend = [daily(runs, events, reflog, datetime.combine(d, time()).timestamp(),
                    min(now, datetime.combine(d + timedelta(days=1), time()).timestamp()),
                    d.isoformat()) for d in dates]
+    trend = [keep_history(home, repo, x, now) for x in trend]
     return dict(repo=label(repo), day=day.isoformat(), daily=trend[-1], trend=trend,
                 method=dict(time='completed launch-day cohorts; cumulative worker seconds, including startup',
                     intervals='deduplicated item IDs; command intervals override wrappers; union; mixed families share equally (estimate)',
@@ -567,11 +618,12 @@ def report(home, repo, root, day, days, now=None):
                     matching='log session IDs + task_started within 180s; equal cwd within 60s fallback (estimate); no mtime',
                     tags='nearest unused same-repo/name tag within 180s of launch; untagged resumes stay untagged',
                     browser='explicit executable names/inline node browser code and browser/node REPL tools; opaque scripts may be other',
-                    timeouts='deduplicated completed browser-command/tool locator timeout markers; lower bound',
+                    timeouts='deduplicated completed browser-command/tool locator and page.waitForURL timeout markers; URL waits include login but are not uniquely attributable to login; lower bound',
                     queue='distinct lanes plus event counts; queue pairs end on landing day, land pairs end on landed day; requeue starts a new wait',
                     features='first recorded tagged launch to last linked landing (estimate); current-branch merge reflog plus mq landed events',
                     missing='no evidence is no data; numeric trends use 0 for empty counts/hours, -1 for missing medians',
-                    timezone='host local calendar days'))
+                    timezone='host local calendar days',
+                    history='finished days saved to ~/.claude/state/loop-stats/<repo>/<day>.json; a saved day with more runs/landings than the logs now show is used instead (source=snapshot)'))
 
 
 def render(result):
@@ -584,7 +636,7 @@ def render(result):
     output.append('Worker hours (completed launch-day cohorts; cumulative):' if w['completed'] else 'Worker time: no data')
     if w['completed']:
         output += [f'  {name}: {seconds/3600:.2f}' for name, seconds in w['bucket_seconds'].items()]
-    output.append(f"Locator timeouts (lower bound): {w['locator_timeouts']}" if w['completed'] else 'Locator timeouts: no data')
+    output.append(f"Locator timeouts (lower bound): {w['locator_timeouts']}; URL wait timeouts (incl. login): {w.get('url_timeouts', 0)}" if w['completed'] else 'Locator timeouts: no data; URL wait timeouts: no data')
     output.append('Runs by reason: ' + ' '.join(f'{k}={v}' for k, v in w['reasons'].items()) if w['runs'] else 'Runs by reason: no data')
     output.append('Rebuild rounds (rework): ' + (' '.join(f'{k}={v}' for k, v in w['rebuild_rounds'].items()) or 'no data'))
     output.append('Queue lanes: ' + ' '.join(f'{k}={q["lanes"][k]}' for k in ('queued', 'landed', 'bounced', 'parked')) +

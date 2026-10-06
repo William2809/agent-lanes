@@ -1,0 +1,112 @@
+#!/bin/sh
+# ABOUTME: Pause workers before the home volume fills; resume only workers this guard paused.
+# Usage: diskguard check | status | install | uninstall
+set -eu
+state="$HOME/.claude/state"; file="$state/diskguard"; owned="$state/diskguard.paused"
+warn=${DISKGUARD_WARN:-10}; pause=${DISKGUARD_PAUSE:-5}; resume=${DISKGUARD_RESUME:-7}
+label=local.agent-lanes.diskguard; plist="$HOME/Library/LaunchAgents/$label.plist"
+free() { df -k "$HOME" 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+$/ {printf "%.6f\n", $4/1048576; exit}'; }
+below() { awk -v f="$1" -v t="$2" 'BEGIN {exit !(f<t)}'; }
+read_state() { old=$(awk 'NR==1{print $1}' "$file" 2>/dev/null || true); old=${old:-ok}; previous=$(awk 'NR==1{print $2}' "$file" 2>/dev/null || true); previous=${previous:-999999999}; }
+save() { printf '%s\t%s\n' "$1" "$gb" >"$tmp/state"; mv "$tmp/state" "$file"; }
+notify() { command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e "display notification \"$gb GB free ($1)\" with title \"Disk guard\"" >/dev/null 2>&1 || true; }
+case "${1:-status}" in
+  status) gb=$(free); [ -n "$gb" ] || { echo 'diskguard: cannot read free space' >&2; exit 1; }; read_state
+    n=$(awk 'NF{n++} END{print n+0}' "$owned" 2>/dev/null || echo 0)
+    [ "$old" != paused ] || old="paused $n workers"
+    printf 'disk: %s GB free (%s)\n' "${gb%.*}" "$old" ;;
+  check) mkdir -p "$state"
+    lock="$state/diskguard.lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+      pid=$(cat "$lock/pid" 2>/dev/null || true)
+      case "$pid" in
+        '') mt=$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)
+            [ $(( $(date +%s) - mt )) -ge 10 ] || exit 0 ;;
+        *[!0-9]*|0) exit 1 ;;
+        *) kill -0 "$pid" 2>/dev/null && exit 0 ;;
+      esac
+      rm -r "$lock" 2>/dev/null || exit 1
+      mkdir "$lock" 2>/dev/null || exit 0
+    fi
+    tmp=""
+    trap '[ -z "$tmp" ] || rm -r "$tmp"; rm -r "$lock"' EXIT
+    trap 'exit 1' HUP INT TERM
+    echo $$ >"$lock/pid"
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/diskguard.XXXXXX")
+    [ -f "$owned" ] || : >"$owned"
+    gb=$(free); [ -n "$gb" ] || exit 1; read_state; next=$old
+    if below "$gb" "$pause" || { below "$gb" "$warn" && ! below "$previous" "$warn"; }; then
+      before=$gb
+      # One worktree per repository; wt-dev owns the stopped/unused cache safety checks.
+      : >"$tmp/repos"
+      for repo in "$HOME"/worktrees/*; do
+        [ -d "$repo" ] || continue
+        for wt in "$repo"/*; do
+          [ -e "$wt/.git" ] || continue
+          common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
+          grep -Fxq "$common" "$tmp/repos" && continue
+          printf '%s\n' "$common" >>"$tmp/repos"
+          (cd "$wt" && wt-dev drop-caches) >"$tmp/caches" 2>/dev/null || true
+          freed=$(awk '$1=="freed" && $2~/^[0-9]+$/{n+=$2} END{print n+0}' "$tmp/caches")
+          echo "diskguard: caches $(basename "$repo") freed $freed MB"
+        done
+      done
+      gb=$(free); [ -n "$gb" ] || exit 1
+      freed=$(awk -v a="$gb" -v b="$before" 'BEGIN{printf "%.3f", (a>b?a-b:0)}')
+      echo "diskguard: cache recovery freed $freed GB; $gb GB free"
+    fi
+    if below "$gb" "$pause"; then
+      # batches lists workers across repos. Capture only successful pauses, never user-paused names.
+      names=$(cd / && batches --all 2>/dev/null | awk '$2=="running" || $2=="STALLED" {print $1}')
+      if [ -n "$names" ]; then
+        (cd / && batches pause --stalled $names) >"$tmp/result" 2>/dev/null || true
+        { cat "$owned" 2>/dev/null || true; awk '$1=="paused" && NF==2{print $2}' "$tmp/result"; } | sort -u >"$tmp/owned"
+        mv "$tmp/owned" "$owned"
+      fi
+      next=paused
+    elif [ "$old" = paused ]; then
+      if ! below "$gb" "$resume"; then
+        : >"$tmp/owned"
+        # Never call batches resume without names: that would resume somebody else's workers.
+        while read -r n; do [ -n "$n" ] || continue
+          (cd / && batches resume "$n") >"$tmp/result" 2>/dev/null || true
+          awk -v n="$n" '$1=="resumed" && $2==n{ok=1} END{exit !ok}' "$tmp/result" || echo "$n" >>"$tmp/owned"
+        done <"$owned"
+        mv "$tmp/owned" "$owned"
+        [ -s "$owned" ] || next=ok
+      fi
+    elif below "$gb" "$warn"; then next=warn
+    else next=ok; fi
+    if [ "$next" != "$old" ]; then
+      case "$next" in
+        paused) notify paused ;;
+        warn) below "$previous" "$warn" || notify warn ;;
+      esac
+      echo "disk: ${gb%.*} GB free ($next)"
+    fi
+    save "$next" ;;
+  install) mkdir -p "$(dirname "$plist")" "$state"
+    self=$(command -v diskguard || true); [ -n "$self" ] || self=$(cd "$(dirname "$0")" && pwd)/diskguard
+    # plistlib escapes paths and PATH without exposing their values in output.
+    DISKGUARD_EXE="$self" python3 - "$plist.new" "$label" "$state" <<'PY'
+import os, plistlib, sys
+path, label, state = sys.argv[1:]
+env = {'PATH': os.environ['PATH']}
+for key in ('DISKGUARD_WARN', 'DISKGUARD_PAUSE', 'DISKGUARD_RESUME'):
+    if key in os.environ:
+        env[key] = os.environ[key]
+with open(path, 'wb') as f:
+    plistlib.dump(dict(Label=label, ProgramArguments=[os.environ['DISKGUARD_EXE'], 'check'],
+                      StartInterval=60, RunAtLoad=True, EnvironmentVariables=env,
+                      StandardOutPath=state + '/diskguard.log', StandardErrorPath=state + '/diskguard.log'), f)
+PY
+    plutil -lint "$plist.new" >/dev/null; mv "$plist.new" "$plist"
+    launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+    launchctl bootstrap "gui/$(id -u)" "$plist"
+    echo 'diskguard: installed; reinstall: diskguard install; uninstall: diskguard uninstall' ;;
+  uninstall) launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+    [ ! -e "$plist" ] || ctrash "$plist" >/dev/null
+    echo 'diskguard: uninstalled; reinstall: diskguard install; uninstall: diskguard uninstall' ;;
+  *) echo 'usage: diskguard check | status | install | uninstall' >&2; exit 2 ;;
+esac

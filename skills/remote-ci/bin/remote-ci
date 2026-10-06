@@ -5,7 +5,8 @@ set -uo pipefail
 kit=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 # Machine-specific settings live outside the repo: ${AGENT_LANES_CONFIG:-~/.config/agent-lanes/config}.
 #   REMOTE_CI_USER (default: your login) · REMOTE_CI_DIRECT_HOST (default: the bridge0 router, i.e. a Thunderbolt bridge)
-#   REMOTE_CI_HOSTKEY_ALIAS (ssh HostKeyAlias for the direct route) · REMOTE_CI_HOST (ssh host for the fallback route)
+#   REMOTE_CI_HOSTKEY_ALIAS (ssh HostKeyAlias for the direct route) · REMOTE_CI_HOST (ssh host for the fallback route,
+#   or "local": this machine is its own runner, with the same ~/ci checkout, Postgres and logs, no SSH)
 cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}
 # shellcheck disable=SC1090
 [ -f "$cfg" ] && . "$cfg"
@@ -13,6 +14,8 @@ user=${REMOTE_CI_USER:-$(id -un)}
 usage() {
   cat <<'USAGE'
 remote-ci check [--force] [--worktree] [--run "<cmd>"] [--summary] [<commit>]   run the check on the runner
+remote-ci fail [SHA|latest]                                             redacted failure summary + log path
+remote-ci blame SHA LANE...                                            rank failing-file overlaps (read-only)
 remote-ci status                                                       lock, runs, disk, Postgres
 remote-ci log [-C n] <regex>                                           grep the latest run's log (no colors)
 remote-ci info                                                         one-line route, ssh command, ports, paths (cheap lookup)
@@ -23,11 +26,19 @@ USAGE
 }
 cmd=${1:-}; shift || true
 [ "$cmd" = init ] && exec bash "$kit/bin/remote-ci-init" "$@"
-case "$cmd" in check | status | setup | info | log) ;; *) usage; exit 2 ;; esac
+case "$cmd" in check | fail | blame | status | setup | info | log) ;; *) usage; exit 2 ;; esac
 
-root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "remote-ci: not in a git repository" >&2; exit 2; }
+if [ "$cmd" = fail ] || [ "$cmd" = blame ]; then
+  target=${1:-latest}
+  [ "$cmd" != blame ] || [ $# -ge 2 ] || exit 1
+  [ "$cmd" != fail ] || [ $# -le 1 ] || exit 1
+  if [ "$target" != latest ] || [ "$cmd" = blame ]; then
+    [[ "$target" =~ ^[0-9a-f]{7,40}$ ]] || exit 1
+  fi
+fi
+root=$(git rev-parse --show-toplevel 2>/dev/null) || { [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: not in a git repository" >&2; exit 2; }
 conf=$root/.remote-ci.conf
-[ -f "$conf" ] || { echo "remote-ci: no .remote-ci.conf in $root (run: remote-ci init)" >&2; exit 2; }
+[ -f "$conf" ] || { [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: no .remote-ci.conf in $root (run: remote-ci init)" >&2; exit 2; }
 # Keep the settings used for cache identity and execution identical while queued.
 conf_snapshot=$(mktemp)
 chmod 600 "$conf_snapshot"
@@ -36,16 +47,29 @@ conf=$conf_snapshot
 trap 'rm -f "$conf_snapshot"' EXIT
 # shellcheck disable=SC1090
 . "$conf"
+if [ "$cmd" = fail ] || [ "$cmd" = blame ]; then
+  case "${REMOTE_CI_NAME:-}" in *[!a-zA-Z0-9_.-]*|''|.|..) exit 1 ;; esac
+fi
 : "${REMOTE_CI_NAME:?set REMOTE_CI_NAME in .remote-ci.conf}"
-case "${REMOTE_CI_SLOTS:-1}" in *[!0-9]* | "" | 0*) echo "remote-ci: REMOTE_CI_SLOTS must be a positive integer" >&2; exit 2 ;; esac
+case "$REMOTE_CI_NAME" in *[!a-zA-Z0-9_.-]*|''|.|..) echo 'remote-ci: unsafe project name' >&2; exit 2 ;; esac
+case "${REMOTE_CI_SLOTS:-1}" in *[!0-9]* | "" | 0*) [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: REMOTE_CI_SLOTS must be a positive integer" >&2; exit 2 ;; esac
 
 base=(-o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
-router=${REMOTE_CI_DIRECT_HOST:-$(ipconfig getoption bridge0 router 2>/dev/null)}
+# A clean environment like an ssh session: the lane's DATABASE_URL, NODE_ENV and PATH must not reach the run.
+local_sh() { env -i HOME="$HOME" USER="$user" LOGNAME="$user" SHELL=/bin/bash PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash -c "cd ~ && $*"; }
+router=""
+[ "${REMOTE_CI_HOST:-}" = local ] || router=${REMOTE_CI_DIRECT_HOST:-$(ipconfig getoption bridge0 router 2>/dev/null)}
 alias_opt=(); [ -n "${REMOTE_CI_HOSTKEY_ALIAS:-}" ] && alias_opt=(-o "HostKeyAlias=$REMOTE_CI_HOSTKEY_ALIAS")
-if [ -n "$router" ] && ssh "${base[@]}" "${alias_opt[@]}" "$user@$router" true 2>/dev/null; then
-  ssh_cmd=(ssh "${base[@]}" "${alias_opt[@]}" "$user@$router")
+if [ "${REMOTE_CI_HOST:-}" = local ]; then
+  [ "$user" = "$(id -un)" ] || { echo "remote-ci: REMOTE_CI_HOST=local runs as you; unset REMOTE_CI_USER" >&2; exit 2; }
+  ssh_cmd=(local_sh)
+  git_url="$HOME/ci/projects/$REMOTE_CI_NAME/repo.git"
+  git_ssh=ssh
+  route=local
+elif [ -n "$router" ] && ssh "${base[@]}" ${alias_opt[@]+"${alias_opt[@]}"} "$user@$router" true 2>/dev/null; then
+  ssh_cmd=(ssh "${base[@]}" ${alias_opt[@]+"${alias_opt[@]}"} "$user@$router")
   git_url="ssh://$user@$router/~/ci/projects/$REMOTE_CI_NAME/repo.git"
-  git_ssh="ssh ${base[*]} ${alias_opt[*]}"
+  git_ssh="ssh ${base[*]} ${alias_opt[*]-}"
   route="direct $router"
 elif [ -n "${REMOTE_CI_HOST:-}" ] && ssh "${base[@]}" "$REMOTE_CI_HOST" true 2>/dev/null; then
   ssh_cmd=(ssh "${base[@]}" "$REMOTE_CI_HOST")
@@ -54,6 +78,7 @@ elif [ -n "${REMOTE_CI_HOST:-}" ] && ssh "${base[@]}" "$REMOTE_CI_HOST" true 2>/
   route="ssh $REMOTE_CI_HOST"
 else
   [ "$cmd" != info ] || echo "direct=${router:-unset} alias=${REMOTE_CI_HOSTKEY_ALIAS:-unset} ssh=${REMOTE_CI_HOST:-unset} unreachable"
+  [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1
   echo "remote-ci: runner unreachable" >&2
   exit 3
 fi
@@ -79,6 +104,15 @@ sync_kit() {
 }
 
 case "$cmd" in
+fail)
+  # Parser runs on SSH stdin: no remote script/config writes or raw log output.
+  "${ssh_cmd[@]}" "python3 - --logs $p/logs '$target'" <"$kit/bin/fail-summary.py" 2>/dev/null
+  rc=$?; [ "$rc" = 0 ] && exit 0; exit 1 ;;
+blame)
+  failure=$("${ssh_cmd[@]}" "python3 - --logs $p/logs --json '$target'" <"$kit/bin/fail-summary.py" 2>/dev/null) || exit 1
+  shift
+  printf '%s\n' "$failure" | python3 "$kit/bin/blame.py" "$root" "$target" "$@"
+  exit $? ;;
 setup)
   sync_kit && remote "bash ~/ci/bin/setup.sh $REMOTE_CI_NAME"
   exit $?
@@ -141,7 +175,7 @@ remote "test -f $p/.ready" || remote "bash ~/ci/bin/setup.sh $REMOTE_CI_NAME" ||
 GIT_SSH_COMMAND="$git_ssh" git push -q --force "$git_url" "$sha:refs/heads/run/$run" || exit 1
 echo "remote-ci: $REMOTE_CI_NAME ${sha:0:8} on the runner via $route (log $p/logs/$run.log)"
 encoded=$(printf '%s' "$command" | base64)
-remote "nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$encoded' $force >/dev/null 2>&1 &" || exit 1
+remote "nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$encoded' $force </dev/null >/dev/null 2>&1 &" || exit 1
 # If this connection drops, the run still finishes and cleans up on the runner (see: remote-ci status).
 if [ "$summary" = 1 ]; then
   remote "done=$p/results/$run.exit

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 from datetime import date, datetime, time, timedelta
@@ -15,9 +16,8 @@ spec.loader.exec_module(stats)
 
 class LoopStatsTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.home = Path(self.temp.name)
+        self.home = Path(tempfile.mkdtemp(prefix="loop-stats-test-"))
+        self.addCleanup(lambda: subprocess.run(["ctrash", str(self.home)], check=True, stdout=subprocess.DEVNULL))
         self.env = patch.dict(os.environ, {'HOME': str(self.home)})
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -40,7 +40,7 @@ class LoopStatsTests(unittest.TestCase):
                    f'{s+1200}\t3\t{log}\t/gone/demo-alpha\nmalformed\n')
         self.write('.claude/state/worker-tags.tsv',
                    f'{s+1}\tdemo\talpha\tfeature-a\tnew\n'
-                   f'{s+601}\tdemo\talpha\tfeature-a\trework\n'
+                   f'{s+601}\tdemo\talpha\tfeature-a\trework\tabcdef123456\n'
                    f'{s+1200}\twrong\talpha\tfeature-b\tbounce\n')
         runs = stats.read_workers(Path.home(), 'demo', None)
         stats.tag_runs(runs, stats.read_tags(Path.home(), 'demo'))
@@ -58,7 +58,7 @@ class LoopStatsTests(unittest.TestCase):
             f'{s-30}\ta\tqueued\t',
             f'{s+60}\ta\tlanding\t',
             f'{s+80}\ta\tbounced\tPRIVATE_DETAIL',
-            f'{s+100}\ta\trequeued\t',
+            f'{s+100}\ta\trequeued\ttool=abcdef123456',
             f'{s+140}\ta\tlanding\t',
             f'{s+200}\ta\tlanded\tabcdef123456',
             f'{s+220}\tb\tparked\tPRIVATE_DETAIL',
@@ -79,7 +79,10 @@ class LoopStatsTests(unittest.TestCase):
             'remote-ci check': [3], 'pnpm check:remote': [3],
             'sh tools/land-preflight.sh branch': [4], 'node tools/check-file-size.mjs': [4],
             'pnpm install && next build': [5],
-            'pw-run shot': [6], 'npx playwright test': [6],
+            'pw-run shot': [6], 'npx playwright test': [6], 'ui-audit --only orders': [6],
+            'node /work/skills/ui-audit/bin/ui-audit --widths 390': [6],
+            'node /work/ui-audit.mjs': [6], 'node --check /work/ui-audit.mjs': [7],
+            'cat /work/ui-audit': [7], 'rg ui-audit docs': [7],
             'node -e "require(\'playwright\')"': [6],
             "node <<'JS'\nrequire('playwright')\nJS": [6],
             "cat <<'JS' > browser.js\nrequire('playwright')\nJS": [7],
@@ -151,6 +154,69 @@ class LoopStatsTests(unittest.TestCase):
         self.assertEqual(runs[0]['seconds'][3], 30)
         self.assertEqual(runs[0]['seconds'][6], 10)
         self.assertEqual(runs[0]['locator_timeouts'], 1)
+
+    def test_audit_and_login_url_timeouts_count_once_without_retaining_output(self):
+        s = self.start
+        def row(at, payload):
+            return dict(timestamp=datetime.fromtimestamp(at).astimezone().isoformat(), payload=payload)
+        failure = 'TimeoutError: page.waitForURL: Timeout 20000ms exceeded. PRIVATE_LOGIN_DETAIL'
+        command = row(s+20, dict(item=dict(type='CommandExecution', id='audit', status='completed',
+            duration=20, command='ui-audit --only orders', aggregated_output=failure)))
+        rows = [row(s, dict(type='function_call', call_id='wrapper', name='exec_command',
+                            arguments=json.dumps({'cmd': 'ui-audit --only orders'}))),
+                command, command,  # Duplicate item and enclosing tool must not double-count.
+                row(s+20, dict(type='function_call_output', call_id='wrapper', output=failure)),
+                row(s+20, dict(type='function_call', call_id='audit-tool', name='mcp__ui_audit__run', arguments='{}')),
+                row(s+30, dict(type='function_call_output', call_id='audit-tool', output=failure)),
+                row(s+30, dict(type='task_complete'))]
+        path = self.write('.codex/sessions/login.jsonl', '\n'.join(json.dumps(r) for r in rows))
+        runs = [dict(start=s, begin=s, sid='fixture', match='log-session-id')]
+        stats.measure_runs(runs, {'fixture': dict(path=path, starts=[s])}, s+40)
+        self.assertEqual(runs[0]['seconds'][6], 30)
+        self.assertEqual(runs[0]['url_timeouts'], 2)
+        self.assertEqual(runs[0]['locator_timeouts'], 0)
+        daily = stats.daily(runs, [], [], s, s+86400, '2026-10-03')
+        self.assertEqual(daily['workers']['url_timeouts'], 2)
+        result = dict(repo='demo', day='2026-10-03', daily=daily, trend=[daily])
+        self.assertIn('URL wait timeouts (incl. login): 2', stats.render(result))
+        self.assertLessEqual(len(stats.render(result).splitlines()), 30)
+        self.assertNotIn('PRIVATE_LOGIN_DETAIL', json.dumps(result))
+        self.assertEqual(stats.url_timeouts('page.waitForURL: Timeout 1000ms exceeded'), 1)
+        self.assertEqual(stats.url_timeouts('TimeoutError: page.waitForURL timed out'), 1)
+        self.assertEqual(stats.url_timeouts('locator.click: Timeout 1000ms exceeded'), 0)
+
+    def test_wrappers_with_overhead_count_once_and_independent_commands_survive(self):
+        s = self.start
+        def row(at, payload):
+            return dict(timestamp=datetime.fromtimestamp(at).astimezone().isoformat(), payload=payload)
+        failure = 'page.waitForURL: Timeout 20000ms exceeded\nlocator.click: Timeout 5000ms exceeded'
+        cmd = 'pw-run private-script.mjs'
+        def command(key, end, duration, call_id=None):
+            item = dict(type='CommandExecution', id=key, status='completed', duration=duration,
+                        command=cmd, aggregated_output=failure)
+            if call_id:
+                item['call_id'] = call_id
+            return row(end, dict(item=item))
+        rows = [row(s, dict(type='function_call', call_id='outer', name='exec_command', arguments=json.dumps({'cmd': cmd}))),
+                row(s+.5, dict(type='custom_tool_call', call_id='inner', name='exec', input='await tools.exec_command({cmd: "pw-run private-script.mjs"})')),
+                command('c1', s+20, 19), command('c1', s+20, 19),
+                row(s+20.5, dict(type='custom_tool_call_output', call_id='inner', output=failure)),
+                row(s+21, dict(type='function_call_output', call_id='outer', output=failure)),
+                # Identical command, independent execution. Same failure must count again.
+                row(s+22, dict(type='function_call', call_id='second', name='exec_command', arguments=json.dumps({'cmd': cmd}))),
+                command('c2', s+25, 2, 'second'),
+                row(s+26, dict(type='function_call_output', call_id='second', output=failure)),
+                # An independent browser API call overlaps c1; time alone must not suppress it.
+                row(s+2, dict(type='function_call', call_id='api', name='mcp__ui_audit__run', arguments='{}')),
+                row(s+19, dict(type='function_call_output', call_id='api', output=failure)),
+                row(s+30, dict(type='task_complete'))]
+        path = self.write('.codex/sessions/wrappers.jsonl', '\n'.join(json.dumps(r) for r in rows))
+        runs = [dict(start=s, begin=s, sid='fixture')]
+        stats.measure_runs(runs, {'fixture': dict(path=path, starts=[s])}, s+40)
+        self.assertEqual(runs[0]['url_timeouts'], 3)
+        self.assertEqual(runs[0]['locator_timeouts'], 3)
+        commands, tools, _ = stats.parse_session(path)
+        self.assertNotIn('private-script', json.dumps(commands + tools))
 
     def test_feature_reflog_event_dedup_and_first_launch(self):
         s = self.start

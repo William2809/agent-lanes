@@ -2,15 +2,17 @@
 // ui-audit: mechanical UI checks over a route list, one line per problem.
 // Checks per page and width: sideways page scroll, words broken across lines,
 // text cut off with an ellipsis (no title), and console/page errors.
-// Usage (repo root): ui-audit [--base URL] [--widths 1440,390] [--routes FILE] [--only substr] [--theme dark]
-// Routes file (default .ui-audit-routes): one "role path" per line, # comments.
+// Usage (repo root): ui-audit [--base URL] [--widths 1440,390] [--routes FILE] [--only substr] [--theme dark] [--ready CSS|networkidle] [--loaded CSS] [--ready-timeout MS]
+// Routes file (default .ui-audit-routes): one "role path | loaded-selector" per line, # comments.
 import { execFileSync } from "node:child_process"
 import { readFileSync, existsSync, mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
+import { authCounts, authLine } from "../../ui-shots/bin/auth-cache.mjs"
 
 const a = process.argv.slice(2)
-const opt = { base: "http://localhost:3000", widths: "1440,390", routes: ".ui-audit-routes", only: "", theme: "" }
+const opt = { base: "http://localhost:3000", widths: "1440,390", routes: ".ui-audit-routes", only: "", theme: "", "auth-ttl": "", ready: process.env.UI_AUDIT_READY || "", loaded: process.env.UI_AUDIT_LOADED || "", "ready-timeout": "15000" }
 for (let i = 0; i < a.length; i++) {
   const k = a[i].replace(/^--/, "")
   if (k === "h" || k === "help") { console.log(readFileSync(new URL(import.meta.url)).toString().split("\n").slice(1, 7).join("\n")); process.exit(0) }
@@ -19,8 +21,15 @@ for (let i = 0; i < a.length; i++) {
 }
 if (!existsSync(opt.routes)) { console.error(`ui-audit: no ${opt.routes}`); process.exit(2) }
 const routes = readFileSync(opt.routes, "utf8").split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"))
-  .map((l) => { const [role, ...rest] = l.split(/\s+/); return { role, path: rest.join(" ") } })
+  .map((l) => { const [route, ready] = l.split(/\s+\|\s+/); const [role, ...rest] = route.split(/\s+/); return { role, path: rest.join(" "), ready: ready || opt.loaded || opt.ready } })
   .filter((r) => !opt.only || r.path.includes(opt.only))
+
+// A loading shell is not an audit result. Require a caller-declared loaded-content signal.
+if (!routes.length || routes.some(r => !r.ready || ["main", "body", "html", "networkidle"].includes(r.ready.trim()))) {
+  console.error("ui-audit: declare loaded content: role path | CSS_SELECTOR, --ready CSS, or --ready networkidle --loaded CSS (a shell such as main is insufficient)")
+  console.log(authLine("ui-audit", authCounts()))
+  process.exit(2)
+}
 
 // Runs in the page; returns problems as one string.
 const probe = `(() => {
@@ -54,16 +63,26 @@ const probe = `(() => {
 
 const shotsDir = mkdtempSync(join(tmpdir(), "ui-audit-"))
 let problems = 0
-const byRole = {}
-for (const r of routes) (byRole[r.role] ||= []).push(r.path)
-for (const [role, paths] of Object.entries(byRole)) {
-  const args = ["--base", opt.base, "--as", role, "--widths", opt.widths, "--wait", "2500", "--console", "--out", shotsDir, "--eval", probe]
+const counts = authCounts()
+const shots = fileURLToPath(new URL("../../ui-shots/bin/ui-shots", import.meta.url))
+const groups = new Map()
+for (const r of routes) {
+  const key = JSON.stringify([r.role, r.ready])
+  if (!groups.has(key)) groups.set(key, { role: r.role, ready: r.ready, paths: [] })
+  groups.get(key).paths.push(r.path)
+}
+for (const { role, ready, paths } of groups.values()) {
+  const args = ["--base", opt.base, "--as", role, "--widths", opt.widths, "--wait", "0", "--ready", opt.ready === "networkidle" ? "networkidle" : ready, "--ready-timeout", opt["ready-timeout"], "--console", "--out", shotsDir, "--eval", probe]
+  if (opt.ready === "networkidle") args.push("--loaded", ready)
+  if (opt["auth-ttl"] !== "") args.push("--auth-ttl", opt["auth-ttl"])
   if (opt.theme) args.push("--theme", opt.theme)
   let text
-  try { text = execFileSync("ui-shots", [...args, ...paths], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1 << 26 }) }
-  catch (e) { text = (e.stdout || "") + (e.stderr || ""); console.log(`${role}: ui-shots failed: ${String(e.stderr || e.message).split("\n").find((l) => /Error/.test(l)) || "see output"}`); problems++ }
+  try { text = execFileSync(process.execPath, [shots, ...args, ...paths], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 1 << 26 }) }
+  catch (e) { text = (e.stdout || "") + (e.stderr || ""); console.log(`${role}: ui-shots failed: ${String(e.stderr || e.message).split("\n").find((l) => /^ui-shots:|Error/.test(l)) || "see output"}`); problems++ }
   let cur = ""
   for (const line of text.split("\n")) {
+    const auth = line.match(/^browser-auth tool=ui-shots logins=(\d+) reused=(\d+)$/)
+    if (auth) { counts.logins += Number(auth[1]); counts.reused += Number(auth[2]); continue }
     if (line.endsWith(".png")) { cur = line.split("/").pop().replace(/^[a-z]+_/, "").replace(/\.png$/, ""); continue }
     const m = line.match(/^\s+eval:\s*(.*)$/)
     if (m) { const v = JSON.parse(m[1] || '""'); if (v) { console.log(`${role} ${cur}: ${v}`); problems++ } continue }
@@ -72,4 +91,5 @@ for (const [role, paths] of Object.entries(byRole)) {
   }
 }
 console.log(problems ? `ui-audit: ${problems} problem line(s); screenshots in ${shotsDir}` : `ui-audit: clean (${routes.length} routes × ${opt.widths}); screenshots in ${shotsDir}`)
+console.log(authLine("ui-audit", counts))
 process.exit(problems ? 1 : 0)

@@ -4,7 +4,12 @@
 #   wt-dev new <name> [--from <ref>] [--branch <b>] [--port N] [--app apps/web] [--no-install] [--shared-db]
 #   Own database: when .env has a localhost DATABASE_URL, `new` clones that database to <db>_wt_<name>
 #   and gives the worktree a real .env pointing at it (parallel workers can't change each other's data);
-#   `rm` drops it. --shared-db (or WT_DEV_SHARED_DB=1) keeps the old shared database.
+#   `rm` drops it. Clone failures remove the fresh worktree; --shared-db / WT_DEV_SHARED_DB=1 opts out.
+#   Remote databases stay shared with a warning. No DATABASE_URL means no database.
+#   Setups share max(1, logical CPUs / 2) slots across repos; WT_DEV_MAX_SETUPS overrides.
+#   wt-dev sleep-idle [--minutes N] [-n]   # sleep idle servers (default 30 min); -n previews
+#   `new` quietly sleeps idle servers first. `ls` shows sleeping; `start` wakes them.
+#   Sleeping drops the worktree's .next cache (rebuilt on start). wt-dev drop-caches does it for every stopped worktree.
 #   wt-dev start|stop|log|path <name>      wt-dev ls      wt-dev rm <name>
 set -euo pipefail
 
@@ -20,14 +25,70 @@ cmd=${1:-}; shift || true
 name=""
 [[ "$cmd" =~ ^(new|start|stop|log|path|rm)$ ]] && { name=${1:-}; [ -n "$name" ] || die "$cmd needs a name"; shift; }
 from=HEAD; branch=""; port=""; app=""; install=1; shared_db=${WT_DEV_SHARED_DB:-0}
+minutes=30; dry_run=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from) from=$2; shift 2;; --branch) branch=$2; shift 2;;
     --port) port=$2; shift 2;; --app) app=$2; shift 2;;
-    --no-install) install=0; shift;; --shared-db) shared_db=1; shift;; *) die "unknown option $1";;
+    --no-install) install=0; shift;; --shared-db) shared_db=1; shift;;
+    --minutes) [ "$cmd" = sleep-idle ] || die "--minutes is for sleep-idle"; minutes=${2:?--minutes needs a number}; shift 2;;
+    -n) [ "$cmd" = sleep-idle ] || die "-n is for sleep-idle"; dry_run=1; shift;;
+    *) die "unknown option $1";;
   esac
 done
+[[ "$minutes" =~ ^[0-9]+$ ]] || die "--minutes needs a nonnegative integer"
+minutes=$((10#$minutes))
+[ -z "$name" ] || { [[ "$name" =~ ^[a-zA-Z0-9_.-]+$ ]] && [ "$name" != . ] && [ "$name" != .. ]; } || die "invalid worktree name"
 wt="$root/$name"
+setup_slot=""
+release_setup() { [ -z "$setup_slot" ] || { rm -rf "$setup_slot"; setup_slot=""; }; }
+trap release_setup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# A short advisory guard serializes mkdir + PID publication + stale-slot moves.
+# It releases even if its process dies; servers never hold a setup slot.
+acquire_setup() {
+  local cpus limit slots="$HOME/.cache/wt-dev/setup-slots" waited=0
+  cpus=$(sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN)
+  limit=${WT_DEV_MAX_SETUPS:-$((cpus / 2))}
+  [[ "$limit" =~ ^[0-9]+$ ]] || die "WT_DEV_MAX_SETUPS needs a positive integer"
+  limit=$((10#$limit)); [ "$limit" -ge 1 ] || limit=1
+  command -v python3 >/dev/null || die "python3 missing (setup slots need it)"
+  mkdir -p "$slots"
+  while :; do
+    setup_slot=$(python3 - "$slots" "$limit" "$$" <<'SLOTS'
+import fcntl, os, shutil, sys, uuid
+root, limit, pid = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+with open(root + '/.guard', 'a') as guard:
+    fcntl.flock(guard, fcntl.LOCK_EX)
+    for i in range(1, limit + 1):
+        slot = root + '/' + str(i)
+        if os.path.isdir(slot):
+            try:
+                with open(slot + '/pid') as f:
+                    owner = int(f.read().strip())
+                if owner <= 0:
+                    raise ValueError()
+                os.kill(owner, 0)
+                continue
+            except PermissionError:
+                continue
+            except (ProcessLookupError, FileNotFoundError, ValueError):
+                stale = slot + '.stale-' + uuid.uuid4().hex
+                os.rename(slot, stale)
+                shutil.rmtree(stale, ignore_errors=True)
+        os.mkdir(slot)
+        with open(slot + '/pid', 'w') as f:
+            f.write(pid + '\n')
+        print(slot)
+        break
+SLOTS
+    ) || die "could not acquire a setup slot"
+    [ -z "$setup_slot" ] || return 0
+    if [ "$waited" = 0 ]; then echo "wt-dev: waiting for a setup slot ($limit/$limit busy)"; waited=1; fi
+    sleep 1
+  done
+}
 
 detect_app() {
   [ -n "$app" ] && { echo "$app"; return; }
@@ -42,16 +103,18 @@ db_of() { local u=${1%%\?*}; echo "${u##*/}"; }
 with_db() { local u=$1 d=$2 q=""; case "$u" in *\?*) q="?${u#*\?}"; u=${u%%\?*};; esac; echo "${u%/*}/$d$q"; }
 own_db() {
   local u; u=$(main_url) || true
-  [ -n "$u" ] || { db_warning=" (no DATABASE_URL in .env)"; return 1; }
-  case "$u" in *@localhost[:/]*|*@127.0.0.1[:/]*) ;; *) db_warning=" (DATABASE_URL is not on localhost)"; return 1;; esac
+  [ -n "$u" ] || return 0
+  case "$u" in *://localhost[:/]*|*://127.0.0.1[:/]*|*@localhost[:/]*|*@127.0.0.1[:/]*) ;; *)
+    echo "wt-dev: own database not created (DATABASE_URL is not on localhost); using the shared one"; return 0;; esac
   local tool
   for tool in pg_dump psql createdb pg_restore; do
-    command -v "$tool" >/dev/null || { db_warning=" ($tool missing)"; return 1; }
+    command -v "$tool" >/dev/null || { db_warning="$tool missing"; return 1; }
   done
   local src; src=$(db_of "$u"); local dst; dst="${src}_wt_$(echo "$name" | tr -c 'a-zA-Z0-9\n' '_' | tr 'A-Z' 'a-z')"
   local admin; admin=$(with_db "$u" postgres)
+  # A same-named clone can only be a leftover: `new` already refused an existing worktree.
   psql "$admin" -q -c "drop database if exists \"$dst\" with (force)" >/dev/null 2>&1
-  createdb --maintenance-db="$admin" "$dst" 2>/dev/null || { db_warning=" (createdb failed)"; return 1; }
+  createdb --maintenance-db="$admin" "$dst" 2>/dev/null || { db_warning="createdb failed"; return 1; }
   local clone; clone=$(with_db "$u" "$dst")
   local failed="" source_tables clone_tables
   local table_sql="select n.nspname, count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'p', 'f') and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' group by n.nspname order by n.nspname collate \"C\""
@@ -63,27 +126,45 @@ own_db() {
   elif [ "$source_tables" != "$clone_tables" ]; then
     failed="clone table counts differ from source"
   fi
+  if [ -z "$failed" ]; then
+    # Write privately before replacing the link; never write through it into the main .env.
+    local line k v q
+    if ! (
+      umask 077
+      while IFS= read -r line || [ -n "$line" ]; do
+        k=${line%%=*}; v=${line#*=}; q=""
+        case "$v" in
+          \"*\") q='"'; v=${v#\"}; v=${v%\"};;
+          \'*\') q="'"; v=${v#\'}; v=${v%\'};;
+        esac
+        case "$v" in *://*/"$src"|*://*/"$src"\?*)
+          echo "$k=$q$(with_db "$v" "$dst")$q";;
+        *) echo "$line";; esac
+      done <"$repo/.env" >"$wt/.env.wt-dev.new"
+    ) || ! rm -f "$wt/.env" || ! mv "$wt/.env.wt-dev.new" "$wt/.env" ||
+         ! echo "$dst" >"$state/$name.db"; then
+      failed="clone environment could not be saved"
+    fi
+  fi
   if [ -n "$failed" ]; then
     psql "$admin" -q -c "drop database if exists \"$dst\" with (force)" >/dev/null 2>&1 || failed="$failed; clone cleanup failed"
-    db_warning=" ($failed)"; return 1
+    db_warning="$failed"; return 1
   fi
-  # Real .env for the worktree: every URL naming the source database now names the clone.
-  rm -f "$wt/.env"  # the symlink to the main .env
-  while IFS= read -r line; do
-    case "$line" in *://*/"$src"|*://*/"$src"\?*|*://*/"$src"\"|*://*/"$src"\"\?*)
-      k=${line%%=*}; v=${line#*=}; q=""; case "$v" in \"*\") q='"'; v=${v#\"}; v=${v%\"};; esac
-      echo "$k=$q$(with_db "$v" "$dst")$q";;
-    *) echo "$line";; esac
-  done <"$repo/.env" >"$wt/.env"
-  echo "$dst" >"$state/$name.db"; echo "database: $dst (clone of $src)"
+  echo "database: $dst (clone of $src)"
 }
 drop_db() {
   [ -f "$state/$name.db" ] || return 0; local u; u=$(main_url)
   psql "$(with_db "$u" postgres)" -q -c "drop database if exists \"$(cat "$state/$name.db")\" with (force)" >/dev/null 2>&1 && echo "dropped database $(cat "$state/$name.db")"
 }
-running() { [ -f "$state/$name.pid" ] && kill -0 "$(cat "$state/$name.pid")" 2>/dev/null; }
+running() {
+  local pid
+  [ -f "$state/$name.pid" ] || return 1
+  pid=$(cat "$state/$name.pid")
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null
+}
 
 start() {
+  rm -f "$state/$name.sleeping"
   running && { echo "already running: http://localhost:$(cat "$state/$name.port")"; return; }
   local a; a=$(detect_app); echo "$a" > "$state/$name.app"
   [ -n "$port" ] || port=$( [ -f "$state/$name.port" ] && ! lsof -iTCP:"$(cat "$state/$name.port")" -sTCP:LISTEN >/dev/null 2>&1 && cat "$state/$name.port" || free_port )
@@ -102,6 +183,9 @@ start() {
   local dotenv="$wt/node_modules/.bin/dotenv"
   (
     cd "$wt/$a"
+    # WT_DEV=1 marks a disposable worktree server; projects can use it to skip
+    # disk-heavy dev caches (a project can turn off its bundler's file-system cache).
+    export WT_DEV=1
     if [ ${#envargs[@]} -gt 0 ] && [ -x "$dotenv" ]; then
       nohup "$dotenv" "${envargs[@]}" -- npx next dev -p "$port" > "$log" 2>&1 &
     else
@@ -109,7 +193,11 @@ start() {
     fi
     echo $! > "$state/$name.pid"
   )
-  for _ in $(seq 1 60); do grep -q 'Ready' "$log" 2>/dev/null && break; sleep 1; done
+  for _ in $(seq 1 60); do
+    grep -q 'Ready' "$log" 2>/dev/null && break
+    running || break
+    sleep 1
+  done
   grep -q 'Ready' "$log" || { tail -5 "$log"; die "dev server not ready after 60s (log: $log)"; }
   echo "ready: http://localhost:$port  (ui-shots --base http://localhost:$port)"
 }
@@ -122,15 +210,72 @@ stop() {
   rm -f "$state/$name.pid"
 }
 
+clear_state() {
+  rm -f "$state/$name".*  # small state files this tool wrote
+}
+server_tree() {
+  ps -axo pid=,ppid= | awk -v root="$1" '
+    { parent[$1]=$2 } END {
+      tree[root]=1
+      do { changed=0; for (p in parent) if (!tree[p] && tree[parent[p]]) { tree[p]=1; changed=1 } } while (changed)
+      for (p in tree) if (tree[p]) printf "%s ", p
+    }'
+}
+# Next's build cache (~1 GB per worktree) is rebuilt on the next start, so a stopped server
+# doesn't need it. Deletes only <worktree>/<app>/.next of a wt-dev worktree; prints MB freed.
+drop_cache() {
+  local a d mb
+  a=$(cat "$state/$name.app" 2>/dev/null || echo apps/web); d="$wt/$a/.next"
+  case "$d" in "$root"/*/.next) ;; *) return 0;; esac
+  [ -d "$d" ] && [ ! -L "$d" ] || return 0
+  mb=$(du -sm "$d" 2>/dev/null | cut -f1); rm -rf "$d" && echo "${mb:-0}"
+}
+sleep_idle() {
+  local saved_name="$name" saved_wt="$wt" f pid modified now idle tree cwds dir freed
+  # Missing/inaccessible cwd information is not evidence of an idle worktree.
+  cwds=$(lsof -n -P -a -d cwd -F pn 2>/dev/null) || return 0
+  now=$(date +%s)
+  for f in "$state"/*.pid; do
+    [ -f "$f" ] || continue
+    name=${f##*/}; name=${name%.pid}; wt="$root/$name"
+    [ -d "$wt" ] && running && [ -f "$state/$name.log" ] || continue
+    modified=$(stat -f %m "$state/$name.log" 2>/dev/null || stat -c %Y "$state/$name.log" 2>/dev/null) || continue
+    [[ "$modified" =~ ^[0-9]+$ ]] || continue
+    idle=$(((now - modified) / 60)); [ "$idle" -ge "$minutes" ] || continue
+    dir=$(cd "$wt" && pwd -P) || continue
+    pid=$(cat "$f"); tree=$(server_tree "$pid") || continue
+    if printf '%s\n' "$cwds" | awk -v dir="$dir" -v tree="$tree" '
+      BEGIN { split(tree, p, " "); for (i in p) own[p[i]]=1 }
+      /^p/ { pid=substr($0,2) }
+      /^n/ { path=substr($0,2); if (!own[pid] && (path==dir || index(path,dir "/")==1)) busy=1 }
+      END { exit !busy }'; then continue; fi
+    if [ "$dry_run" = 1 ]; then echo "would sleep $name"
+    else
+      stop >/dev/null
+      : >"$state/$name.sleeping"
+      freed=$(drop_cache)
+      echo "slept $name (idle $idle min${freed:+; freed ${freed} MB cache}; wt-dev start $name to wake)"
+    fi
+  done
+  name="$saved_name"; wt="$saved_wt"
+}
+
 case "$cmd" in
   new)
     [ -e "$wt" ] && die "$wt exists"
+    sleep_idle
+    acquire_setup
     if [ -n "$branch" ]; then git -C "$repo" worktree add -q -b "$branch" "$wt" "$from"
     else git -C "$repo" worktree add -q --detach "$wt" "$from"; fi
     for f in "$repo"/.env "$repo"/.env.local "$repo"/apps/*/.env "$repo"/apps/*/.env.local; do
       [ -f "$f" ] || continue; rel=${f#"$repo/"}; ln -s "$f" "$wt/$rel"
     done
-    if [ "$shared_db" != 1 ]; then own_db || echo "wt-dev: own database not created${db_warning:-}; using the shared one"; fi
+    if [ "$shared_db" != 1 ] && ! own_db; then
+      reason=${db_warning:-database clone failed}
+      git -C "$repo" worktree remove --force "$wt" || reason="$reason; fresh worktree cleanup failed"
+      clear_state
+      die "$reason; rerun with --shared-db (or WT_DEV_SHARED_DB=1) to use the main database on purpose"
+    fi
     if [ $install = 1 ]; then (cd "$wt" && pnpm install --frozen-lockfile --prefer-offline >/dev/null 2>&1) || die "pnpm install failed in $wt"; fi
     echo "worktree: $wt ($(git -C "$wt" rev-parse --short HEAD)${branch:+, branch $branch})"
     start;;
@@ -141,15 +286,28 @@ case "$cmd" in
   rm)
     stop
     if [ ! -d "$wt" ]; then  # already gone: clean leftovers, say so plainly
-      git -C "$repo" worktree prune; drop_db || true; rm -f "$state/$name".*; die "no worktree $name (not found; leftover state cleaned)"; fi
+      git -C "$repo" worktree prune; drop_db || true; clear_state; die "no worktree $name (not found; leftover state cleaned)"; fi
     git -C "$repo" worktree remove "$wt" || die "worktree has changes; commit or move them first (not forced)"
     drop_db || true
-    rm -f "$state/$name".*; echo "removed $wt";;
+    clear_state; echo "removed $wt";;
+  sleep-idle) sleep_idle;;
+  drop-caches)  # build caches of every stopped/sleeping worktree in this repo
+    total=0
+    # A worktree some process works in (a worker, a build, a shell) keeps its cache.
+    cwds=$(lsof -n -P -a -d cwd -Fn 2>/dev/null | sed -n 's/^n//p') || die "lsof failed; not dropping caches"
+    for d in "$root"/*/; do
+      [ -d "$d" ] || continue; name=$(basename "$d"); wt="$root/$name"
+      running && continue
+      dir=$(cd "$wt" && pwd -P)
+      printf '%s\n' "$cwds" | awk -v d="$dir" '$0==d || index($0, d "/")==1 {f=1} END {exit !f}' && continue
+      mb=$(drop_cache); [ -z "$mb" ] || { echo "dropped $name cache (${mb} MB)"; total=$((total + mb)); }
+    done
+    echo "freed ${total} MB";;
   ls)
     for d in "$root"/*/; do
       [ -d "$d" ] || continue; name=$(basename "$d")
-      st=stopped; running && st="http://localhost:$(cat "$state/$name.port")"
+      st=stopped; [ ! -f "$state/$name.sleeping" ] || st=sleeping; running && st="http://localhost:$(cat "$state/$name.port")"
       echo "$name  $(git -C "$d" rev-parse --abbrev-ref HEAD)@$(git -C "$d" rev-parse --short HEAD)  $st  dirty:$(git -C "$d" status --porcelain | wc -l | tr -d ' ')  db:$(cat "$state/$name.db" 2>/dev/null || echo shared)"
     done;;
-  *) sed -n '2,6p' "$0"; exit 1;;
+  *) sed -n '2,12p' "$0"; exit 1;;
 esac

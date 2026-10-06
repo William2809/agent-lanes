@@ -8,6 +8,9 @@
 #   --lead:       run through the Codex profile in AGENT_LANES_LEAD_PROFILE (e.g. a proxy that lets the
 #                 worker spawn other providers' subagents); never with full-access or read-only models.
 set -eu
+tool_root=$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)
+tool_rev=$(git -C "$tool_root" rev-parse HEAD 2>/dev/null || echo unknown)
+. "$tool_root/skills/agent-workers/scripts/state.sh"
 cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}
 # shellcheck disable=SC1090
 [ -f "$cfg" ] && . "$cfg"
@@ -36,6 +39,5 @@ nohup "$codex" exec $route --model "$model" \
   -C "$dir" "$(cat "$prompt")" </dev/null >"$log" 2>&1 &
 echo $! >"$log.pid"
 # Registry read by batches.sh, so a worker that dies is noticed.
-mkdir -p "$HOME/.claude/state"
-printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$!" "$log" "$dir" >>"$HOME/.claude/state/workers.tsv"
+ops_register "$!" "$log" "$dir" "$sandbox" "${WK_PRESET:-}"
 echo "$log"
