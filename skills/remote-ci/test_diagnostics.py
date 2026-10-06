@@ -139,6 +139,16 @@ sys.exit(subprocess.run(args, input=sys.stdin.read(), text=True).returncode)
             self.assertEqual(result.returncode, 0)
             self.assertIn('postgres://***@host/db', result.stdout)
             self.assertNotIn('example-pass', result.stdout + result.stderr)
+            # Tail mode reads the requested failed SHA, stays bounded and redacts.
+            log.write_text('== sha ' + 'abcdef01' * 5 + '\n' +
+                           'noise\n' * 100 + 'R2 InternalError token=example-value\n' +
+                           '== finished rc=1')
+            tail = call('fail', '--tail', 'abcdef01')
+            self.assertEqual(tail.returncode, 0)
+            self.assertEqual(len(tail.stdout.splitlines()), 81)  # 80 + Log path.
+            self.assertIn('R2 InternalError token=[redacted]', tail.stdout)
+            self.assertNotIn('example-value', tail.stdout + tail.stderr)
+            self.assertEqual(call('fail', '--tail', '12345678').returncode, 1)
             self.assertEqual(call('fail', '12345678').returncode, 1)
             self.assertEqual(call('blame', 'abcdef01', 'lane').stdout.strip(), 'suspect unknown: failing files not named')
             log.write_text('== sha ' + 'abcdef01' * 5 + '\n== finished rc=0')

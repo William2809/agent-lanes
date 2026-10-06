@@ -100,7 +100,7 @@ def parse(text, path=''):
     return dict(failed=True, files=files, summary=summary[:15], path=path)
 
 
-def latest(logs, target):
+def latest(logs, target, tail=False):
     candidates = []
     for file in Path(logs).glob('*.log'):
         try:
@@ -117,7 +117,11 @@ def latest(logs, target):
             continue
         if target != 'latest' and not any(s.startswith(target) for s in re.findall(r'\bsha ([0-9a-f]{40})\b', text)):
             continue
-        return parse(text, str(file))
+        result = parse(text, str(file))
+        if tail and result['failed']:
+            # Last 80 lines only; bound each line before the redaction boundary.
+            result['summary'] = [line[:300] for line in text.splitlines()[-80:]]
+        return result
     return dict(failed=False)
 
 
@@ -125,11 +129,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--logs', required=True)
     parser.add_argument('--json', action='store_true')
+    parser.add_argument('--tail', action='store_true')
     parser.add_argument('target', nargs='?', default='latest')
     args = parser.parse_args()
     if args.target != 'latest' and not re.fullmatch(r'[0-9a-f]{7,40}', args.target):
         return 1
-    result = latest(args.logs, args.target)
+    result = latest(args.logs, args.target, args.tail)
     if args.json:
         emit(result, structured=True)
     elif result['failed']:

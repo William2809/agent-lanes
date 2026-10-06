@@ -20,14 +20,14 @@ fail() {
 }
 
 # 1. Stack: each worktree rebases onto the previous one's tip (the first onto the branch).
-onto=$base; last=""
+onto=$base; last=""; last_name=""
 for name in $names; do
   wt=$(wt-dev path "$name") || fail "no worktree $name"
   [ -z "$(git -C "$wt" status --porcelain -- . ':!.reviews')" ] || fail "$name dirty (commit first)"
   [ "$(git -C "$wt" rev-list --count "$base..HEAD")" -gt 0 ] || fail "$name has nothing to land"
   restore="$restore $wt=$(git -C "$wt" rev-parse HEAD)"
   git -C "$wt" rebase -q "$onto" >/dev/null 2>&1 || { git -C "$wt" rebase --abort 2>/dev/null; fail "$name conflicts onto $onto"; }
-  onto=$(git -C "$wt" rev-parse HEAD); last=$wt
+  onto=$(git -C "$wt" rev-parse HEAD); last=$wt; last_name=$name
   echo "stacked $name"
 done
 wt=$last
@@ -41,16 +41,11 @@ if [ -f "$wt/tools/check-file-size.mjs" ]; then
 fi
 
 # 3. Preflight: seconds-cheap guards that otherwise cost a full remote round.
-# Install when node_modules is missing (--no-install worktree) or the lockfile differs from the
+# Install when dependencies are missing (--no-install worktree) or a lockfile differs from the
 # one last installed here (the rebase picked up a new dependency: 2026-10-05, six lanes failed
-# typecheck after one lane added a package).
-if [ -f "$wt/pnpm-lock.yaml" ]; then
-  lock=$(git -C "$wt" hash-object pnpm-lock.yaml); stamp="$wt/node_modules/.land-lock"
-  if [ ! -d "$wt/node_modules" ] || [ "$(cat "$stamp" 2>/dev/null)" != "$lock" ]; then
-    (cd "$wt" && pnpm install --frozen-lockfile --prefer-offline >/dev/null 2>&1) || fail "pnpm install"
-    echo "$lock" >"$stamp"; echo "installed deps"
-  fi
-fi
+# typecheck after one lane added a package). wt-dev picks the commands from the lockfiles.
+out=$(wt-dev install "$last_name" --if-changed 2>&1) || { printf '%s\n' "$out" | tail -6; fail "install"; }
+[ -z "$out" ] || printf '%s\n' "$out"
 if [ -x "$main/tools/land-preflight.sh" ]; then
   out=$(cd "$wt" && sh "$main/tools/land-preflight.sh" "$base" 2>&1) || { printf '%s\n' "$out" | tail -8; fail "preflight"; }
   echo "preflight ok"
@@ -59,7 +54,7 @@ fi
 # 4. One full check on the stack tip.
 sha=$(git -C "$wt" rev-parse --short HEAD); tries=0
 check=remote-ci
-if [ -f "$wt/package.json" ] && node -e 'const p = require(process.argv[1]); process.exit(typeof p.scripts?.["check:remote"] === "string" ? 0 : 1)' "$wt/package.json"; then check=pnpm; fi
+if [ -f "$wt/package.json" ] && command -v node >/dev/null && node -e 'const p = require(process.argv[1]); process.exit(typeof p.scripts?.["check:remote"] === "string" ? 0 : 1)' "$wt/package.json"; then check=pnpm; fi
 while :; do
   # LAND_CHECK (environment variable): run this command in the worktree instead, e.g. without a runner machine.
   if [ -n "${LAND_CHECK:-}" ]; then out=$(cd "$wt" && sh -c "$LAND_CHECK" 2>&1)
