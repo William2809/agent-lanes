@@ -446,11 +446,24 @@ case "$cmd" in
     case "$(cat "$state/$name.db" 2>/dev/null)" in "sqlite rel:"*)
       dbrel=$(cut -d: -f2- "$state/$name.db"); hold="$state/$name.dbhold"
       case "$dbrel" in /*|*..*) die "bad database state for $name";; esac
-      if [ -f "$wt/$dbrel" ] && [ ! -L "$wt/$dbrel" ]; then mkdir -p "$hold" && mv "$wt/$dbrel"* "$hold/"; else hold=""; fi;;
+      # Only the database and SQLite's own side files: anything else untracked makes git refuse below.
+      if [ -f "$wt/$dbrel" ] && [ ! -L "$wt/$dbrel" ]; then
+        mkdir -p "$hold" || die "cannot hold $dbrel aside"
+        for f in "$wt/$dbrel" "$wt/$dbrel-wal" "$wt/$dbrel-shm" "$wt/$dbrel-journal"; do
+          if [ -f "$f" ] && [ ! -L "$f" ]; then mv "$f" "$hold/"; fi
+        done
+      else hold=""; fi;;
     esac
     if ! git -C "$repo" worktree remove "$wt"; then
-      [ -z "$hold" ] || mv "$hold"/* "$(dirname "$wt/$dbrel")/" && rmdir "$hold" 2>/dev/null
-      die "worktree has changes; commit or move them first (not forced)"
+      # Git can unregister the worktree, then fail its final rmdir because a process (a browser,
+      # a dev server) wrote files meanwhile. Nothing tracked is left, so trash the remnant.
+      real=$(cd "$wt" 2>/dev/null && pwd -P) || real=$wt
+      if git -C "$repo" worktree list --porcelain | grep -qxF -e "worktree $wt" -e "worktree $real"; then
+        [ -z "$hold" ] || mv "$hold"/* "$(dirname "$wt/$dbrel")/" && rmdir "$hold" 2>/dev/null
+        die "worktree has changes; commit or move them first (not forced)"
+      fi
+      ctrash "$wt" >/dev/null || die "worktree unregistered but $wt could not be trashed"
+      echo "trashed leftover files in $wt"
     fi
     if [ -n "$hold" ]; then rm -rf "$hold"; echo "dropped sqlite copy $(basename "$dbrel")"; rm -f "$state/$name.db"; fi
     drop_db || true

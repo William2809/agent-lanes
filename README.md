@@ -210,7 +210,7 @@ remote-ci info      # route=local
 - The runner's PostgreSQL uses its own port (5418 for version 18), so it does not collide with a dev database on 5432. It runs only during checks.
 - The run starts with a clean environment: the lane's `DATABASE_URL`, `NODE_ENV` and `PATH` do not reach it.
 - Checks share the CPU with your dev servers and workers. They run at `nice 10`; keep `REMOTE_CI_SLOTS=1` and cap test workers (e.g. `export VITEST_MAX_WORKERS=4` in `.remote-ci.conf`). With many lanes, `wt-dev sleep-idle` stops idle dev servers, and `diskguard install` adds a 60-second free-space check.
-- Lighter option: `LAND_CHECK="pnpm test"` runs the check in the lane's worktree with the environment of the shell that runs `mq`. It needs no setup, but the tests reach whatever database that environment (or the lane's `.env`, if your test command loads it) points at, and the queue gets no failure summary, so a red train lands one lane at a time.
+- Lighter option: `LAND_CHECK="pnpm test"` runs the check in the lane's worktree with the environment of the shell that runs `mq`. It needs no setup, but the tests reach whatever database that environment (or the lane's `.env`, if your test command loads it) points at, and the queue gets no failure summary, so a red train lands one lane at a time. The check must not edit tracked files or commit: `land` refuses to land a tree other than the one it checked.
 - Moving to a second machine later is one line: set `REMOTE_CI_HOST` to its SSH host and run `remote-ci setup` again.
 
 ## Example setup: a MacBook and a Mac mini

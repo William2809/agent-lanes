@@ -98,8 +98,9 @@ def main():
     text = diagnostic('blame' if command == 'suspect' else 'fail', sha,
                       lanes, tail=command == 'transient')
     if command == 'transient':
-        # land can carry errors from local/custom checks without a remote log.
-        print(transient(text + '\n' + sys.stdin.read(65536)))
+        # land can carry errors from local/custom checks without a remote log. Classify each
+        # source on its own, so a long local tail cannot push a remote marker out of the window.
+        print(transient(text) or transient(sys.stdin.read(65536)))
         return
     # Bound input before matching or redacting; long lines can make regex work costly.
     text = '\n'.join(line[:300] for line in text.splitlines()[:16])
