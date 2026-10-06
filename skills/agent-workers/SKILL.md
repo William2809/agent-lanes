@@ -43,7 +43,7 @@ A good brief: the goal in one line, the exact files or paths in scope, the accep
 
 `batches pause [NAME…]` pauses named workers, or all running workers when no names are given. `batches resume [NAME…]` continues named workers, or all paused workers, from their recorded directories. State lives in `~/.claude/state/paused-workers.tsv`. Resume keeps a timestamped backup and leaves failed launches queued.
 
-- `diskguard check` tries `wt-dev drop-caches` in each repo and re-measures on first crossing WARN or before PAUSE; only stopped, unused `.next` caches are removed, and only its own paused workers resume at RESUME.
+- `diskguard check` tries `wt-dev drop-caches` in each repo and re-measures on first crossing WARN or before PAUSE; only build caches of stopped, unused lanes are removed (`.next` by default, or the framework's caches and `WT_DEV_CACHE` paths), and only its own paused workers resume at RESUME.
 - `lanes` dims an earlier worker death once the queue owns the lane or it has landed; unowned deaths, failed fixers, parked/stalled work, stalled queues and disk alerts still need you.
 - `batches`: what needs you: running / DIED / STALLED workers and lanes with work to land. Exit 3 = attention.
 - `remote-ci fail [SHA|latest]` prints a bounded, redacted red-check summary; `remote-ci blame SHA LANE...` ranks actual failing-file/directory/package overlaps as suspect hints.

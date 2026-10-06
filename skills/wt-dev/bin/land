@@ -42,8 +42,8 @@ fi
 
 # 3. Preflight: seconds-cheap guards that otherwise cost a full remote round.
 # Install when dependencies are missing (--no-install worktree) or a lockfile differs from the
-# one last installed here (the rebase picked up a new dependency: 2026-10-05, six lanes failed
-# typecheck after one lane added a package). wt-dev picks the commands from the lockfiles.
+# one last installed here (the rebase picked up a new dependency: without this, lanes fail
+# typecheck after another lane added a package). wt-dev picks the commands from the lockfiles.
 out=$(wt-dev install "$last_name" --if-changed 2>&1) || { printf '%s\n' "$out" | tail -6; fail "install"; }
 [ -z "$out" ] || printf '%s\n' "$out"
 if [ -x "$main/tools/land-preflight.sh" ]; then

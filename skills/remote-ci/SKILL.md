@@ -21,7 +21,7 @@ Heavy checks run on a runner machine (currently an Apple Silicon Mac with Homebr
 | `remote-ci status` / `remote-ci setup` | Runner state / idempotent setup for this project |
 | `remote-ci init` | Add `.remote-ci.conf` and a pre-push hook to this repo |
 
-Exit codes: the check's own; `3` runner unreachable (the caller runs the check locally); `75` all slots busy after five minutes. A code tree that already passed is not checked again unless you pass `--force`. A dirty checkout is snapshotted automatically; pass a commit SHA or use a clean tree to check exactly a commit. Agents: run `remote-ci check --worktree --summary` in the background and keep working.
+Exit codes: the check's own; `3` runner unreachable (`land` and `mq` count it as a failed check; only the pre-push hook falls back to a local run); `75` all slots busy after five minutes. A code tree that already passed is not checked again unless you pass `--force`. A dirty checkout is snapshotted automatically; pass a commit SHA or use a clean tree to check exactly a commit. Agents: run `remote-ci check --worktree --summary` in the background and keep working.
 
 `fail` selects the newest matching runner log, including green/incomplete runs. `blame` compares each lane with the main checkout branch (its reflog fork-point when available) using `git diff --name-only BASE...LANE`; missing evidence and no overlap stay explicit. These inspections never synchronize scripts/config or submit checks.
 

@@ -16,3 +16,4 @@ done
 [ -f "$cfg/config" ] || { cp "$here/config/config.example" "$cfg/config"; chmod 600 "$cfg/config"; echo "created $cfg/config (edit it)"; }
 [ -f "$cfg/models.conf" ] || { cp "$here/config/models.conf.example" "$cfg/models.conf"; echo "created $cfg/models.conf"; }
 case ":$PATH:" in *":$bin:"*) ;; *) echo "add $bin to your PATH" ;; esac
+echo "agent-lanes $(cat "$here/VERSION" 2>/dev/null || echo unknown) installed (changes: CHANGELOG.md)"
