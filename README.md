@@ -2,7 +2,7 @@
 
 Small shell tools for running **many AI coding agents in parallel on one repository** without them tripping over each other. One human decides, one AI lead plans and reviews, and many workers build in their own *lanes*.
 
-Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the lead and the [Codex CLI](https://github.com/openai/codex) for workers, on macOS. Lanes work with any git repository; per-lane dev servers and database copies know common web stacks (see [Supported stacks](#supported-stacks)). Each tool is a few hundred lines of shell or JavaScript, so it's easy to read and adapt.
+Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the lead, on macOS. Workers run on the [Codex CLI](https://github.com/openai/codex) by default, or on the Cursor CLI, opencode, pi or oh-my-pi (see [Supported harnesses](#supported-harnesses)). Lanes work with any git repository; per-lane dev servers and database copies know common web stacks (see [Supported stacks](#supported-stacks)). Each tool is a few hundred lines of shell, Python or JavaScript, so it's easy to read and adapt.
 
 ## The problem
 
@@ -56,7 +56,7 @@ More detail and the reasoning: [docs/concepts.md](docs/concepts.md).
 
 - macOS with `git` and `python3`, plus your project's own toolchain (Node, Python, Ruby, ...).
 - Optional, for a dev server per lane: a framework `wt-dev` knows, or a dev command in `.wt-dev.conf` (see [Supported stacks](#supported-stacks)). Without one, lanes still get their own worktree, just no server.
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for the lead and the [Codex CLI](https://github.com/openai/codex), logged in, for workers.
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for the lead, and a logged-in worker CLI: the [Codex CLI](https://github.com/openai/codex) by default, or one of the [supported harnesses](#supported-harnesses).
 - Optional, for a database copy per lane: a `DATABASE_URL` on `localhost` in the repo's root `.env` and that database's client tools (PostgreSQL: `psql`, `createdb`, `pg_dump`, `pg_restore`; MySQL/MariaDB: `mysql`, `mysqldump`; SQLite: nothing). Without a `DATABASE_URL`, lanes have no database; a remote one stays shared.
 - For screenshots (`ui-shots`, `wt-compare`): Playwright installed in the project.
 - For the check runner: Homebrew on Apple Silicon (it installs PostgreSQL for test databases when you ask for one). The runner is this machine ([Standalone setup](#standalone-setup-one-machine)) or a second Mac you can SSH into ([Example setup](#example-setup-a-macbook-and-a-mac-mini)).
@@ -94,7 +94,7 @@ wk invoice-fix -w -o "apps/web/invoice" -m build-hard -t invoice:new -f brief.md
 - `-w` creates the worktree `invoice-fix` with its own dev server and database copy (`wt-dev ls` shows the port).
 - `-o` claims the paths the worker will edit. A later lane that overlaps them is refused; give that task to the lane's worker after it finishes (`wk NAME -r -` with the new task on stdin), or wait until the lane lands.
 - `-t invoice:new` tags the launch with a feature and a reason (`new`, `rework`, `bounce`, `review`, `review-fix`, `other`) so rework per feature can be counted.
-- `-m` picks a preset (`ao-model ls`). Reviewers use a read-only preset and can join any lane: `wk invoice-review -d invoice-fix -m review -f review.md`.
+- `-m` picks a preset (`ao-model ls`). Reviewers use a read-only preset and can join any lane: `wk invoice-review -d invoice-fix -m review -t invoice:review -f review.md`.
 
 Then follow it:
 
@@ -130,7 +130,7 @@ codex-limit              # Codex plan usage and reset time
 codex-watch 95 &         # pause running workers automatically at 95% usage
 ```
 
-`wk` refuses new launches when usage reaches `WK_MAX_PCT` (default 100). Expired usage windows count as 0%; unknown usage allows a launch. A worker cut off by a provider error continues with `wk NAME -r`.
+`wk` refuses new Codex launches when usage reaches `WK_MAX_PCT` (default 100); other harnesses are not checked. Expired usage windows count as 0%; unknown usage allows a launch. A worker cut off by a provider error continues with `wk NAME -r`.
 
 ### 7. Change models
 
@@ -146,6 +146,20 @@ Presets are the only place model names live. `ao-model ls` shows them; override 
 | `mq` says `PARKED` | Read `mq ls` and the lane's last report; fix it in the worktree, `wtcommit`, then `mq add NAME` again. |
 | `remote-ci` exits 3 | The runner is unreachable. `remote-ci info` still shows configured direct/alias and SSH routes; check the cable, network or VPN and `~/.config/agent-lanes/config`. `land` and `mq` treat this as a failed check; only the pre-push hook falls back to a local run. |
 | `wt-dev new` stops with a database error | The copy of the local database failed (missing client tools, a failed create or dump/restore, different table counts, or a database without a built-in adapter: set `WT_DEV_DB_CLONE`/`WT_DEV_DB_DROP`), so the new worktree was removed. Fix the cause, or rerun with `--shared-db` to use the main database on purpose. No `DATABASE_URL` means no database; a remote one stays shared with a warning. |
+
+## Supported harnesses
+
+A worker harness is the agent CLI that runs a worker. Pick it per preset with an optional 6th column in `models.conf` (`codex` when absent). Non-Codex harnesses run through `harness_run.py`, which writes the same log shape as Codex (header, `tokens used`, final report; a last `ERROR:` line on failure, or `stopped by signal N` after `batches pause`). So `batches`, `wk -r`, `batches pause` and `mq` work the same for every harness.
+
+| Harness | CLI | read-only | workspace-write | full-access | Resume | Status |
+|---|---|---|---|---|---|---|
+| `codex` (default) | Codex CLI | native sandbox | native sandbox | `danger-full-access` | `codex exec resume` | tested daily |
+| `pi` | [pi](https://github.com/earendil-works/pi) | tools `read,grep,find,ls` only (no shell) | refused (no sandbox) | all tools | `--session-id` | tested live |
+| `opencode` | [opencode](https://opencode.ai) | injected agent: read tools, shell only for `git diff/log/show/status` | refused (no sandbox) | `--auto` | `--session` | tested live |
+| `cursor` | Cursor CLI (`cursor-agent`) | `--mode ask` | `--sandbox enabled` | `--sandbox disabled` | `create-chat` + `--resume` | stub-tested only |
+| `omp` | [oh-my-pi](https://github.com/can1357/oh-my-pi) | refused (not yet tested) | refused (no sandbox) | `--approval-mode=yolo` | `--resume` | stub-tested only |
+
+"Refused" means a preset that asks for that sandbox fails at launch with a clear message; it never runs with more access than asked. The pi and opencode read-only modes were probed by hand against the live CLIs (pi 0.85, opencode 1.18) with prompts that try to write a file every way they can (file tools, shell chains, redirects, `git diff --output`, `git difftool`, opencode `task` subagents); none wrote. The repo tests check the flags and config, not the enforcement. A pi reviewer has no shell, so give it file paths to read rather than asking for `git diff`. Stub-tested harnesses pass the fake-CLI tests in `tests/test_harness.py` but have not run a live worker yet. The `codex-limit` usage guard applies to Codex presets only.
 
 ## Supported stacks
 
@@ -244,7 +258,7 @@ Then once per project: `remote-ci init` (adds `.remote-ci.conf` and a pre-push h
 
 | Tool | Purpose |
 |---|---|
-| `wk` | Launch a Codex worker in one line: preset, worktree, path claim, the repo's standing header |
+| `wk` | Launch a worker in one line: preset (model and harness), worktree, path claim, the repo's standing header |
 | `mq` | Merge queue over `land` |
 | `batches` | Worker status: running, died, stalled; lanes with work to land; `batches pause` / `batches resume` |
 | `diskguard` | Warn on low disk space; pause workers below 5 GB and resume its own workers at 7 GB; optional 60-second LaunchAgent |
@@ -262,7 +276,7 @@ Project-specific pieces stay in each project: the worker header (`~/.claude/stat
 
 ## Status
 
-Extracted from daily use. Expect sharp edges: macOS-first (the remote-ci runner is an Apple Silicon Mac: your own or a second one, such as a Mac mini). Tests cover `session-stats`, `loop-stats`, `lanes`, `diskguard`, the runner's failure diagnostics and the screenshot login cache (`test_browser_tools.mjs` needs a project with Playwright); `mq` and `wk` are tested only by daily use. `codex-limit` ships as a usage guard: `wk` refuses new launches at `WK_MAX_PCT` (default 100). Issues and small pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Extracted from daily use. Expect sharp edges: macOS-first (the remote-ci runner is an Apple Silicon Mac: your own or a second one, such as a Mac mini). Tests cover `session-stats`, `loop-stats`, `lanes`, `diskguard`, the runner's failure diagnostics and the screenshot login cache (`test_browser_tools.mjs` needs a project with Playwright); `wk` harness adapters have fake-CLI tests (`tests/test_harness.py`); the rest of `mq` and `wk` is tested by daily use. `codex-limit` ships as a usage guard: `wk` refuses new Codex launches at `WK_MAX_PCT` (default 100). Issues and small pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

@@ -1,5 +1,6 @@
 #!/bin/sh
-# ABOUTME: Launches one external worker through the Codex CLI; models, efforts and sandbox limits come from presets (ao-model).
+# ABOUTME: Launches one external worker through the Codex CLI or another harness (WK_HARNESS: cursor, opencode, pi, omp;
+# ABOUTME: harness_run.py writes their logs in the Codex shape); models, efforts and sandbox limits come from presets (ao-model).
 # ABOUTME: Runs detached; writes the transcript to <log> and the process id to <log>.pid.
 # Usage: run-worker.sh [--lead] <model> <effort> <sandbox> <repo-dir> <prompt-file> <log-file>
 #   model/effort: any model in the presets (`ao-model ls`); effort minimal|low|medium|high|xhigh
@@ -18,11 +19,25 @@ lead=0; [ "${1:-}" = "--lead" ] && { lead=1; shift; }
 [ $# -eq 6 ] || { sed -n 4,9p "$0"; exit 2; }
 model=$1 effort=$2 sandbox=$3 dir=$4 prompt=$5 log=$6
 case "$sandbox" in read-only|workspace-write|full-access) ;; *) echo "bad sandbox: $sandbox" >&2; exit 2 ;; esac
-preset_route=$(ao-model check "$model" "$effort" "$sandbox") || exit 2
+harness=${WK_HARNESS:-codex}
+preset_route=$("$tool_root/bin/ao-model" check "$model" "$effort" "$sandbox" "$harness") || exit 2
+# wk passes the chosen preset's own route; re-deriving it from model/effort/sandbox can pick another preset's.
+[ -z "${WK_ROUTE:-}" ] || preset_route=$WK_ROUTE
+if [ "$harness" != codex ]; then
+  [ $lead -eq 0 ] || { echo "--lead is Codex-only" >&2; exit 2; }
+  python3 "$tool_root/skills/agent-workers/scripts/harness_run.py" check "$harness" "$sandbox" || exit 2
+  [ -d "$dir" ] || { echo "repo dir not found: $dir" >&2; exit 1; }
+  [ -s "$prompt" ] || { echo "prompt file empty or missing: $prompt" >&2; exit 1; }
+  mkdir -p "$(dirname "$log")"
+  WK_ROUTE=$preset_route nohup python3 "$tool_root/skills/agent-workers/scripts/harness_run.py" run "$harness" "$model" "$effort" "$sandbox" "$dir" "$prompt" </dev/null >"$log" 2>&1 &
+  echo $! >"$log.pid"
+  ops_register "$!" "$log" "$dir" "$sandbox" "${WK_PRESET:-}"
+  echo "$log"; exit 0
+fi
 if [ $lead -eq 1 ]; then
   [ -n "${AGENT_LANES_LEAD_PROFILE:-}" ] || { echo "--lead needs AGENT_LANES_LEAD_PROFILE in $cfg" >&2; exit 2; }
   [ "$sandbox" != full-access ] || { echo "full-access is not allowed with --lead (children would inherit it)" >&2; exit 2; }
-  ao-model check "$model" "$effort" workspace-write >/dev/null 2>&1 || { echo "--lead is not for read-only models" >&2; exit 2; }
+  "$tool_root/bin/ao-model" check "$model" "$effort" workspace-write codex >/dev/null 2>&1 || { echo "--lead is not for read-only models" >&2; exit 2; }
   route="--profile $AGENT_LANES_LEAD_PROFILE"
 elif [ "$preset_route" = codex ]; then route=""
 else route="--profile $preset_route"; fi

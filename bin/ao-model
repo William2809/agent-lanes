@@ -1,24 +1,26 @@
 #!/bin/sh
-# ABOUTME: Model presets lookup: maps a preset name (build, review, ...) to model/effort/sandbox/route,
+# ABOUTME: Model presets lookup: maps a preset name (build, review, ...) to model/effort/sandbox/route/harness,
 # ABOUTME: and checks a model:effort:sandbox request against the presets. Presets: presets/models.conf + user override.
-# Usage: ao-model get NAME          -> "model effort sandbox route"
+# Usage: ao-model get NAME          -> "model effort sandbox route harness"
 #        ao-model ls                -> all presets (override applied)
-#        ao-model check MODEL EFFORT SANDBOX  -> prints the route; exit 2 with a reason if not allowed
+#        ao-model check MODEL EFFORT SANDBOX [HARNESS]  -> prints the route; exit 2 with a reason if not allowed
+#   harness: optional 6th column (codex when absent); check with HARNESS looks only at that harness's presets
 set -eu
 here=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 user=${AGENT_LANES_MODELS:-$HOME/.config/agent-lanes/models.conf}
 # Later lines win per name: defaults first, then the user's file.
-all() { cat "$here/presets/models.conf" "$user" 2>/dev/null | sed 's/#.*//' | awk 'NF>=5 {r[$1]=$2" "$3" "$4" "$5; if (!($1 in o)) {o[$1]=++n; k[n]=$1}} END {for (i=1;i<=n;i++) print k[i], r[k[i]]}'; }
+all() { cat "$here/presets/models.conf" "$user" 2>/dev/null | sed 's/#.*//' | awk 'NF>=5 {r[$1]=$2" "$3" "$4" "$5" "(NF>=6 ? $6 : "codex"); if (!($1 in o)) {o[$1]=++n; k[n]=$1}} END {for (i=1;i<=n;i++) print k[i], r[k[i]]}'; }
 rank() { case "$1" in read-only) echo 1 ;; workspace-write) echo 2 ;; full-access) echo 3 ;; *) echo 9 ;; esac; }
 case "${1:-ls}" in
-  get) r=$(all | awk -v n="${2:?name}" '$1==n {print $2, $3, $4, $5}'); [ -n "$r" ] || { echo "ao-model: no preset '$2' (ao-model ls)" >&2; exit 2; }; echo "$r" ;;
-  ls) all | awk '{printf "%-14s %-16s %-7s %-16s %s\n", $1, $2, $3, $4, $5}' ;;
+  get) r=$(all | awk -v n="${2:?name}" '$1==n {print $2, $3, $4, $5, $6}'); [ -n "$r" ] || { echo "ao-model: no preset '$2' (ao-model ls)" >&2; exit 2; }; echo "$r" ;;
+  ls) all | awk '{printf "%-14s %-16s %-7s %-16s %-14s %s\n", $1, $2, $3, $4, $5, $6}' ;;
   check) m=${2:?model} e=${3:?effort} s=${4:?sandbox}
     case "$e" in minimal|low|medium|high|xhigh) ;; *) echo "ao-model: bad effort $e" >&2; exit 2 ;; esac
-    rows=$(all | awk -v m="$m" '$2==m'); [ -n "$rows" ] || { echo "ao-model: model $m is in no preset (add it to $user)" >&2; exit 2; }
+    h=${5:-}
+    rows=$(all | awk -v m="$m" -v h="$h" '$2==m && (h=="" || $6==h)'); [ -n "$rows" ] || { echo "ao-model: model $m is in no ${h:+$h }preset (add it to $user)" >&2; exit 2; }
     max=$(printf '%s\n' "$rows" | while read -r _ _ _ sb _; do rank "$sb"; done | sort -n | tail -1)
     [ "$(rank "$s")" -le "$max" ] || { echo "ao-model: $m presets allow at most $(printf '%s\n' "$rows" | awk '{print $4}' | sort -u | tr '\n' ' ')- not $s" >&2; exit 2; }
     # Route: prefer a preset with exactly this effort and sandbox, then this sandbox, then any.
     { printf '%s\n' "$rows" | awk -v e="$e" -v s="$s" '$3==e && $4==s'; printf '%s\n' "$rows" | awk -v s="$s" '$4==s'; printf '%s\n' "$rows"; } | head -1 | awk '{print $5}' ;;
-  *) sed -n 4,6p "$0"; exit 2 ;;
+  *) sed -n 4,7p "$0"; exit 2 ;;
 esac

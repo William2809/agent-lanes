@@ -100,9 +100,9 @@ all=0; [ "${1:-}" = "--all" ] && all=1
 now=$(date +%s); stall=${BATCHES_STALL_MIN:-12}
 flag=$(mktemp); done_n=$(mktemp); trap 'ctrash "$flag" "$done_n" >/dev/null' EXIT
 age() { m=$(( (now - $1) / 60 )); [ $m -lt 60 ] && echo "${m}m" || echo "$((m / 60))h$((m % 60))m"; }
-# A pid counts only while it is still a codex process (pids get reused).
+# A pid counts only while it is still a worker process, Codex or harness_run.py (pids get reused).
 # ps can be blind inside a sandboxed shell, so also trust kill -0 and a log written in the last 3 minutes.
-alive() { ps -p "$1" -o command= 2>/dev/null | grep -q codex || kill -0 "$1" 2>/dev/null \
+alive() { ps -p "$1" -o command= 2>/dev/null | grep -qE 'codex|harness_run' || kill -0 "$1" 2>/dev/null \
   || { [ -n "${2:-}" ] && ! grep -q '^tokens used' "$2" && [ $((now - $(stat -f %m "$2" 2>/dev/null || echo 0))) -lt 180 ]; }; }
 is_acked() { grep -qx "$1" "$acked"; }
 # Why a worker stopped: last error-looking line of its log (secret-looking lines skipped), ~80 chars.
