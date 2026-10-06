@@ -7,7 +7,7 @@
 #   -m        a model preset from `ao-model ls` (default: build). Presets with a read-only sandbox are reviewers.
 #   header    ~/.claude/state/headers/<repo>.md, placeholders {{DIR}} {{URL}} {{BASE}} {{NAME}} {{LOGDIR}}; Astra gets a read-only line instead
 #   -t FEATURE:REASON  required for new launches (WK_ALLOW_UNTAGGED=1 overrides); REASON = new | rework (after owner feedback) | bounce | review | review-fix | other
-#   -r [MSG|-] resume NAME's codex session (MSG '-' = read it from stdin, use a quoted heredoc) (same model/sandbox/dir) after a capacity error or a cut-off run
+#   -r [MSG|-] resume NAME's session (Codex or another harness) (MSG '-' = read it from stdin, use a quoted heredoc) (same model/sandbox/dir) after a capacity error or a cut-off run
 # Then: batches wait NAME… (background) · batches report NAME…
 set -eu
 # Scripts ship next to this file: <repo>/bin/wk -> <repo>/skills (no fixed install location).
@@ -29,7 +29,7 @@ if [ "${1:-}" = "-r" ]; then
   main=$(cd "$top" && cd "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/.." 2>/dev/null && pwd || echo "$top")
   logs="$HOME/.claude/state/logs/$(basename "$main")"; log="$logs/$name.log"
   [ -f "$log" ] || { echo "no log $log" >&2; exit 1; }
-  if [ -f "$log.pid" ] && { ps -p "$(cat "$log.pid")" -o command= 2>/dev/null | grep -q codex || kill -0 "$(cat "$log.pid")" 2>/dev/null; }; then
+  if [ -f "$log.pid" ] && { ops_agent_pid "$(cat "$log.pid")" || kill -0 "$(cat "$log.pid")" 2>/dev/null; }; then
     if batches --all 2>/dev/null | awk -v n="$name" '$1==n && $2=="STALLED" {f=1} END {exit !f}'; then
       echo "$name is still running (STALLED; stop it with batches pause --stalled $name before resuming)" >&2
     else echo "$name is still running" >&2; fi
@@ -50,31 +50,30 @@ if [ "${1:-}" = "-r" ]; then
   # Resumes also reserve capacity before publishing a new writer.
   launch_lock="$HOME/.claude/state/mq/$(basename "$main")/launch.lock"
   mkdir -p "$(dirname "$launch_lock")"; ops_lock "$launch_lock" || exit 1
-  if [ -f "$log.pid" ] && ps -p "$(cat "$log.pid")" -o command= 2>/dev/null | grep -q codex; then echo "$name is still running" >&2; exit 1; fi
+  if [ -f "$log.pid" ] && ops_agent_pid "$(cat "$log.pid")"; then echo "$name is still running" >&2; exit 1; fi
   # The name/log may have been reused while waiting. mq resumes only its own writable lane.
-  sid=$(hv "session id"); model=$(hv model); eff=$(hv "reasoning effort"); sb=$(hv sandbox | cut -d" " -f1); dir=$(hv workdir); prov=$(hv provider)
+  sid=$(hv "session id"); model=$(hv model); eff=$(hv "reasoning effort"); sb=$(hv sandbox | cut -d" " -f1); dir=$(hv workdir); prov=$(hv provider); h=$(hv harness)
   [ -n "$sid" ] && [ -d "$dir" ] || { echo "cannot read session id/workdir from $log" >&2; exit 1; }
   if [ -n "${WK_RESUME_DIR:-}" ]; then
     [ "$dir" = "$WK_RESUME_DIR" ] && [ "$sb" != read-only ] || { echo "wk: $name session does not match writable lane $WK_RESUME_DIR" >&2; exit 1; }
   fi
   [ "$dir" = "$main" ] || ops_writer_guard "$main" "$dir" "$sb" || exit $?
   old="$logs/$name.$(date +%m%d-%H%M).log"; mv "$log" "$old"
-  cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}; [ -f "$cfg" ] && . "$cfg"; codex=${CODEX_BIN:-$(command -v codex)}
-  [ "$eff" = xhigh ] && [ -z "${WK_ALLOW_XHIGH:-}" ] && eff=high  # effort cap: max high (user, 2026-10-05)
+  cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}; [ -f "$cfg" ] && . "$cfg"; codex=${CODEX_BIN:-$(command -v codex || true)}
+  [ "$eff" = xhigh ] && [ -z "${WK_ALLOW_XHIGH:-}" ] && eff=high  # effort cap: xhigh runs as high unless WK_ALLOW_XHIGH is set
   [ -z "${WK_LAUNCH_INTENT:-}" ] || [ -d "$WK_LAUNCH_INTENT" ] || { echo "wk: repair launch cancelled" >&2; exit 1; }
+  if [ -n "$h" ] && [ "$h" != codex ]; then
+    [ "$src" = "$log" ] && src=$old
+    (cd "$dir" || exit 1; nohup python3 "$skills/agent-workers/scripts/harness_run.py" resume "$src" "$msg" "$eff" </dev/null >"$log" 2>&1 &
+     echo $! >"$log.pid"; ops_register "$!" "$log" "$dir" "$sb" resume)
+    echo "resumed $name ($h $model $eff, $sid); previous log $old"; exit 0
+  fi
   (cd "$dir" || exit 1; nohup "$codex" exec resume --model "$model" -c "model_reasoning_effort=\"$eff\"" -c "sandbox_mode=\"$sb\"" ${prov:+-c "model_provider=\"$prov\""} \
     --skip-git-repo-check "$sid" "$msg" </dev/null >"$log" 2>&1 &
    echo $! >"$log.pid"; ops_register "$!" "$log" "$dir" "$sb" resume)
   echo "resumed $name ($model $eff, $sid); previous log $old"; exit 0
 fi
-# Plan guard: no new launches near the Codex limit (overflow would spend credits). WK_FORCE=1 overrides.
-if command -v codex-limit >/dev/null && [ "${WK_FORCE:-0}" != 1 ]; then
-  pct=$(codex-limit --pct 2>/dev/null) || pct=""
-  case "$pct" in ''|*[!0-9]*) ;; *)
-    [ "$pct" -lt "${WK_MAX_PCT:-100}" ] || { echo "wk: Codex plan at ${pct}% used; not launching (WK_FORCE=1 to override)" >&2; exit 1; } ;;
-  esac
-fi
-# Disk guard: a full disk (2026-10-03 and 2026-10-04) wedged Docker/Postgres and killed every worker.
+# Disk guard: a full disk has wedged Docker/Postgres and killed every running worker.
 # No new launches below WK_MIN_FREE_GB (default 15) free. WK_DISK_OK=1 overrides (WK_FORCE does not).
 free_gb=$(df -g "$HOME" 2>/dev/null | awk 'NR==2{print $4}')
 case "$free_gb" in ''|*[!0-9]*) ;; *)
@@ -89,14 +88,21 @@ if [ -z "$tag" ] && [ "${WK_ALLOW_UNTAGGED:-0}" != 1 ]; then
 fi
 if [ -n "$tag" ]; then case "$tag" in :*) echo "wk: -t needs a nonempty FEATURE" >&2; exit 2 ;; *:new|*:rework|*:bounce|*:review|*:review-fix|*:other) ;;
   *) echo "wk: -t wants FEATURE:REASON, REASON one of new rework bounce review review-fix other" >&2; exit 2 ;; esac; fi
-preset=$(ao-model get "$m") || exit 2
-set -- $preset; model=$1 eff=$2 sb=$3
+preset=$("$skills/../bin/ao-model" get "$m") || exit 2  # the sibling copy: a worktree checkout tests its own presets code
+set -- $preset; model=$1 eff=$2 sb=$3 route=$4 harness=${5:-codex}
+# Plan guard: no new Codex launches near the Codex limit (overflow would spend credits). WK_FORCE=1 overrides.
+if [ "$harness" = codex ] && command -v codex-limit >/dev/null && [ "${WK_FORCE:-0}" != 1 ]; then
+  pct=$(codex-limit --pct 2>/dev/null) || pct=""
+  case "$pct" in ''|*[!0-9]*) ;; *)
+    [ "$pct" -lt "${WK_MAX_PCT:-100}" ] || { echo "wk: Codex plan at ${pct}% used; not launching (WK_FORCE=1 to override)" >&2; exit 1; } ;;
+  esac
+fi
 top=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 # Inside a linked worktree, name logs/headers after the main checkout, not the worktree.
 main=$(cd "$top" && cd "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/.." 2>/dev/null && pwd || echo "$top"); repo=$(basename "$main")
 base=$(git -C "$top" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
 logs="$HOME/.claude/state/logs/$repo"; mkdir -p "$logs"; log="$logs/$name.log"
-if [ -f "$log.pid" ] && ps -p "$(cat "$log.pid")" -o command= 2>/dev/null | grep -q codex; then echo "$name is already running" >&2; exit 1; fi
+if [ -f "$log.pid" ] && ops_agent_pid "$(cat "$log.pid")"; then echo "$name is already running" >&2; exit 1; fi
 dir=$top; url=""
 if [ -n "$own" ] && [ "$wt" -eq 0 ] && [ -z "$into" ] && [ "$top" = "$main" ]; then
   echo "wk: -o ignored in the main checkout (claims are for -w/-d worktrees)"
@@ -136,7 +142,7 @@ if [ -n "$own" ]; then
   hit=$(cd "$main" && MQ_FORCE=${WK_FORCE:-0} mq claim "$(basename "$dir")" $own) || { [ -z "$hit" ] || printf '%s\n' "$hit" >&2; echo "wk: not launching $name: paths owned elsewhere. Join that batch (-d WT) or wait for it to land (WK_FORCE=1 overrides)" >&2; exit 1; }
 fi
 # Recheck after acquiring the launch lock so concurrent callers cannot reuse a worker name.
-if [ -f "$log.pid" ] && ps -p "$(cat "$log.pid")" -o command= 2>/dev/null | grep -q codex; then echo "$name is already running" >&2; exit 1; fi
+if [ -f "$log.pid" ] && ops_agent_pid "$(cat "$log.pid")"; then echo "$name is already running" >&2; exit 1; fi
 [ -f "$log" ] && mv "$log" "$logs/$name.$(date +%m%d-%H%M).log"
 p="$logs/$name.prompt"
 # Workers commit only inside their own wt-dev worktree; in the main checkout they leave edits for the lead.
@@ -150,13 +156,14 @@ case "$hdr" in *"Report style"*) ;; *) hdr="$hdr
 Report style: about 80% ASD-STE100 (short sentences, one fact each, active voice, plain words). Final report fields: Changed: · Verified live: (command → result) · Verified by stub or reasoning only: · Not done / risks:. A claim without a live check never goes under Verified live." ;; esac
 printf '%s\n%s\n' "$hdr" "$body" >"$p"
 [ -z "${WK_LAUNCH_INTENT:-}" ] || [ -d "$WK_LAUNCH_INTENT" ] || { echo "wk: repair launch cancelled" >&2; exit 1; }
-WK_PRESET=$m sh "$skills/agent-workers/scripts/run-worker.sh" "$model" "$eff" "$sb" "$dir" "$p" "$log" >/dev/null || { echo "wk: launch of $name FAILED (run-worker refused; see above)" >&2; exit 1; }
+WK_PRESET=$m WK_ROUTE=$route WK_HARNESS=$harness sh "$skills/agent-workers/scripts/run-worker.sh" "$model" "$eff" "$sb" "$dir" "$p" "$log" >/dev/null || { echo "wk: launch of $name FAILED (run-worker refused; see above)" >&2; exit 1; }
 where=""; [ "$dir" = "$main" ] && [ "$sb" != "read-only" ] && where=" — MAIN CHECKOUT (edits land on the branch; use -w for a worktree)"
 # Tags append the tool revision; the first five fields retain their meaning (workers.tsv stays four).
 if [ -n "$tag" ]; then printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$repo" "$name" "${tag%%:*}" "${tag#*:}" "$tool_rev" >>"$HOME/.claude/state/worker-tags.tsv"
 else echo "wk: no -t FEATURE:REASON tag (loop-stats can't count rework for $name)" >&2; fi
 [ -z "$pending_slot" ] || ctrash "$pending_slot" >/dev/null; pending_slot=""
 ops_unlock "$launch_lock"; launch_lock=""
-echo "started $name: $model $eff${url:+ @$name$url}$where"
+hl=""; [ "$harness" = codex ] || hl="$harness "
+echo "started $name: $hl$model $eff${url:+ @$name$url}$where"
 # Unlanded worktrees touching the same files conflict at land: say so now, not later.
 (cd "$main" 2>/dev/null && sh "$skills/agent-workers/scripts/batches.sh" overlap) || true

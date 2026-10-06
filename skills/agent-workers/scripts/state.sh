@@ -1,6 +1,8 @@
 #!/bin/sh
 # ABOUTME: Shared portable state locks and worker roles; workers.tsv stays four columns.
 # Lock callers run in a subshell or install a trap, and hold launch locks through registration.
+# A worker PID counts only while it is still a worker process (pids get reused): Codex or harness_run.py.
+ops_agent_pid() { ps -p "$1" -o command= 2>/dev/null | grep -qE 'codex|harness_run'; }
 ops_pid_live() { case "$1" in ''|*[!0-9]*|0) return 1 ;; esac; kill -0 "$1" 2>/dev/null; }
 ops_stat() {
   case "$(uname -s)" in Darwin) stat -f "$1" "$3" 2>/dev/null ;; *) stat -c "$2" "$3" 2>/dev/null ;; esac
@@ -56,7 +58,7 @@ ops_writers() (
     sort -rn | awk -F'\t' '!seen[$2]++' |
     while IFS="$(printf '\t')" read -r at pid lg dir; do
       [ -z "${2:-}" ] || [ "$dir" = "$2" ] || continue
-      ps -p "$pid" -o command= 2>/dev/null | grep -q codex || continue
+      ops_agent_pid "$pid" || continue
       ops_writable "$lg" || continue
       _ops_common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
       [ "$_ops_common" = "$1/.git" ] && basename "$lg" .log

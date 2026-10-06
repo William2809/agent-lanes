@@ -1,6 +1,6 @@
 ---
 name: agent-workers
-description: Delegate bounded tasks to Codex worker agents in lanes, track them, and verify their output before landing. Use when the user asks for workers, subagents, parallel agents or a second opinion, or when the project's AGENTS.md says to use them.
+description: Delegate bounded tasks to worker agents (Codex, Cursor CLI, opencode, pi or omp) in lanes, track them, and verify their output before landing. Use when the user asks for workers, subagents, parallel agents or a second opinion, or when the project's AGENTS.md says to use them.
 ---
 
 # Agent workers
@@ -19,6 +19,8 @@ Models live in presets (`ao-model ls`; see the model-presets skill). Default rol
 | `build-max` | Persistent hard failures, after `build-hard` stalled |
 | `review` | Independent read-only review of HIGH-risk work and shared UI |
 | `review-light` | Quick read-only second look |
+
+A preset's optional 6th column picks the harness (`codex` by default; `cursor`, `opencode`, `pi`, `omp`); see the model-presets skill. Every harness gets the same `wk`, `batches`, `wk -r` and `mq` behavior.
 
 Start at the lowest preset that fits. Prefer a reviewer from a different model family than the builder when you can, and give every review a specific question.
 

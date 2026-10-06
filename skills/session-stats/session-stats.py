@@ -416,7 +416,7 @@ def workers(project_path, since, now):
                         os.kill(pid, 0)
                         proc = subprocess.run(['ps', '-p', str(pid), '-o', 'command='],
                                               capture_output=True, text=True, timeout=5)
-                        result['running' if proc.returncode == 0 and 'codex' in proc.stdout else 'died'] += 1
+                        result['running' if proc.returncode == 0 and ('codex' in proc.stdout or 'harness_run' in proc.stdout) else 'died'] += 1
                     except ProcessLookupError:
                         result['died'] += 1
                     except PermissionError:
@@ -523,7 +523,7 @@ def main():
                          'context': 'sum cache_read per unique assistant message; average divides by assistant turns',
                          'tool_results': 'text characters (image payloads excluded); fixed tool/command labels',
                          'background': 'task IDs and referenced output files; file-only outcomes have no inferred completion time',
-                         'workers': 'project and accessible Git worktrees; registry starts in window; tokens used marker=done, otherwise alive PID with codex command=running, else died; no session attribution'}}
+                         'workers': 'project and accessible Git worktrees; registry starts in window; tokens used marker=done, otherwise alive PID with codex/harness_run command=running, else died; no session attribution'}}
     if args.json:
         print(json.dumps(report, indent=2))
     else:
