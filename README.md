@@ -15,14 +15,14 @@ Getting agents to write code is the easy part. With many parallel workers, the s
 
 ## How it works
 
-<a href="docs/standalone-light.png?raw=true">
+<a href="docs/standalone-light.png">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/standalone-dark.svg">
   <img alt="agent-lanes on one machine: you and the AI lead start lanes (worktree, worker, own dev server and database copy); lanes join the merge queue, which runs full checks on a runner on the same machine and fast-forwards passing lanes to the feature branch; a conflict or red check sends a fixer worker into the lane, then it rejoins the queue" src="docs/standalone-light.svg">
 </picture>
 </a>
 
-<sub>Click the diagram to open it full size (also in <a href="docs/standalone-dark.png?raw=true">dark</a>).</sub>
+<sub>Click the diagram to open it full size (zoom in, or press Raw for the original; also in <a href="docs/standalone-dark.png">dark</a>).</sub>
 
 1. **You talk to the lead.** The AI lead (Claude Code) splits the work into briefs and starts one lane per task with `wk`.
 2. **Each lane is isolated.** It gets its own git worktree (a separate checkout where its worker commits), its own dev server and its own copy of the local database. It claims the paths it will edit; a new lane whose claim overlaps a live one is refused, and the queue flags changes outside a lane's claim.
@@ -203,14 +203,14 @@ remote-ci info      # route=local
 
 One developer works on a MacBook. A Mac mini on the same desk is the **runner**: it does nothing but full checks, so the laptop stays fast while many workers and dev servers run.
 
-<a href="docs/pipeline-light.png?raw=true">
+<a href="docs/pipeline-light.png">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/pipeline-dark.svg">
   <img alt="agent-lanes pipeline: you and the AI lead on the MacBook start lanes (worktree, worker, own dev server and database copy); lanes join the merge queue, which runs full checks on the Mac mini over SSH and fast-forwards passing lanes to the feature branch; a conflict or red check sends a fixer worker into the lane, then it rejoins the queue" src="docs/pipeline-light.svg">
 </picture>
 </a>
 
-<sub>Click the diagram to open it full size (also in <a href="docs/pipeline-dark.png?raw=true">dark</a>). Source: <code>docs/pipeline.excalidraw</code> (edit at excalidraw.com); re-render with <code>node docs/render-diagram.mjs</code>.</sub>
+<sub>Click the diagram to open it full size (zoom in, or press Raw for the original; also in <a href="docs/pipeline-dark.png">dark</a>). Source: <code>docs/pipeline.excalidraw</code> (edit at excalidraw.com); re-render with <code>node docs/render-diagram.mjs</code>.</sub>
 
 **Connecting the two machines.** `remote-ci` first tries the direct route, then the SSH host, then gives up with exit code 3.
 
