@@ -197,6 +197,51 @@ class WtDev(unittest.TestCase):
         self.wt('rm', 'r1'); self.names.remove('r1')
         self.assertTrue(os.path.isfile(os.path.join(self.repo, 'dev.db')))
 
+    def test_rm_holds_only_sqlite_files_so_untracked_notes_block_removal(self):
+        self.commit()
+        self.write('.env', 'DATABASE_URL=file:./dev.db\n')
+        sqlite3.connect(os.path.join(self.repo, 'dev.db')).execute('create table t (x)').connection.commit()
+        self.new('n1')
+        wt = self.path('n1')
+        open(os.path.join(wt, 'dev.db-wal'), 'w').write('wal')
+        open(os.path.join(wt, 'dev.db.notes'), 'w').write('keep me')
+        r = self.wt('rm', 'n1', check=False)
+        self.assertNotEqual(r.returncode, 0, 'rm removed a worktree holding untracked notes')
+        self.assertEqual(open(os.path.join(wt, 'dev.db.notes')).read(), 'keep me')
+        self.assertTrue(os.path.isfile(os.path.join(wt, 'dev.db')), 'refused rm lost the lane database')
+        self.assertTrue(os.path.isfile(os.path.join(wt, 'dev.db-wal')))
+        os.rename(os.path.join(wt, 'dev.db.notes'), os.path.join(self.tmp.name, 'notes'))
+        self.wt('rm', 'n1'); self.names.remove('n1')  # the -wal side file goes with the database
+        self.assertFalse(os.path.exists(wt))
+
+    def test_tracked_sqlite_symlink_to_a_shared_file_is_refused(self):
+        shared = os.path.join(self.tmp.name, 'shared.db')
+        sqlite3.connect(shared).execute('create table t (x)').connection.commit()
+        os.symlink(shared, os.path.join(self.repo, 'dev.db'))
+        self.git('add', '-f', 'dev.db'); self.commit()
+        self.write('.env', 'DATABASE_URL=file:./dev.db\n')
+        r = self.wt('new', 's1', check=False)
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('symlink', r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(self.path('s1')), 'a refused clone left the worktree behind')
+
+    def test_sqlite_folder_link_to_the_worktree_root_is_accepted(self):
+        os.symlink('.', os.path.join(self.repo, 'data'))
+        self.git('add', '-f', 'data'); self.commit()
+        self.write('.env', 'DATABASE_URL=file:./data/dev.db\n')
+        r = self.new('l1')
+        self.assertIn('not found in the main checkout', r.stdout)
+
+    def test_tracked_dangling_sqlite_symlink_is_refused(self):
+        # The app would create the shared database on first use, so a missing target counts too.
+        os.symlink(os.path.join(self.tmp.name, 'shared-not-yet.db'), os.path.join(self.repo, 'dev.db'))
+        self.git('add', '-f', 'dev.db'); self.commit()
+        self.write('.env', 'DATABASE_URL=file:./dev.db\n')
+        r = self.wt('new', 's2', check=False)
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn('symlink', r.stdout + r.stderr)
+        self.assertFalse(os.path.exists(self.path('s2')))
+
     def test_backend_preset_wins_over_asset_package_json(self):
         self.write('package.json', json.dumps({'devDependencies': {'vite': '6'}}))
         self.write('manage.py', 'import os, sys\nos.execvp("python3", ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "serve.py"), sys.argv[2].split(":")[1]])\n')

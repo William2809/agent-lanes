@@ -21,6 +21,8 @@ tool_rev=$MQ_TOOL_REV
 . "$MQ_TOOL_ROOT/skills/agent-workers/scripts/state.sh"
 main=$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd) || { echo "mq: not in a git repo" >&2; exit 2; }
 st="$HOME/.claude/state/mq/$(basename "$main")"; mkdir -p "$st/claims"; q="$st/queue"
+# land writes a bounded raw tail of a failed step here (its printed summary drops most lines).
+LAND_TAIL="$st/check.tail"; export LAND_TAIL
 MAX_BOUNCES=${MQ_MAX_BOUNCES:-2}
 # Lanes landed together per train (one full check for all). MQ_TRAIN=1 restores one-at-a-time.
 TRAIN=${MQ_TRAIN:-4}; solo=0; pick=""; next_lanes=""; held=""
@@ -184,18 +186,31 @@ check_failure() {
   _sha=$(check_sha "$1"); [ -n "$_sha" ] || return 0
   python3 "$MQ_TOOL_ROOT/bin/mq-diagnostics.py" fail "$_sha" 2>/dev/null
 }
-# Reserve once per lane/head before waiting, so a stopped runner cannot retry twice.
+# transient_retry KEY LANE...: reserve once per lane set and heads before waiting, so a stopped
+# runner cannot retry twice. land restores failed stacks, so the heads are the lanes' own.
 transient_retry() (
-  _head=$(git -C "$(wt-dev path "$w")" rev-parse HEAD 2>/dev/null) || exit 1
-  _mark="$st/transient.$w.$_head"; [ ! -f "$_mark" ] || exit 1
+  _key=$1; shift; _heads=""
+  for _lane in "$@"; do
+    _head=$(git -C "$(wt-dev path "$_lane")" rev-parse HEAD 2>/dev/null) || exit 1; _heads="$_heads $_head"
+  done
+  if [ $# -eq 1 ]; then _id=${_heads# }; else _id=$(printf '%s\n' "$@" $_heads | shasum | cut -c1-16); fi
+  _mark="$st/transient.$_key.$_id"; [ ! -f "$_mark" ] || exit 1
   case "$last" in 'FAILED check '*|'FAILED preflight'|'FAILED file-size ratchet') ;; *) exit 1 ;; esac
   _sha=$(check_sha "$last")
-  _marker=$(printf '%s\n' "$out" | tail -80 |
+  # Classify land's raw tail; a land without LAND_TAIL support leaves only its printed summary.
+  if [ -s "$LAND_TAIL" ]; then _text=$(cat "$LAND_TAIL"); else _text=$(printf '%s\n' "$out" | tail -80); fi
+  _marker=$(printf '%s\n' "$_text" |
     python3 "$MQ_TOOL_ROOT/bin/mq-diagnostics.py" transient "$_sha" 2>/dev/null)
   [ -n "$_marker" ] || exit 1
   : >"$_mark" || exit 1
   printf '%s\n' "$_marker"
 )
+# The main checkout left the pinned branch: stop, keep the lanes queued (no bounce, no retry).
+target_moved() {
+  case "$last" in 'FAILED target moved'*) ;; *) return 1 ;; esac
+  echo "mq: stopping, ${last#FAILED }; lanes stay queued"; ev mq target-moved "${last#FAILED }" || true
+  return 0
+}
 # Observe outcomes before finished fixers can requeue. Each original lane is counted once.
 resolve_train() {
   [ -n "$red_pending" ] || return 0
@@ -465,6 +480,9 @@ elif ! reserve; then
 fi
 echo $$ >"$lock/pid"; trap 'ops_unlock "$lock"' EXIT; trap 'exit 1' HUP INT TERM
 cd "$main" || exit 1
+# Pin the branch this runner lands on; land refuses another one, and the runner then stops.
+LAND_TARGET=$(git symbolic-ref -q HEAD) || { echo "mq: main checkout is not on a branch; not landing"; exit 1; }
+export LAND_TARGET
 landed=0
 while :; do
   resolve_train; advance_split
@@ -533,7 +551,18 @@ while :; do
   # unknown blame and a second red subgroup use the existing solo order.
   if [ "$n" -gt 1 ]; then
     echo "landing train:$ws"; for c in $ws; do ev "$c" landing "train of $n"; done
-    out=$(land $ws 2>&1); last=$(printf '%s\n' "$out" | tail -1)
+    # A transient storage fault retries the same train once before any split or blame.
+    transient_attempt=0
+    while :; do
+      : >"$LAND_TAIL"; out=$(land $ws 2>&1); last=$(printf '%s\n' "$out" | tail -1)
+      case "$last" in LANDED*) break ;; esac
+      [ "$transient_attempt" = 0 ] || break
+      marker=$(transient_retry train $ws) || break
+      transient_attempt=1
+      echo "TRANSIENT train: $marker; retrying once"; ev train transient-retry "$marker"
+      sleep 60
+      for c in $ws; do ev "$c" landing "train of $n; transient retry"; done
+    done
     case "$last" in
       LANDED*) for c in $ws; do delq "$c"; landed=$((landed + 1)); ev "$c" landed "${last#LANDED } (train)"
           printf '%s\t%s\t%s\n' "$(date +%FT%T)" "$c" "$last" >>"$st/history"; done
@@ -541,6 +570,7 @@ while :; do
         r=$(printf '%s\n' "$out" | grep '^refresh:' | head -1); [ -z "$r" ] || ev train refresh "${r#refresh: }"
         echo "train$ws: $last"; continue ;;
     esac
+    target_moved && break
     why=${last#FAILED }; ev train train-failed "$why"
     red_train
     # Preserve the conflict pick path even when the remaining subgroup conflicts.
@@ -551,10 +581,10 @@ while :; do
   echo "landing $w"; ev "$w" landing
   transient_attempt=0
   while :; do
-    out=$(land "$w" 2>&1); last=$(printf '%s\n' "$out" | tail -1)
+    : >"$LAND_TAIL"; out=$(land "$w" 2>&1); last=$(printf '%s\n' "$out" | tail -1)
     case "$last" in LANDED*) break ;; esac
     [ "$transient_attempt" = 0 ] || break
-    marker=$(transient_retry) || break
+    marker=$(transient_retry "$w" "$w") || break
     transient_attempt=1
     echo "TRANSIENT $w: $marker; retrying once"; ev "$w" transient-retry "$marker"
     sleep 60
@@ -566,6 +596,7 @@ while :; do
       printf '%s\n' "$out" | grep -E '^(refresh:|cleanup failed)' | sed "s/^/$w: /"
       r=$(printf '%s\n' "$out" | grep '^refresh:' | head -1); [ -z "$r" ] || ev "$w" refresh "${r#refresh: }"; echo "$w: $last"; printf '%s\t%s\t%s\n' "$(date +%FT%T)" "$w" "$last" >>"$st/history"; continue ;;
   esac
+  target_moved && break
   why=${last#FAILED }; b=$(( $(field "$w" 3) + 1 ))
   # Already merged (e.g. the runner died after landing it): drop it instead of bouncing.
   case "$why" in *"has nothing to land"*) delq "$w"; ev "$w" dropped "already on branch"; echo "$w: already on the branch; dropped"; continue ;; esac

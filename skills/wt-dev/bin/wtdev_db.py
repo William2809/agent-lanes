@@ -131,10 +131,14 @@ def sqlite_clone(repo, wt, app, name, var):
         rel = os.path.normpath(os.path.join(base, path))
         if rel.startswith('..'):
             continue
+        dst = os.path.join(wt, rel)
+        # A tracked symlink (dev.db -> /shared/app.db), even a dangling one, gives every lane one database.
+        if os.path.islink(dst):
+            fail(f'sqlite {rel} is a symlink; lanes would share one database')
+        parent = os.path.dirname(dst)
+        if os.path.dirname(rel) and not inside(parent, wt) and os.path.realpath(parent) != os.path.realpath(wt):
+            fail(f'sqlite {rel}: a folder on its path links outside the worktree')
         if os.path.isfile(os.path.join(repo, rel)):
-            dst = os.path.join(wt, rel)
-            if not inside(os.path.dirname(dst) or wt, wt) and os.path.dirname(rel):
-                fail(f'sqlite {rel}: a folder on its path links outside the worktree')
             if os.path.exists(dst):
                 print(f'sqlite {rel} (tracked in git; the worktree has its own copy)\t')
                 return
