@@ -50,3 +50,14 @@ pw-run --base http://localhost:3000 --as ADMIN --width 390 steps.mjs
 Artifacts use `PW_OUT` when set, otherwise a unique `/tmp/pw-run-*` folder. Auth counters have the same one-line format with `tool=pw-run`. Login failures are summarized without credential values; URL-wait timeouts retain a safe `page.waitForURL: Timeout` marker for loop-stats; known credentials are redacted from diagnostic text and login inputs are masked in failure screenshots. Auth state files contain session secrets: never print, screenshot, or commit them.
 
 Regression check (run from a project with Playwright installed): `node --test /path/to/agent-lanes/skills/ui-shots/test_browser_tools.mjs`. It uses an isolated local fixture and never connects to the project's server. Also run `node --test /path/to/agent-lanes/skills/ui-shots/test_auth_cache.mjs` for checkout/symlink rejection, killed-owner recovery and a twenty-process scaled contention check.
+
+## html-shots (local HTML files, e.g. Artifacts)
+
+The Chrome extension cannot scroll inside a published Artifact frame. Screenshot the local source file instead:
+
+```sh
+html-shots page.html --out <scratch>/shots '#level1 .chart-wrap' '#m6'   # top shot per width + one PNG per selector
+html-shots page.html --widths 1440,390 --theme dark --full
+```
+
+Prints PNG paths and `overflow WIDTH scrollWidth` (equal = no sideways scroll). Adds `<meta charset>` when the file has no doctype. No login, no server. Run from a project root that has Playwright (pnpm stores are found too). Tile results with `shot-sheet`.

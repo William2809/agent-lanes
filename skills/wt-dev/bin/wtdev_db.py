@@ -7,8 +7,8 @@
 #   wtdev_db.py env-set SRC DST VAR < VALUE               -> copy SRC to DST (mode 600) with VAR=VALUE (stdin)
 #   wtdev_db.py env-exec ENVFILE -- CMD...                -> exec CMD with ENVFILE's vars (existing env wins)
 #   wtdev_db.py pgname SRC NAME                           -> the lane's Postgres database name
-import hashlib, os, re, shutil, sqlite3, subprocess, sys, tempfile
-from urllib.parse import urlsplit, urlunsplit, unquote
+import fcntl, hashlib, os, re, shutil, sqlite3, subprocess, sys, tempfile, time
+from urllib.parse import urlsplit, urlunsplit, unquote, parse_qsl, urlencode
 
 sys.dont_write_bytecode = True
 
@@ -76,6 +76,52 @@ def pgname(src, name):
     if len(dst.encode()) > 63:
         dst = dst.encode()[:54].decode(errors='ignore') + '_' + hashlib.sha1(dst.encode()).hexdigest()[:8]
     return dst
+
+
+def pg_exec(args):
+    """Receive the URL privately; only the client gets its password, through PGPASSWORD."""
+    p = urlsplit(os.environ.pop('WT_DEV_PG_URL'))
+    password = unquote(p.password) if p.password is not None else None
+    netloc = p.netloc
+    if '@' in netloc:
+        user, host = netloc.rsplit('@', 1)
+        netloc = user.split(':', 1)[0] + '@' + host
+    query = []
+    for key, value in parse_qsl(p.query, keep_blank_values=True):
+        if key == 'password':
+            password = value
+        else:
+            query.append((key, value))
+    if password is not None:
+        os.environ['PGPASSWORD'] = password
+    url = urlunsplit((p.scheme, netloc, p.path, urlencode(query), p.fragment))
+    args = [a.replace('__WT_DEV_PG_URL__', url) for a in args]
+    os.execvp(args[0], args)
+
+
+def port_reservation(root, port, owner, release=False):
+    """Serialize stale reclamation and release, so an old owner cannot remove a new lock."""
+    os.makedirs(root, exist_ok=True)
+    lock = os.path.join(root, port)
+    with open(os.path.join(root, '.guard'), 'a') as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        if os.path.isdir(lock):
+            try:
+                with open(os.path.join(lock, 'owner')) as f:
+                    current = f.read()
+            except FileNotFoundError:
+                current = ''
+            if release and current != owner:
+                return
+            if not release and time.time() - os.stat(lock).st_mtime <= 300:
+                sys.exit(1)
+            if os.path.exists(os.path.join(lock, 'owner')):
+                os.unlink(os.path.join(lock, 'owner'))
+            os.rmdir(lock)
+        if not release:
+            os.mkdir(lock)
+            with open(os.path.join(lock, 'owner'), 'w') as f:
+                f.write(owner)
 
 
 def inside(path, root):
@@ -278,6 +324,11 @@ def main(argv):
             if k and k not in os.environ:
                 os.environ[k] = v
         os.execvp(rest[0], rest)
+    if cmd in ('reserve-port', 'release-port'):
+        port_reservation(*argv[2:5], release=cmd == 'release-port')
+        return
+    if cmd == 'pg-exec':
+        pg_exec(argv[2:])
     if cmd == 'pgname':
         print(pgname(argv[2], argv[3]))
         return

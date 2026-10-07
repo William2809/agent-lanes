@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """ABOUTME: Runs one worker through a non-Codex harness (cursor, opencode, pi, omp) and writes a Codex-shaped log.
-ABOUTME: Header lines, then one line per event, then `tokens used` + the final report, or an `ERROR:` line.
+ABOUTME: Header lines and events; writes the final report to AGENT_LANES_LOG.last under the shared supervisor.
 
 Usage: harness_run.py check  HARNESS SANDBOX                                 exit 2 + reason if unsupported
        harness_run.py run    HARNESS MODEL EFFORT SANDBOX DIR PROMPT_FILE    log on stdout
        harness_run.py resume OLD_LOG MESSAGE [EFFORT]                        same session, model, sandbox, dir
 
-The log contract (read by wk, batches, report.sh, mq): `key: value` header lines in the first 20 lines
+Legacy transcript format (resume headers remain in use): `key: value` header lines in the first 20 lines
 (workdir, model, harness, sandbox, reasoning effort, session id), `tokens used` + a count line + the
 final message on success, `ERROR: ...` as the last line on failure. Sandbox per harness:
   read-only        cursor --mode ask · opencode: injected agent (edit denied; shell only git diff/log/show/status,
@@ -304,6 +304,9 @@ def execute(harness, model, effort, sandbox, workdir, message, session=None, rou
         emit(f'stopped by signal {stopped[0]}')
         return 128 + stopped[0]
     if rc == 0 and run.final and not run.error:
+        if os.environ.get('AGENT_LANES_LOG'):
+            with open(os.environ['AGENT_LANES_LOG'] + '.last', 'w', encoding='utf-8') as f:
+                f.write(run.final + '\n')
         emit(f'tokens used\n{run.tokens:,}\n{run.final}')
         return 0
     emit(f'ERROR: {harness} {oneline(run.error, 400) if run.error else f"exited {rc} without a final message"}')

@@ -40,6 +40,8 @@ Settings live in `~/.config/agent-lanes/config` (see `config/config.example`):
 
 ## What a run does
 
+Pass keys include the code tree, config and runner kit revision. Queued runs recheck the pass cache; identical live checks share one result and log. `--force` and `--run` bypass both shortcuts.
+
 1. Syncs the runner scripts and this project's config; pushes the commit (or a worktree snapshot) to a bare repo on the runner.
 2. Runs detached, at `nice 10`, in its own process group, with `REMOTE_CI_TIMEOUT` (default 1500 seconds, 25 min) applied separately to each supervised command in `remote/run.sh`: install (`REMOTE_CI_INSTALL`), template build (`REMOTE_CI_DB_PREPARE`), prepare (`REMOTE_CI_PREPARE`), and check (`REMOTE_CI_CHECK` or `--run`). Checkout, queue/template-lock waits, other database operations and cleanup are outside this timeout; it is not a total-run deadline. `REMOTE_CI_SLOTS=N` allows N parallel runs, each with its own checkout and database.
 3. Starts the runner's own PostgreSQL if configured (`REMOTE_CI_POSTGRES=<major>`, port 5400+major). Each run gets a fresh database, cloned from a cached template when `REMOTE_CI_TEMPLATE_INPUTS` and `REMOTE_CI_DB_PREPARE` are set (the template rebuilds when those inputs change).

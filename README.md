@@ -176,6 +176,10 @@ Lanes, claims, the merge queue and the check runner work with any git repository
 | Rails, Laravel, Phoenix | `bin/rails server -p` / `php artisan serve --port` / `mix phx.server` | Preset, not yet tested |
 | Anything else: Express, Fastify, NestJS, FastAPI, Flask, Go, Rust... | `WT_DEV_CMD` in `.wt-dev.conf` (read `PORT`) | Works with any command that listens on `PORT` |
 
+`LAND_BASELINE_CMD` in the main checkout's `.wt-dev.conf` (a lane's copy is ignored) opts into a command that `land` runs in the lane on the stack tip. `LAND_BASELINE_FILES` lists space-separated paths to commit with `chore(tooling): update baseline`. Changes to other tracked files fail. An unset command skips the step; these settings alone leave framework detection active.
+
+`.wt-dev.conf` (like `.remote-ci.conf`) is committed shell code that unattended `mq` and `land` run, so it needs the same trust as the repo code.
+
 **Installs** follow the lockfiles at the root: pnpm, npm, yarn, bun, uv, poetry, bundler, composer and mix (or `WT_DEV_INSTALL`). `land` reinstalls only when a lockfile changed.
 
 **Databases.** A database on `localhost` in `.env` gets a copy per lane; the lane's `.env` points at it, and removing the lane drops it.
@@ -269,10 +273,48 @@ Then once per project: `remote-ci init` (adds `.remote-ci.conf` and a pre-push h
 | `ao-model` | Model presets lookup and launch checks |
 | `ui-audit`, `ui-shots`, `pw-run`, `wt-compare` | Mechanical UI checks, role-based screenshots (one shared login per role), before/after review pages |
 | `ui-quick` (skill) | Fast 1:1 UI polishing with the owner watching the live page: no worktree or workers; lanes that need those edits wait in the queue |
+| `discuss` (skill) | Discussion mode: talk through ideas and plans with no edits, workers or commits until you say to start; wraps up into a notes file |
 | `session-stats` | Workflow metrics from Claude Code transcripts |
 | `ctrash` | Move files to a dated trash folder instead of `rm` (safe for unattended agents) |
 
 Project-specific pieces stay in each project: the worker header (`~/.claude/state/headers/<repo>.md`; see [templates/](templates/)), an optional `tools/land-preflight.sh`, and `.remote-ci.conf`.
+
+## Claude Code mods
+
+Two optional [Claude Code](https://docs.claude.com/en/docs/claude-code) plugins in [mods/](mods/). They load in every session.
+
+**`workers`**: a band above the prompt with context use, running workers per repo and failed workers with where they came from:
+
+```
+☀ Clear 5% of context 52.2k / 1.0M   last turns ▁▃▅ ▲ +52.2k   ⚙ 7 running (my-app, api-server) · 1 stalled (my-app worktree search-fix) · 1 errored (api-server worktree auth-retry)   5h 4%  [-]
+```
+
+`/workers` opens the full `batches` list in a side pane. When a worker that this session launched finishes or fails, the mod sends this session a prompt, so the lead acts without polling:
+
+```
+[workers mod, automatic] Your workers changed state:
+- search-fix finished: read `batches report search-fix`, verify, continue.
+- auth-retry ERRORED (stream disconnected): find the cause (log tail, batches report), fix the brief or the tool, resume or relaunch.
+```
+
+**`guards`**: blocks risky commands before they run and says what to do instead: `rm` (use `ctrash`), `pkill`/`killall`, AI attribution trailers in commits, subagents without a model tag in their description, and subagents on models you list. Force pushes and pushes to `main`/`staging` stop with an **Allow once** button in `/guards`:
+
+```
+Guards
+  push to main
+  git push origin main
+  [ Allow once ]
+```
+
+Install (user scope, all projects):
+
+```sh
+claude plugin marketplace add <path-to-this-repo>
+claude plugin install workers@agent-lanes --scope user
+claude plugin install guards@agent-lanes --scope user
+```
+
+Settings go in `~/.config/agent-lanes/config`: `GUARDS_BLOCK_SUBAGENT_MODELS=<regex>` lists subagent models to block (case-insensitive, e.g. `opus|sonnet`). Unset, no model is blocked; the choice is yours. Edit a mod in `mods/`, then run `/reload-plugins`. Check with `claude plugin validate mods/<mod>` and `claude plugin test mods/<mod>`.
 
 ## Status
 

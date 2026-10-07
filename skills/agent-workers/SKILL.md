@@ -80,3 +80,5 @@ Use `wk -w/-d -o` → review → `wtcommit` → `mq add` for builds, reviews and
 Every result you read is re-read on each later turn. Keep worker reports to 15 lines with details in a file, view screenshots as one contact sheet (`shot-sheet`), and let workers summarise large files for you.
 
 **Tag every new launch** with `-t FEATURE:REASON` (required unless `WK_ALLOW_UNTAGGED=1`; `wk NAME -r` retains its resume syntax). REASON = `new`, `rework` after owner feedback, `bounce`, `review`, `review-fix`, `other`, e.g. `wk archive-replace -w -o apps/web/archive -t archive:rework`. Tags go to `~/.claude/state/worker-tags.tsv`; `mq` tags its own bounce fixes. They let `loop-stats` count rebuild rounds per feature.
+
+Each attempt writes `<log>.run` (launch spec), `<log>.last` (final agent message), and `<log>.exit` (`rc` and end time). The registered `.pid` stays the real worker PID. Readers use these records first and accept legacy logs for one release.

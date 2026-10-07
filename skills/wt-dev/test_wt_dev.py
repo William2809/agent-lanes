@@ -63,6 +63,40 @@ class WtDev(unittest.TestCase):
     def listening(self, port):
         return subprocess.run(['lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN'], capture_output=True).returncode == 0
 
+    def test_parallel_new_reserves_distinct_ports_and_releases_them(self):
+        self.write('.wt-dev.conf', "WT_DEV_CMD='sleep 2; exec python3 serve.py \"$PORT\"'\nWT_DEV_INSTALL=''\n")
+        self.commit(); self.env['WT_DEV_MAX_SETUPS'] = '2'
+        self.names.extend(['race1', 'race2'])
+        procs = [subprocess.Popen(['wt-dev', 'new', n], cwd=self.repo, env=self.env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for n in self.names]
+        for proc in procs:
+            out, err = proc.communicate(timeout=120)
+            self.assertEqual(proc.returncode, 0, out + err)
+        self.assertNotEqual(self.port('race1'), self.port('race2'))
+        locks = os.path.join(self.home, '.cache', 'wt-dev', 'repo', 'ports')
+        self.assertEqual(os.listdir(locks), ['.guard'])
+
+    def test_port_reservations_expire_and_old_owner_cannot_release_new_lock(self):
+        root = os.path.join(self.tmp.name, 'ports')
+        helper = os.path.join(BIN, 'wtdev_db.py')
+        def call(cmd, owner):
+            return subprocess.run(['python3', helper, cmd, root, '3001', owner], capture_output=True)
+        self.assertEqual(call('reserve-port', 'old').returncode, 0)
+        self.assertNotEqual(call('reserve-port', 'new').returncode, 0)
+        os.utime(os.path.join(root, '3001'), (time.time() - 301, time.time() - 301))
+        self.assertEqual(call('reserve-port', 'new').returncode, 0)
+        self.assertEqual(call('release-port', 'old').returncode, 0)
+        self.assertEqual(open(os.path.join(root, '3001', 'owner')).read(), 'new')
+        self.assertEqual(call('release-port', 'new').returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(root, '3001')))
+
+    def test_failed_server_releases_port_reservation(self):
+        self.write('.wt-dev.conf', "WT_DEV_CMD='exit 1'\nWT_DEV_INSTALL=''\n")
+        self.commit(); self.names.append('failedport')
+        self.assertNotEqual(self.wt('new', 'failedport', check=False).returncode, 0)
+        locks = os.path.join(self.home, '.cache', 'wt-dev', 'repo', 'ports')
+        self.assertEqual(os.listdir(locks), ['.guard'])
+
     def test_vite_preset_install_override_and_stop_kills_tree(self):
         self.write('package.json', json.dumps({'devDependencies': {'vite': '6'}}))
         self.write('tools/vite', '#!/bin/sh\n# stub: vite --port N --strictPort\nexec python3 "$(dirname "$0")/../../serve.py" "$2" "$@"\n', 0o755)
@@ -214,6 +248,38 @@ class WtDev(unittest.TestCase):
         self.wt('rm', 'n1'); self.names.remove('n1')  # the -wal side file goes with the database
         self.assertFalse(os.path.exists(wt))
 
+    def test_rm_uses_fresh_hold_and_reports_failed_rollback(self):
+        self.commit(); self.write('.env', 'DATABASE_URL=file:./dev.db\n')
+        sqlite3.connect(os.path.join(self.repo, 'dev.db')).execute('create table t (x)').connection.commit()
+        self.new('holds'); lane = self.path('holds')
+        open(os.path.join(lane, 'notes'), 'w').write('block removal')
+        shims = os.path.join(self.tmp.name, 'mvshims'); os.makedirs(shims)
+        stub = textwrap.dedent('''\
+            #!/bin/sh
+            case "$2" in *.dbhold.*/)
+              printf '%s\\n' "$2" >>"$HOLD_LOG";; esac
+            case "$1" in *.dbhold.*/*)
+              [ "${FAIL_ROLLBACK:-0}" != 1 ] || exit 1;; esac
+            exec /bin/mv "$@"
+        ''')
+        path = os.path.join(shims, 'mv'); open(path, 'w').write(stub); os.chmod(path, 0o755)
+        self.env.update(PATH=shims + ':' + self.env['PATH'], HOLD_LOG=os.path.join(self.tmp.name, 'holds.log'))
+        for _ in range(2):
+            r = self.wt('rm', 'holds', check=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertTrue(os.path.isfile(os.path.join(lane, 'dev.db')))
+        holds = open(self.env['HOLD_LOG']).read().splitlines()
+        self.assertEqual(len(set(holds)), 2)
+        # A leftover from an older run must not mix with the next hold.
+        os.makedirs(holds[0]); open(os.path.join(holds[0], 'sentinel'), 'w').write('keep')
+        self.env['FAIL_ROLLBACK'] = '1'
+        r = self.wt('rm', 'holds', check=False)
+        self.assertNotEqual(r.returncode, 0)
+        held = open(self.env['HOLD_LOG']).read().splitlines()[-1].rstrip('/')
+        self.assertIn('database rollback failed; held files at ' + held, r.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(held, 'dev.db')))
+        self.assertEqual(open(os.path.join(holds[0], 'sentinel')).read(), 'keep')
+
     def test_tracked_sqlite_symlink_to_a_shared_file_is_refused(self):
         shared = os.path.join(self.tmp.name, 'shared.db')
         sqlite3.connect(shared).execute('create table t (x)').connection.commit()
@@ -303,6 +369,59 @@ class WtDev(unittest.TestCase):
         root = os.path.dirname(lane)
         self.assertEqual(sorted(f for f in os.listdir(root) if f.startswith('dropped-')), ['dropped-main'])
 
+    def land(self, name):
+        env = dict(self.env, LAND_CHECK='true', GIT_AUTHOR_NAME='t', GIT_COMMITTER_NAME='t',
+                   GIT_AUTHOR_EMAIL='user@example.invalid', GIT_COMMITTER_EMAIL='user@example.invalid')
+        return subprocess.run(['land', name, '--keep'], cwd=self.repo, env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    def test_land_baseline_uses_main_config_and_only_listed_files(self):
+        self.write('baseline', 'old\n'); self.write('other', 'old\n')
+        self.write('.wt-dev.conf', "LAND_BASELINE_CMD='printf new > baseline'\nLAND_BASELINE_FILES='baseline'\n"); self.commit()
+        self.new('baseline')
+        lane = self.path('baseline')
+        open(os.path.join(lane, 'change'), 'w').write('x')
+        self.git('-C', lane, 'add', 'change'); self.git('-C', lane, 'commit', '-qm', 'change')
+        r = self.land('baseline')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(open(os.path.join(self.repo, 'baseline')).read(), 'new')
+        log = subprocess.check_output(['git', '-C', lane, 'log', '-1', '--format=%s'], text=True)
+        self.assertEqual(log.strip(), 'chore(tooling): update baseline')
+
+    def test_land_baseline_refuses_other_tracked_changes(self):
+        self.write('baseline', 'old\n'); self.write('other', 'old\n')
+        self.write('.wt-dev.conf', "LAND_BASELINE_CMD='printf new > baseline; printf bad > other'\nLAND_BASELINE_FILES='baseline'\n"); self.commit()
+        self.new('badbaseline'); lane = self.path('badbaseline')
+        open(os.path.join(lane, 'change'), 'w').write('x')
+        self.git('-C', lane, 'add', 'change'); self.git('-C', lane, 'commit', '-qm', 'change')
+        r = self.land('badbaseline')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('outside LAND_BASELINE_FILES', r.stdout)
+        self.assertEqual(open(os.path.join(self.repo, 'baseline')).read(), 'old\n')
+
+    def test_land_ignores_baseline_command_from_the_lane(self):
+        self.write('baseline', 'old\n'); self.commit()
+        self.new('lanebaseline'); lane = self.path('lanebaseline')
+        canary = os.path.join(self.tmp.name, 'canary')
+        open(os.path.join(lane, '.wt-dev.conf'), 'w').write(f"LAND_BASELINE_CMD='touch {canary}'\nLAND_BASELINE_FILES='baseline'\n")
+        self.git('-C', lane, 'add', '.wt-dev.conf'); self.git('-C', lane, 'commit', '-qm', 'lane config')
+        r = self.land('lanebaseline')
+        self.assertFalse(os.path.exists(canary), r.stdout + r.stderr)
+
+    def test_land_skips_unconfigured_project_specific_baseline(self):
+        self.write('tools/check-file-size.mjs', 'throw new Error("must not run")\n')
+        self.commit(); self.new('skipbaseline'); lane = self.path('skipbaseline')
+        open(os.path.join(lane, 'change'), 'w').write('x')
+        self.git('-C', lane, 'add', 'change'); self.git('-C', lane, 'commit', '-qm', 'change')
+        r = self.land('skipbaseline')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_baseline_only_config_keeps_framework_detection(self):
+        self.write('manage.py', 'import os, sys\nos.execvp("python3", ["python3", "serve.py", sys.argv[2].split(":")[1]])\n')
+        self.write('.wt-dev.conf', "LAND_BASELINE_CMD='true'\nLAND_BASELINE_FILES='baseline'\n")
+        self.commit()
+        self.assertIn('ready: http://localhost:', self.new('detect').stdout)
+
     # Postgres copies: distinct names and an owner mark (review 2026-10-06, 1A)
     PSQL = textwrap.dedent('''\
         #!/usr/bin/env python3
@@ -331,6 +450,27 @@ class WtDev(unittest.TestCase):
         self.write('.wt-dev.conf', 'WT_DEV_INSTALL=""\n')
         self.git('add', '-A'); self.git('commit', '-qm', 'x', '--allow-empty')
         self.write('.env', 'DATABASE_URL=postgresql://localhost/main\n')
+
+    def test_postgres_password_is_only_in_client_environment(self):
+        self.postgres()
+        password = 'fixture-pass@word'
+        self.write('.env', 'DATABASE_URL=postgresql://user:fixture-pass%40word@localhost/main\n')
+        shims = os.path.join(self.tmp.name, 'pgshims')
+        record = "import json, os, sys\nwith open(os.environ['PG_STATE'] + '.argv', 'a') as f: f.write(json.dumps([os.path.basename(sys.argv[0]), sys.argv[1:], os.environ.get('PGPASSWORD'), os.environ.get('WT_DEV_PG_URL')]) + '\\n')\n"
+        for tool in ('psql', 'createdb', 'pg_dump', 'pg_restore'):
+            path = os.path.join(shims, tool)
+            old = open(path).read()
+            if tool in ('pg_dump', 'pg_restore'):
+                old = '#!/usr/bin/env python3\n' + ('sys.stdin.read()\n' if tool == 'pg_restore' else '')
+            open(path, 'w').write(old.split('\n', 1)[0] + '\n' + record + old.split('\n', 1)[1])
+        self.new('private')
+        self.wt('rm', 'private'); self.names.remove('private')
+        calls = [json.loads(line) for line in open(self.pg + '.argv')]
+        self.assertEqual({c[0] for c in calls}, {'psql', 'createdb', 'pg_dump', 'pg_restore'})
+        for _, args, env_password, raw_url in calls:
+            self.assertFalse(any(password in a or 'fixture-pass%40word' in a for a in args))
+            self.assertEqual(env_password, password)
+            self.assertIsNone(raw_url)
 
     def dbs(self):
         return json.load(open(self.pg))

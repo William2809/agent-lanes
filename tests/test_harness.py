@@ -86,7 +86,15 @@ class HarnessTests(unittest.TestCase):
         until = time.monotonic() + 15
         while time.monotonic() < until:
             text = self.log(name).read_text() if self.log(name).exists() else ''
-            if '\ntokens used\n' in text or '\nERROR: ' in text:
+            if self.log(name).with_suffix('.log.exit').exists():
+                record = self.log(name).with_suffix('.log.run')
+                last = self.log(name).with_suffix('.log.last')
+                self.assertTrue(record.exists())
+                self.assertTrue(last.exists())
+                if '\ntokens used\n' in text:
+                    self.assertTrue(last.read_text().strip())
+                else:
+                    self.assertFalse(last.read_text().strip())
                 return text
             time.sleep(0.05)
         raise AssertionError(f'{name} did not finish: {text}')
@@ -163,6 +171,11 @@ class HarnessTests(unittest.TestCase):
         last = self.calls()[-1]['args']
         self.assertEqual(last[last.index('--session') + 1], 'ses_fixture')
         self.assertEqual(last[-1], 'continue please')
+        record = dict(line.split('=', 1) for line in self.log('o1').with_suffix('.log.run').read_text().splitlines())
+        self.assertEqual(record['resume_of'], 'ses_fixture')
+        old = next(self.log('o1').parent.glob('o1.*.log'))
+        for suffix in ('.run', '.last', '.exit', '.pid'):
+            self.assertTrue(old.with_name(old.name + suffix).exists())
 
     def test_cursor_and_omp_adapters(self):
         self.f.wk('c1', '-d', 'a', '-m', 'cubuild', '-t', 'fixture:new')
@@ -190,6 +203,10 @@ class HarnessTests(unittest.TestCase):
             time.sleep(0.05)
         self.assertNotEqual(subprocess.run(['kill', '-0', gc.read_text()], capture_output=True).returncode, 0)
         self.assertIn('stopped by signal 15', self.log('h1').read_text())
+        self.finish('h1')
+        self.assertRegex(self.log('h1').with_suffix('.log.exit').read_text(), r'^rc=143 ended=\d+\n$')
+        status = self.f.run(str(ROOT / 'skills/agent-workers/scripts/batches.sh'), check=False).stdout
+        self.assertRegex(status, r'h1 +DIED \(rc=143, no report\)')
 
     def test_codex_plan_guard_skips_other_harnesses_and_route_is_kept(self):
         self.f.shim('codex-limit', '#!/bin/sh\necho 100\n')
@@ -198,7 +215,7 @@ class HarnessTests(unittest.TestCase):
         self.f.wk('g2', '-d', 'a', '-m', 'pibuild', '-t', 'fixture:new', env={'WK_FORCE': '0'})
         self.finish('g2')
         self.f.shim('codex-limit', '#!/bin/sh\necho 0\n')
-        self.f.shim('codex', '#!/bin/sh\necho "$@" >>"$FIXTURE_ROOT/codex-args"\necho "session id: s"\necho "tokens used"\necho 1\n')
+        self.f.shim('codex', '#!/bin/sh\necho "$@" >>"$FIXTURE_ROOT/codex-args"\nwhile [ $# -gt 0 ]; do [ "$1" != -o ] || { echo fixture >"$2"; }; shift; done\necho "session id: s"\necho "tokens used"\necho 1\n')
         self.f.wk('g3', '-d', 'a', '-m', 'routeb', '-t', 'fixture:new')
         self.finish('g3')
         self.assertIn('--profile proxy-b', (self.f.root / 'codex-args').read_text())

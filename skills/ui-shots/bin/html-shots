@@ -1,0 +1,64 @@
+#!/usr/bin/env node
+// html-shots: screenshot a local HTML file (e.g. an Artifact page before or after publishing).
+// The Chrome extension cannot scroll inside a published Artifact frame; use this instead.
+//   html-shots page.html [--out DIR] [--widths 1440,390] [--theme light|dark] [--full] [CSS selector...]
+// With selectors: one PNG per selector match (first match) at the first width.
+// Always: one top-of-page PNG per width, and a line "overflow WIDTH scrollWidth" per width.
+// Adds <meta charset> when the file has no doctype (Artifact files get it at publish time).
+// Uses the Playwright of the current project (run from a project root that has it).
+const { createRequire } = require("module")
+const { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } = require("fs")
+const { join, resolve, basename } = require("path")
+
+const args = process.argv.slice(2)
+const opt = { out: join(process.env.TMPDIR || "/tmp", "html-shots-" + Date.now()), widths: "1440,390", theme: "light", full: false }
+const sels = []
+let file
+for (let i = 0; i < args.length; i++) {
+  const a = args[i]
+  if (a === "--out") opt.out = args[++i]
+  else if (a === "--widths") opt.widths = args[++i]
+  else if (a === "--theme") opt.theme = args[++i]
+  else if (a === "--full") opt.full = true
+  else if (a === "-h" || a === "--help") { console.log(readFileSync(__filename, "utf8").split("\n").slice(1, 8).join("\n")); process.exit(0) }
+  else if (!file) file = resolve(a)
+  else sels.push(a)
+}
+if (!file || !existsSync(file)) { console.error("html-shots: give an existing HTML file"); process.exit(2) }
+
+function loadChromium() {
+  const req = createRequire(join(process.cwd(), "package.json"))
+  for (const name of ["@playwright/test", "playwright"]) { try { return req(name).chromium } catch {} }
+  const pnpm = join(process.cwd(), "node_modules", ".pnpm")
+  if (existsSync(pnpm)) {
+    const dir = readdirSync(pnpm).filter(d => d.startsWith("playwright@")).sort().pop()
+    if (dir) return require(join(pnpm, dir, "node_modules", "playwright")).chromium
+  }
+  console.error("html-shots: no Playwright here; run from a project root that has it"); process.exit(2)
+}
+
+;(async () => {
+  const chromium = loadChromium()
+  mkdirSync(opt.out, { recursive: true })
+  let html = readFileSync(file, "utf8")
+  if (!/^\s*<!doctype/i.test(html)) html = '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">' + html
+  const page = join(opt.out, "_page.html")
+  writeFileSync(page, html)
+  const b = await chromium.launch()
+  const widths = opt.widths.split(",").map(Number)
+  const stem = basename(file).replace(/\.html?$/, "")
+  for (const [n, w] of widths.entries()) {
+    const p = await b.newPage({ viewport: { width: w, height: 900 }, colorScheme: opt.theme })
+    await p.goto("file://" + page); await p.waitForTimeout(1200)
+    const top = join(opt.out, `${stem}_${w}.png`)
+    await p.screenshot({ path: top, fullPage: opt.full }); console.log(top)
+    console.log("overflow", w, await p.evaluate(() => document.documentElement.scrollWidth))
+    if (n === 0) for (const s of sels) {
+      const path = join(opt.out, `${stem}_${w}_${s.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "")}.png`)
+      try { await p.locator(s).first().screenshot({ path, timeout: 5000 }); console.log(path) }
+      catch { console.log("missing", s) }
+    }
+    await p.close()
+  }
+  await b.close()
+})()

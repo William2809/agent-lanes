@@ -397,18 +397,22 @@ def workers(project_path, since, now):
                     if key in seen:
                         continue
                     seen.add(key)
-                    done = False
-                    try:
-                        with Path(logfile).expanduser().open(encoding='utf-8', errors='replace') as log:
-                            for entry in log:
-                                if entry.startswith('tokens used'):
-                                    done = True
-                                    break
-                    except OSError:
-                        pass
-                    if done:
-                        result['done'] += 1
-                        continue
+                    logpath = Path(logfile).expanduser()
+                    record, exitfile, last = (Path(str(logpath) + suffix) for suffix in ('.run', '.exit', '.last'))
+                    if record.exists() or exitfile.exists():
+                        if exitfile.exists():
+                            fields = dict(item.split('=', 1) for item in exitfile.read_text().split() if '=' in item)
+                            done = fields.get('rc') == '0' and last.exists() and last.stat().st_size > 0
+                            result['done' if done else 'died'] += 1
+                            continue
+                    else:
+                        try:
+                            with logpath.open(encoding='utf-8', errors='replace') as log:
+                                if any(re.sub(r'^(\x1b\[[0-9;]*m)*', '', entry).startswith('tokens used') for entry in log):
+                                    result['done'] += 1
+                                    continue
+                        except OSError:
+                            pass
                     if pid <= 0:
                         result['died'] += 1
                         continue
@@ -416,7 +420,9 @@ def workers(project_path, since, now):
                         os.kill(pid, 0)
                         proc = subprocess.run(['ps', '-p', str(pid), '-o', 'command='],
                                               capture_output=True, text=True, timeout=5)
-                        result['running' if proc.returncode == 0 and ('codex' in proc.stdout or 'harness_run' in proc.stdout) else 'died'] += 1
+                        worker = proc.returncode == 0 and ('codex' in proc.stdout or 'harness_run' in proc.stdout)
+                        hidden = record.exists() and not proc.stdout.strip()
+                        result['running' if worker or hidden else 'died'] += 1
                     except ProcessLookupError:
                         result['died'] += 1
                     except PermissionError:
@@ -523,7 +529,7 @@ def main():
                          'context': 'sum cache_read per unique assistant message; average divides by assistant turns',
                          'tool_results': 'text characters (image payloads excluded); fixed tool/command labels',
                          'background': 'task IDs and referenced output files; file-only outcomes have no inferred completion time',
-                         'workers': 'project and accessible Git worktrees; registry starts in window; tokens used marker=done, otherwise alive PID with codex/harness_run command=running, else died; no session attribution'}}
+                         'workers': 'project and accessible Git worktrees; registry starts in window; exit rc=0 with nonempty last message=done; legacy tokens used marker=done, otherwise alive PID with codex/harness_run command=running, else died; no session attribution'}}
     if args.json:
         print(json.dumps(report, indent=2))
     else:

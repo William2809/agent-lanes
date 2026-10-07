@@ -75,7 +75,8 @@ if mode == 'repair':
     p = dir / (dir.name + '.txt'); p.write_text(p.read_text() + 'repair\\n')
     subprocess.run(['git', '-C', str(dir), 'add', p.name], check=True, stdout=subprocess.DEVNULL)
     subprocess.run(['git', '-C', str(dir), 'commit', '-q', '-m', 'fixture repair'], check=True)
-print('tokens used\\n1', flush=True)
+pathlib.Path(args[args.index('-o') + 1]).write_text('Changed: fixture\\n')
+print('tokens used\\n1\\nChanged: fixture', flush=True)
 ''')
         self.shim('land', '''#!/usr/bin/env python3
 import os, pathlib, subprocess, sys
@@ -169,7 +170,7 @@ print('LANDED fixture')
         log = self.home / '.claude/state/logs/demo' / (name + '.log')
         until = time.monotonic() + 10
         while time.monotonic() < until:
-            if log.exists() and '\ntokens used\n' in log.read_text():
+            if Path(str(log) + '.exit').exists():
                 return
             time.sleep(0.05)
         raise AssertionError(f'worker {name} did not report')

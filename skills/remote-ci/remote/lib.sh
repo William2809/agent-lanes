@@ -29,17 +29,28 @@ database_url() {
 
 # shlock reclaims dead PIDs; liveness checks must also ignore stale lock files.
 lock_live() {
-  local pid group
+  local pid
   if [ -f "$1" ]; then
     pid=$(cat "$1")
     case "$pid" in *[!0-9]* | "" | 0) ;; *) kill -0 "$pid" 2>/dev/null && return 0 ;; esac
   fi
   # A SIGKILLed supervisor may leave a bounded child phase alive until its watchdog expires.
-  if [ -f "$1.child" ]; then
-    group=$(cat "$1.child")
-    case "$group" in *[!0-9]* | "" | 0) ;; *) kill -0 -"$group" 2>/dev/null && return 0 ;; esac
-  fi
-  return 1
+  child_live "$1.child"
+}
+child_live() {
+  local group
+  group=$(cat "$1" 2>/dev/null)
+  case "$group" in *[!0-9]* | "" | 0) return 1 ;; esac
+  kill -0 -"$group" 2>/dev/null
+}
+run_child_live() {
+  local file
+  for file in "$dir"/slots/*.run; do
+    [ "$(cat "$file" 2>/dev/null)" = "$1" ] || continue
+    child_live "${file%.run}.lock.child" && return 0
+  done
+  # Exclusive runs store their child's group beside the global PID lock.
+  [ "$(cat "$ci/lock" 2>/dev/null)" = "$2" ] && child_live "$ci/lock.child"
 }
 slots_active() {
   local f

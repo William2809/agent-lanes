@@ -19,6 +19,7 @@ if [ -z "${MQ_COPY:-}" ]; then
 fi
 tool_rev=$MQ_TOOL_REV
 . "$MQ_TOOL_ROOT/skills/agent-workers/scripts/state.sh"
+. "$MQ_TOOL_ROOT/skills/agent-workers/scripts/run-record.sh"
 main=$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd) || { echo "mq: not in a git repo" >&2; exit 2; }
 st="$HOME/.claude/state/mq/$(basename "$main")"; mkdir -p "$st/claims"; q="$st/queue"
 # land writes a bounded raw tail of a failed step here (its printed summary drops most lines).
@@ -62,6 +63,7 @@ main_overlap() { _lp=$(wt-dev path "$1" 2>/dev/null) && [ -d "$_lp" ] || return 
     echo "--lane--"; git -C "$_lp" diff --name-only "$_mb...HEAD" 2>/dev/null; } |
     awk 'l && ($0 in d) {print; if (++n == 3) exit} $0 == "--lane--" {l = 1; next} !l {d[$0] = 1}' | tr '\n' ' '; }
 running() { [ -n "$1" ] || return 1; f="$HOME/.claude/state/logs/$(basename "$main")/$1.log.pid"
+  [ ! -f "${f%.pid}.exit" ] || return 1
   # Alive = the pid exists AND is still a worker process (pids get reused; a stranger would wedge the lane).
   [ -f "$f" ] && ops_agent_pid "$(cat "$f")" && return 0
   batches 2>/dev/null | awk -v n="$1" '$1==n && $2=="running"{f=1} END{exit !f}'; }
@@ -165,7 +167,7 @@ _reconcile_launch() {
 reported() {
   lg=$(awk -F'\t' -v n="$1" '{b=$3; sub(/.*\//,"",b); sub(/\.log$/,"",b)} b==n{l=$3} END{print l}' "$HOME/.claude/state/workers.tsv" 2>/dev/null)
   [ -n "$lg" ] || lg="$HOME/.claude/state/logs/$(basename "$main")/$1.log"
-  grep -q '^tokens used' "$lg" 2>/dev/null
+  ops_reported "$lg"
 }
 paused_worker() { awk -F'\t' -v n="$1" '$1==n{f=1} END{exit !f}' "$HOME/.claude/state/paused-workers.tsv" 2>/dev/null; }
 disk_low() {

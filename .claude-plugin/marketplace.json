@@ -1,0 +1,8 @@
+{
+  "name": "agent-lanes",
+  "owner": { "name": "agent-lanes" },
+  "plugins": [
+    { "name": "workers", "source": "./mods/workers", "description": "Band above the prompt: context, workers per repo, failed workers with their origin; /workers pane; wakes the lead when its workers finish or fail" },
+    { "name": "guards", "source": "./mods/guards", "description": "Blocks risky shell commands, untagged or listed-model subagents, AI trailers; force push and main/staging pushes need Allow once" }
+  ]
+}

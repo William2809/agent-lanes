@@ -19,6 +19,8 @@ log=$dir/logs/$run.log
 exec >"$log" 2>&1
 submitted=$(date +%s)
 child="" watchdog="" locked=0 slot=0 template_lock="" pg_started=0 guard_owned=0 template_locked=0
+claim=$dir/results/tree-$tree.running
+claim_owned=0 cache_result=0
 work=$dir/work
 base_db=$REMOTE_CI_DB
 role=ci
@@ -61,17 +63,79 @@ SQL
     release_guard
   fi
   git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null
-  if [ -z "$command" ]; then
+  if [ "$cache_result" = 1 ]; then
     if [ "$rc" = 0 ]; then echo "$sha" >"$dir/results/tree-$tree.pass"
     else rm -f "$dir/results/tree-$tree.pass"; fi
   fi
   echo "== timing cleanup $(( $(date +%s) - cleanup_start ))s"
   echo "== timing total $(( $(date +%s) - submitted ))s (including queue)"
   echo "== finished rc=$rc $(date '+%F %T')"
-  # Publish completion only after cleanup, logging and locks are finished.
-  echo "$rc" >"$dir/results/$run.exit"
+  # Publish completion atomically after cleanup, logging and slot release.
+  echo "$rc" >"$dir/results/$run.exit.new"
+  mv "$dir/results/$run.exit.new" "$dir/results/$run.exit"
+  if [ "$claim_owned" = 1 ]; then
+    rm -f "$claim.run" "$claim"
+    claim_owned=0
+  fi
 }
 trap 'finish 1; exit 1' HUP INT TERM
+run_live() {
+  case "$1" in *[!0-9]* | "" | 0) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null && ps -p "$1" -o command= 2>/dev/null | grep -q 'run.sh'
+}
+busy_claim() { echo "busy: $*"; finish 75; exit 75; }
+# shlock publishes the PID atomically. The sidecar binds that PID to a run ID;
+# readers wait for matching metadata rather than following a previous owner.
+if [ -z "$command" ] && [ "$force" = 0 ]; then
+  while :; do
+    owner_pid="" followed=""
+    read -r owner_pid followed 2>/dev/null <"$claim.run" || true
+    if [ -n "$followed" ] && ! run_live "$owner_pid" && run_child_live "$followed" "$owner_pid"; then
+      busy_claim "run $followed still has a live slot child (log $dir/logs/$followed.log)"
+    fi
+    if /usr/bin/shlock -f "$claim" -p $$; then
+      # The owner may die between inspection and shlock. Preserve its metadata
+      # if a child still runs, so the next retry can make the same check.
+      owner_pid="" followed=""
+      read -r owner_pid followed 2>/dev/null <"$claim.run" || true
+      if [ -n "$followed" ] && run_child_live "$followed" "$owner_pid"; then
+        rm -f "$claim"
+        busy_claim "run $followed still has a live slot child (log $dir/logs/$followed.log)"
+      fi
+      break
+    fi
+    [ $(( $(date +%s) - submitted )) -lt 300 ] || busy_claim "tree claim metadata unavailable after 300 seconds"
+    owner=$(cat "$claim" 2>/dev/null)
+    case "$owner" in *[!0-9]* | "" | 0) sleep 1; continue ;; esac
+    if kill -0 "$owner" 2>/dev/null && ! run_live "$owner"; then
+      # The pid was reused by another program: the claim is stale, so take it over.
+      echo "== stale tree claim (pid $owner is not run.sh); replacing it"
+      rm -f "$claim" "$claim.run"; continue
+    fi
+    if [ "$owner" = "$owner_pid" ] && [ -n "$followed" ] && run_live "$owner"; then
+      echo "== following run $followed sha $sha (log $dir/logs/$followed.log)"
+      follow_started=$(date +%s)
+      while [ ! -f "$dir/results/$followed.exit" ]; do
+        [ $(( $(date +%s) - follow_started )) -lt "$REMOTE_CI_TIMEOUT" ] ||
+          busy_claim "followed run $followed exceeded $REMOTE_CI_TIMEOUT seconds (log $dir/logs/$followed.log)"
+        if ! run_live "$owner"; then
+          # Recheck publication after death: finish writes the exit before releasing its claim.
+          [ -f "$dir/results/$followed.exit" ] && break
+          echo "Error: followed run ended without a result (log $dir/logs/$followed.log)"
+          finish 1; exit 1
+        fi
+        sleep 1
+      done
+      rc=$(cat "$dir/results/$followed.exit")
+      [ "$rc" = 0 ] || echo "Error: followed run rc=$rc (log $dir/logs/$followed.log)"
+      finish "$rc"; exit "$rc"
+    fi
+    sleep 1
+  done
+  claim_owned=1
+  printf '%s %s\n' "$$" "$run" >"$claim.run.new"
+  mv "$claim.run.new" "$claim.run"
+fi
 mkdir -p "$dir/slots"
 while [ "$locked" = 0 ]; do
   if ! lock_live "$ci/lock" && /usr/bin/shlock -f "$ci/lock" -p $$; then
@@ -102,6 +166,11 @@ while [ "$locked" = 0 ]; do
   fi
   sleep 2
 done
+if [ -z "$command" ] && [ "$force" = 0 ] && [ -f "$dir/results/tree-$tree.pass" ]; then
+  echo "== cached: identical tree passed while queued"
+  finish 0; exit 0
+fi
+[ -z "$command" ] && cache_result=1
 started=$(date +%s)
 echo "== $project run $run sha $sha slot $slot/$REMOTE_CI_SLOTS start $(date '+%F %T')"
 echo "== timing queue $((started - submitted))s"
