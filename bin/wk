@@ -13,7 +13,9 @@ set -eu
 # Scripts ship next to this file: <repo>/bin/wk -> <repo>/skills (no fixed install location).
 skills=$(cd "$(dirname "$(readlink -f "$0")")/../skills" && pwd)
 tool_rev=$(git -C "$skills/.." rev-parse HEAD 2>/dev/null || echo unknown)
-. "$skills/agent-workers/scripts/state.sh"
+_run_scripts="$skills/agent-workers/scripts"
+. "$_run_scripts/state.sh"
+. "$_run_scripts/run-record.sh"
 # mq publishes a unique durable intent before invoking wk. Cancelled intents cannot fork late.
 if [ -n "${WK_LAUNCH_INTENT:-}" ]; then
   [ -d "$WK_LAUNCH_INTENT" ] || { echo "wk: repair launch cancelled" >&2; exit 1; }
@@ -29,7 +31,7 @@ if [ "${1:-}" = "-r" ]; then
   main=$(cd "$top" && cd "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/.." 2>/dev/null && pwd || echo "$top")
   logs="$HOME/.claude/state/logs/$(basename "$main")"; log="$logs/$name.log"
   [ -f "$log" ] || { echo "no log $log" >&2; exit 1; }
-  if [ -f "$log.pid" ] && { ops_agent_pid "$(cat "$log.pid")" || kill -0 "$(cat "$log.pid")" 2>/dev/null; }; then
+  if ops_running "$log"; then
     if batches --all 2>/dev/null | awk -v n="$name" '$1==n && $2=="STALLED" {f=1} END {exit !f}'; then
       echo "$name is still running (STALLED; stop it with batches pause --stalled $name before resuming)" >&2
     else echo "$name is still running" >&2; fi
@@ -39,10 +41,10 @@ if [ "${1:-}" = "-r" ]; then
   paused=$(awk -F'\t' -v n="$name" '$1==n {f=1} END {print f+0}' "$HOME/.claude/state/paused-workers.tsv" 2>/dev/null || echo 0)
   # A resume that failed at startup leaves a log without a session header: read the newest older log that has one.
   src="$log"
-  sed -n '1,20p' "$log" | grep -q '^session id: ' || src=$(ls -t "$logs/$name".[0-9]*-[0-9]*.log 2>/dev/null | while read -r f; do sed -n '1,20p' "$f" | grep -q '^session id: ' && { echo "$f"; break; }; done)
+  ops_plain "$log" | head -20 | grep -q '^session id: ' || src=$(ls -t "$logs/$name".[0-9]*-[0-9]*.log 2>/dev/null | while read -r f; do ops_plain "$f" | head -20 | grep -q '^session id: ' && { echo "$f"; break; }; done)
   [ -n "$src" ] || src="$log"
-  [ "$paused" != 1 ] && [ "$src" = "$log" ] && ! grep -q '^tokens used' "$log" && [ $(( $(date +%s) - $(stat -f %m "$log") )) -lt 180 ] && { echo "$name log was written <3 min ago; probably still running (check: batches)" >&2; exit 1; }
-  hv() { sed -n "1,20s/^$1: //p" "$src" | head -1; }
+  [ "$paused" != 1 ] && [ "$src" = "$log" ] && ! ops_completed "$log" && [ $(( $(date +%s) - $(ops_stat %m %Y "$log") )) -lt 180 ] && { echo "$name log was written <3 min ago; probably still running (check: batches)" >&2; exit 1; }
+  hv() { ops_plain "$src" | sed -n "1,20s/^$1: //p" | head -1; }
   sid=$(hv "session id"); model=$(hv model); eff=$(hv "reasoning effort"); sb=$(hv sandbox | cut -d" " -f1); dir=$(hv workdir); prov=$(hv provider)
   [ -n "$sid" ] && [ -d "$dir" ] || { echo "cannot read session id/workdir from $log" >&2; exit 1; }
   [ "${2:-}" = "-" ] && set -- "$1" "$(cat)"  # MSG '-' = message on stdin (quoted heredoc); bare -r never reads stdin (it hung in background shells)
@@ -50,27 +52,33 @@ if [ "${1:-}" = "-r" ]; then
   # Resumes also reserve capacity before publishing a new writer.
   launch_lock="$HOME/.claude/state/mq/$(basename "$main")/launch.lock"
   mkdir -p "$(dirname "$launch_lock")"; ops_lock "$launch_lock" || exit 1
-  if [ -f "$log.pid" ] && ops_agent_pid "$(cat "$log.pid")"; then echo "$name is still running" >&2; exit 1; fi
+  if ops_running "$log"; then echo "$name is still running" >&2; exit 1; fi
   # The name/log may have been reused while waiting. mq resumes only its own writable lane.
   sid=$(hv "session id"); model=$(hv model); eff=$(hv "reasoning effort"); sb=$(hv sandbox | cut -d" " -f1); dir=$(hv workdir); prov=$(hv provider); h=$(hv harness)
   [ -n "$sid" ] && [ -d "$dir" ] || { echo "cannot read session id/workdir from $log" >&2; exit 1; }
+  preset=resume; record_route=${prov:-codex}; resume_route=""
+  if [ -f "$src.run" ]; then
+    rv() { sed -n "s/^$1=//p" "$src.run" | head -1; }
+    model=$(rv model); sb=$(rv sandbox); dir=$(rv dir); h=$(rv harness)
+    preset=$(rv preset); record_route=$(rv route); eff=$(rv effort)
+    if [ "$h" = codex ] && [ "$record_route" != codex ]; then resume_route="--profile $record_route"; fi
+  fi
   if [ -n "${WK_RESUME_DIR:-}" ]; then
     [ "$dir" = "$WK_RESUME_DIR" ] && [ "$sb" != read-only ] || { echo "wk: $name session does not match writable lane $WK_RESUME_DIR" >&2; exit 1; }
   fi
   [ "$dir" = "$main" ] || ops_writer_guard "$main" "$dir" "$sb" || exit $?
-  old="$logs/$name.$(date +%m%d-%H%M).log"; mv "$log" "$old"
+  old="$logs/$name.$(date +%m%d-%H%M%S).$$.log"; ops_archive "$log" "$old"
   cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}; [ -f "$cfg" ] && . "$cfg"; codex=${CODEX_BIN:-$(command -v codex || true)}
   [ "$eff" = xhigh ] && [ -z "${WK_ALLOW_XHIGH:-}" ] && eff=high  # effort cap: xhigh runs as high unless WK_ALLOW_XHIGH is set
   [ -z "${WK_LAUNCH_INTENT:-}" ] || [ -d "$WK_LAUNCH_INTENT" ] || { echo "wk: repair launch cancelled" >&2; exit 1; }
+  ops_run_record "$log" "$preset" "${h:-codex}" "$record_route" "$model" "$eff" "$sb" "$dir" "$sid"
   if [ -n "$h" ] && [ "$h" != codex ]; then
     [ "$src" = "$log" ] && src=$old
-    (cd "$dir" || exit 1; nohup python3 "$skills/agent-workers/scripts/harness_run.py" resume "$src" "$msg" "$eff" </dev/null >"$log" 2>&1 &
-     echo $! >"$log.pid"; ops_register "$!" "$log" "$dir" "$sb" resume)
+    (cd "$dir" || exit 1; ops_launch "$log" "$dir" "$sb" "$preset" python3 "$_run_scripts/harness_run.py" resume "$src" "$msg" "$eff")
     echo "resumed $name ($h $model $eff, $sid); previous log $old"; exit 0
   fi
-  (cd "$dir" || exit 1; nohup "$codex" exec resume --model "$model" -c "model_reasoning_effort=\"$eff\"" -c "sandbox_mode=\"$sb\"" ${prov:+-c "model_provider=\"$prov\""} \
-    --skip-git-repo-check "$sid" "$msg" </dev/null >"$log" 2>&1 &
-   echo $! >"$log.pid"; ops_register "$!" "$log" "$dir" "$sb" resume)
+  (cd "$dir" || exit 1; ops_launch "$log" "$dir" "$sb" "$preset" "$codex" exec $resume_route --color never resume -o "$log.last" --model "$model" -c "model_reasoning_effort=\"$eff\"" -c "sandbox_mode=\"$sb\"" ${prov:+-c "model_provider=\"$prov\""} \
+    --skip-git-repo-check "$sid" "$msg")
   echo "resumed $name ($model $eff, $sid); previous log $old"; exit 0
 fi
 # Disk guard: a full disk has wedged Docker/Postgres and killed every running worker.
@@ -102,7 +110,7 @@ top=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 main=$(cd "$top" && cd "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)/.." 2>/dev/null && pwd || echo "$top"); repo=$(basename "$main")
 base=$(git -C "$top" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
 logs="$HOME/.claude/state/logs/$repo"; mkdir -p "$logs"; log="$logs/$name.log"
-if [ -f "$log.pid" ] && ops_agent_pid "$(cat "$log.pid")"; then echo "$name is already running" >&2; exit 1; fi
+if ops_running "$log"; then echo "$name is already running" >&2; exit 1; fi
 dir=$top; url=""
 if [ -n "$own" ] && [ "$wt" -eq 0 ] && [ -z "$into" ] && [ "$top" = "$main" ]; then
   echo "wk: -o ignored in the main checkout (claims are for -w/-d worktrees)"
@@ -142,8 +150,8 @@ if [ -n "$own" ]; then
   hit=$(cd "$main" && MQ_FORCE=${WK_FORCE:-0} mq claim "$(basename "$dir")" $own) || { [ -z "$hit" ] || printf '%s\n' "$hit" >&2; echo "wk: not launching $name: paths owned elsewhere. Join that batch (-d WT) or wait for it to land (WK_FORCE=1 overrides)" >&2; exit 1; }
 fi
 # Recheck after acquiring the launch lock so concurrent callers cannot reuse a worker name.
-if [ -f "$log.pid" ] && ops_agent_pid "$(cat "$log.pid")"; then echo "$name is already running" >&2; exit 1; fi
-[ -f "$log" ] && mv "$log" "$logs/$name.$(date +%m%d-%H%M).log"
+if ops_running "$log"; then echo "$name is already running" >&2; exit 1; fi
+[ ! -f "$log" ] || ops_archive "$log" "$logs/$name.$(date +%m%d-%H%M%S).$$.log"
 p="$logs/$name.prompt"
 # Workers commit only inside their own wt-dev worktree; in the main checkout they leave edits for the lead.
 if [ "$dir" != "$main" ] && wt-dev ls 2>/dev/null | awk -v n="$(basename "$dir")" '$1==n{f=1} END{exit !f}'; then

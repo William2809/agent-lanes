@@ -150,5 +150,61 @@ class RegressionTests(unittest.TestCase):
                                  dict(done=1, died=2, running=1, unknown=0))
 
 
+    def test_worker_records_override_transcripts_and_alive_pids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            state = home / '.claude/state'
+            state.mkdir(parents=True)
+            project = (home / 'project').resolve()
+            rows = []
+            for index, (rc, final) in enumerate(((0, 'report'), (7, 'partial'), (0, '')), 1):
+                log = home / f'{index}.log'
+                log.write_text('tokens used\n100\nlegacy report\n')
+                Path(str(log) + '.run').write_text('run_id=fixture\n')
+                Path(str(log) + '.last').write_text(final)
+                Path(str(log) + '.exit').write_text(f'rc={rc} ended=12\n')
+                rows.append(f'10\t{index}\t{log}\t{project}\n')
+            missing = home / 'missing.log'
+            missing.write_text('\x1b[1mtokens used\x1b[0m\n100\n')
+            Path(str(missing) + '.run').write_text('run_id=hard-kill\n')
+            rows.append(f'10\t4\t{missing}\t{project}\n')
+            (state / 'workers.tsv').write_text(''.join(rows))
+            with patch.object(stats.Path, 'home', return_value=home), \
+                    patch.object(stats.os, 'kill', side_effect=ProcessLookupError):
+                self.assertEqual(stats.workers(project, 0, 20), dict(done=1, died=3, running=0, unknown=0))
+
+
+    def test_record_workers_with_hidden_ps_use_live_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state = home / '.claude/state'
+            state.mkdir(parents=True)
+            project = home / 'project'
+            rows = []
+            for pid in range(1, 6):
+                log = home / f'{pid}.log'
+                log.write_text('still working\n')
+                if pid != 4:
+                    Path(str(log) + '.run').write_text('run_id=fixture\n')
+                rows.append(f'10\t{pid}\t{log}\t{project}\n')
+            (state / 'workers.tsv').write_text(''.join(rows))
+
+            def process(args, **kwargs):
+                if args[0] == 'git':
+                    return stats.subprocess.CompletedProcess(args, 1, '', '')
+                if args[2] == '3':
+                    return stats.subprocess.CompletedProcess(args, 0, 'unrelated process', '')
+                return stats.subprocess.CompletedProcess(args, 0 if args[2] == '5' else 1, '', '')
+
+            def alive(pid, _signal):
+                if pid == 1:
+                    raise ProcessLookupError
+
+            with patch.object(stats.Path, 'home', return_value=home), \
+                    patch.object(stats.subprocess, 'run', side_effect=process), \
+                    patch.object(stats.os, 'kill', side_effect=alive):
+                self.assertEqual(stats.workers(project, 0, 20), dict(done=0, died=3, running=2, unknown=0))
+
+
 if __name__ == '__main__':
     unittest.main()

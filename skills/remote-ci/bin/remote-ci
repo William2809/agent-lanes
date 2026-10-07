@@ -46,7 +46,8 @@ conf_snapshot=$(mktemp)
 chmod 600 "$conf_snapshot"
 cp "$conf" "$conf_snapshot"
 conf=$conf_snapshot
-trap 'rm -f "$conf_snapshot"' EXIT
+kit_snapshot=""
+trap 'rm -f "$conf_snapshot" ${kit_snapshot:+"$kit_snapshot/"*.sh}; [ -z "$kit_snapshot" ] || rmdir "$kit_snapshot"' EXIT
 # shellcheck disable=SC1090
 . "$conf"
 if [ "$cmd" = fail ] || [ "$cmd" = blame ]; then
@@ -87,14 +88,20 @@ fi
 remote() { "${ssh_cmd[@]}" "$@" 2>&1 | grep -v '^Pseudo-terminal'; return "${PIPESTATUS[0]}"; }
 p="~/ci/projects/$REMOTE_CI_NAME"
 
+snapshot_kit() {
+  [ -z "$kit_snapshot" ] || return 0
+  kit_snapshot=$(mktemp -d) || return 1
+  cp "$kit/remote/"*.sh "$kit_snapshot/"
+}
 sync_kit() {
+  snapshot_kit || return 1
   local run_dir=""
   [ -n "${1:-}" ] && run_dir="$p/runs/$1"
   # Runner scripts and this project's config travel on every call, so changes apply at once.
-  tar -C "$kit/remote" -cf - . | remote 'mkdir -p ~/ci/bin; tmp=$(mktemp -d ~/ci/bin/.sync.XXXXXX) && tar -C "$tmp" -xf - && for f in "$tmp"/*; do mv -f "$f" ~/ci/bin/; done; rmdir "$tmp"' || return 1
+  tar -C "$kit_snapshot" -cf - . | remote 'mkdir -p ~/ci/bin; tmp=$(mktemp -d ~/ci/bin/.sync.XXXXXX) && tar -C "$tmp" -xf - && for f in "$tmp"/*; do mv -f "$f" ~/ci/bin/; done; rmdir "$tmp"' || return 1
   remote "mkdir -p $p; tmp=\$(mktemp $p/.conf.XXXXXX) && chmod 600 \"\$tmp\" && cat >\"\$tmp\" && mv -f \"\$tmp\" $p/conf" <"$conf" || return 1
   if [ -n "$run_dir" ]; then
-    tar -C "$kit/remote" -cf - . | remote "mkdir -p $run_dir/bin && chmod 700 $run_dir && tar -C $run_dir/bin -xf -" || return 1
+    tar -C "$kit_snapshot" -cf - . | remote "mkdir -p $run_dir/bin && chmod 700 $run_dir && tar -C $run_dir/bin -xf -" || return 1
     remote "umask 077; cat >$run_dir/conf; if [ -f $p/env.local ]; then cp $p/env.local $run_dir/env.local; fi" <"$conf" || return 1
   fi
   if [ -n "${REMOTE_CI_ENV_KEYS:-}" ] && [ -f "$root/.env" ]; then
@@ -164,8 +171,13 @@ if [ "$worktree" = 1 ]; then
 else
   sha=$(git rev-parse "$target^{commit}") || exit 2
 fi
-# A pass is keyed on the code and this project's remote-ci settings together.
-tree=$(git rev-parse "$sha^{tree}")-$(git hash-object "$conf" | cut -c1-8)
+# A pass identifies code, project settings and the synced runner scripts.
+snapshot_kit || exit 1
+kit_rev=$(cd "$kit_snapshot" && for script in *.sh; do
+  printf '%s\n' "$script"
+  git hash-object "$script" || exit 1
+done | git hash-object --stdin | cut -c1-8) || exit 1
+tree=$(git rev-parse "$sha^{tree}")-$(git hash-object "$conf" | cut -c1-8)-$kit_rev
 if [ "$force" = 0 ] && [ -z "$command" ] && remote "test -f $p/results/tree-$tree.pass"; then
   echo "remote-ci: this exact code already passed on the runner ($route); skipping."
   exit 0
@@ -182,8 +194,14 @@ remote "nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$enc
 if [ "$summary" = 1 ]; then
   remote "done=$p/results/$run.exit
     while [ ! -f \$done ]; do sleep 2; done
-    sed 's/\x1b\[[0-9;]*m//g' $p/logs/$run.log |
-      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|== timing|== finished|maximum resident' |
+    log=$p/logs/$run.log
+    followed=\$(sed -n 's/^== following run \([a-zA-Z0-9_.-][a-zA-Z0-9_.-]*\) sha .*/\1/p' \"\$log\" | head -1)
+    set -- \"\$log\"
+    if [ -n \"\$followed\" ] && [ -f $p/logs/\$followed.log ]; then
+      set -- \"\$@\" $p/logs/\$followed.log
+    fi
+    sed 's/\x1b\[[0-9;]*m//g' \"\$@\" |
+      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|== following|== cached:|== timing|== finished|maximum resident' |
       sed 's/^[^ :]*:[a-z:-]*: *//' | awk '!seen[\$0]++' | head -60
     exit \$(cat \$done)"
   rc=$?

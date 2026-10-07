@@ -11,6 +11,7 @@
 #        batches report NAME…  final report of finished workers (report.sh on their logs)
 #        batches overlap   unlanded worktrees that touch the same files (future land conflicts)
 # Exit 3 when something needs the lead (DIED, STALLED). Run inside the repo for worktrees.
+. "$(dirname "$(readlink -f "$0")")/run-record.sh"
 state="$HOME/.claude/state"; reg="$state/workers.tsv"; acked="$state/acked"; paused="$state/paused-workers.tsv"
 mkdir -p "$state"; touch "$acked"
 # Import the old dock queue once; keep the source in trash.
@@ -36,7 +37,7 @@ case "${1:-}" in
       kill -0 "$pid" 2>/dev/null || continue
       log=${r#*"$(printf '\t')"}
       dir=$(awk -F'\t' -v target="$log" '$3==target {d=$4} END {print d}' "$reg")
-      if kill "$pid" 2>/dev/null; then
+      if ops_worker_live "$pid" && [ ! -f "$log.exit" ] && kill "$pid" 2>/dev/null; then
         printf '%s\t%s\n' "$n" "$dir" >>"$paused"
         echo "paused $n"
       fi
@@ -102,8 +103,17 @@ flag=$(mktemp); done_n=$(mktemp); trap 'ctrash "$flag" "$done_n" >/dev/null' EXI
 age() { m=$(( (now - $1) / 60 )); [ $m -lt 60 ] && echo "${m}m" || echo "$((m / 60))h$((m % 60))m"; }
 # A pid counts only while it is still a worker process, Codex or harness_run.py (pids get reused).
 # ps can be blind inside a sandboxed shell, so also trust kill -0 and a log written in the last 3 minutes.
-alive() { ps -p "$1" -o command= 2>/dev/null | grep -qE 'codex|harness_run' || kill -0 "$1" 2>/dev/null \
-  || { [ -n "${2:-}" ] && ! grep -q '^tokens used' "$2" && [ $((now - $(stat -f %m "$2" 2>/dev/null || echo 0))) -lt 180 ]; }; }
+alive() {
+  [ -z "${2:-}" ] || [ ! -f "$2.exit" ] || return 1
+  _batch_cmd=$(ps -p "$1" -o command= 2>/dev/null)
+  printf '%s\n' "$_batch_cmd" | grep -qE 'codex|harness_run' && return 0
+  # A hidden ps result can still have a live PID; a visible unrelated command is reuse.
+  if [ -n "${2:-}" ] && [ -f "$2.run" ]; then
+    [ -z "$_batch_cmd" ] && kill -0 "$1" 2>/dev/null; return
+  fi
+  kill -0 "$1" 2>/dev/null || { [ -n "${2:-}" ] && ! ops_completed "$2" &&
+    [ $((now - $(stat -f %m "$2" 2>/dev/null || echo 0))) -lt 180 ]; }
+}
 is_acked() { grep -qx "$1" "$acked"; }
 # Why a worker stopped: last error-looking line of its log (secret-looking lines skipped), ~80 chars.
 cause() { m=$(tail -200 "$1" 2>/dev/null | grep -E "${2:-ERROR|[Ee]rror:|panic|Killed|capacity|usage limit|rate limit|exit code|stream disconnected}")
@@ -117,14 +127,25 @@ cause() { m=$(tail -200 "$1" 2>/dev/null | grep -E "${2:-ERROR|[Ee]rror:|panic|K
     name=$(basename "$log" .log)
     mt=$(stat -f %m "$log" 2>/dev/null || echo "$start")
     if is_paused "$name"; then st="paused (batches resume $name)"
+    elif [ -f "$log.exit" ]; then
+      rc=$(sed -n 's/^rc=\([^ ]*\) ended=.*/\1/p' "$log.exit")
+      if ops_reported "$log"; then
+        echo x >>"$done_n"; [ $all -eq 1 ] || continue; st="done"
+      elif is_acked "$name"; then continue
+      elif [ "${rc:-0}" -lt 128 ] 2>/dev/null && tail -5 "$log" 2>/dev/null | grep -q '^ERROR:'; then
+        st="ERRORED ($(tail -5 "$log" | cause /dev/stdin '^ERROR:' | sed 's/^ERROR: //')) -> wk $name -r"; echo 1 >"$flag"
+      else st="DIED (rc=${rc:-unknown}$([ -s "$log.last" ] || printf ', no report')): $(cause "$log")"; echo 1 >"$flag"; fi
     elif alive "$pid" "$log"; then
       if [ $((now - mt)) -gt $((stall * 60)) ]; then
         is_acked "$name" && [ $all -eq 0 ] && continue
         st="STALLED log quiet $(age "$mt")"; is_acked "$name" || echo 1 >"$flag"
       else st="running $(age "$start")"; fi
+    elif [ -f "$log.run" ]; then
+      is_acked "$name" && continue
+      st="DIED (no exit record; killed hard): $(cause "$log")"; echo 1 >"$flag"
     elif tail -5 "$log" 2>/dev/null | grep -q '^ERROR:' && ! is_acked "$name"; then
       st="ERRORED ($(tail -5 "$log" | cause /dev/stdin '^ERROR:' | sed 's/^ERROR: //')) -> wk $name -r"; echo 1 >"$flag"
-    elif grep -q '^tokens used' "$log" 2>/dev/null; then
+    elif ops_reported "$log"; then
       echo x >>"$done_n"; [ $all -eq 1 ] || continue; st="done"
     elif is_acked "$name"; then continue
     else st="DIED (no report): $(cause "$log")"; echo 1 >"$flag"; fi

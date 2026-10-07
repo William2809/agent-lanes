@@ -1,7 +1,7 @@
 #!/bin/sh
 # ABOUTME: Launches one external worker through the Codex CLI or another harness (WK_HARNESS: cursor, opencode, pi, omp;
 # ABOUTME: harness_run.py writes their logs in the Codex shape); models, efforts and sandbox limits come from presets (ao-model).
-# ABOUTME: Runs detached; writes the transcript to <log> and the process id to <log>.pid.
+# ABOUTME: Runs detached; records metadata, final message, exit status and the real worker PID next to <log>.
 # Usage: run-worker.sh [--lead] <model> <effort> <sandbox> <repo-dir> <prompt-file> <log-file>
 #   model/effort: any model in the presets (`ao-model ls`); effort minimal|low|medium|high|xhigh
 #   sandbox:      read-only | workspace-write | full-access, at most what that model's presets allow
@@ -11,7 +11,9 @@
 set -eu
 tool_root=$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)
 tool_rev=$(git -C "$tool_root" rev-parse HEAD 2>/dev/null || echo unknown)
-. "$tool_root/skills/agent-workers/scripts/state.sh"
+_run_scripts="$tool_root/skills/agent-workers/scripts"
+. "$_run_scripts/state.sh"
+. "$_run_scripts/run-record.sh"
 cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}
 # shellcheck disable=SC1090
 [ -f "$cfg" ] && . "$cfg"
@@ -29,9 +31,8 @@ if [ "$harness" != codex ]; then
   [ -d "$dir" ] || { echo "repo dir not found: $dir" >&2; exit 1; }
   [ -s "$prompt" ] || { echo "prompt file empty or missing: $prompt" >&2; exit 1; }
   mkdir -p "$(dirname "$log")"
-  WK_ROUTE=$preset_route nohup python3 "$tool_root/skills/agent-workers/scripts/harness_run.py" run "$harness" "$model" "$effort" "$sandbox" "$dir" "$prompt" </dev/null >"$log" 2>&1 &
-  echo $! >"$log.pid"
-  ops_register "$!" "$log" "$dir" "$sandbox" "${WK_PRESET:-}"
+  ops_run_record "$log" "${WK_PRESET:-}" "$harness" "$preset_route" "$model" "$effort" "$sandbox" "$dir" ""
+  WK_ROUTE=$preset_route ops_launch "$log" "$dir" "$sandbox" "${WK_PRESET:-}" python3 "$_run_scripts/harness_run.py" run "$harness" "$model" "$effort" "$sandbox" "$dir" "$prompt"
   echo "$log"; exit 0
 fi
 if [ $lead -eq 1 ]; then
@@ -48,11 +49,10 @@ codex=${CODEX_BIN:-$(command -v codex || true)}
 [ -d "$dir" ] || { echo "repo dir not found: $dir" >&2; exit 1; }
 [ -s "$prompt" ] || { echo "prompt file empty or missing: $prompt" >&2; exit 1; }
 mkdir -p "$(dirname "$log")"
+record_route=$preset_route; [ $lead -eq 0 ] || record_route=$AGENT_LANES_LEAD_PROFILE
+ops_run_record "$log" "${WK_PRESET:-}" codex "$record_route" "$model" "$effort" "$sandbox" "$dir" ""
 # shellcheck disable=SC2086  # $route is intentionally split into flag + value
-nohup "$codex" exec $route --model "$model" \
+ops_launch "$log" "$dir" "$sandbox" "${WK_PRESET:-}" "$codex" exec $route --color never -o "$log.last" --model "$model" \
   -c "model_reasoning_effort=\"$effort\"" -s "$sandbox" --skip-git-repo-check \
-  -C "$dir" "$(cat "$prompt")" </dev/null >"$log" 2>&1 &
-echo $! >"$log.pid"
-# Registry read by batches.sh, so a worker that dies is noticed.
-ops_register "$!" "$log" "$dir" "$sandbox" "${WK_PRESET:-}"
+  -C "$dir" "$(cat "$prompt")"
 echo "$log"

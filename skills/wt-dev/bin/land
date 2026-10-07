@@ -76,11 +76,31 @@ tree_clean() {
 }
 command -v migcheck >/dev/null && { migcheck "$wt" || fail "migration journal (renumber with a newer when) $(at)"; }
 
-# 2. Baseline once, on the tip.
-if [ -f "$wt/tools/check-file-size.mjs" ]; then
-  out=$(cd "$wt" && node tools/check-file-size.mjs --update 2>&1) || { keep_tail; printf "%s\n" "$out" | tail -8; fail "file-size ratchet $(at)"; }
-  git -C "$wt" diff --quiet -- tools/file-size-baseline.json ||
-    { git -C "$wt" commit -q -m "chore(tooling): lower file-size baseline" -- tools/file-size-baseline.json; echo "baseline lowered"; }
+# 2. Optional repo baseline once, on the tip. Settings come from the main checkout's .wt-dev.conf
+# only: a lane's own copy is candidate code and must not choose what runs here.
+LAND_BASELINE_CMD="" LAND_BASELINE_FILES=""
+if [ -f "$main/.wt-dev.conf" ]; then
+  LAND_BASELINE_CMD=$(. "$main/.wt-dev.conf" >/dev/null 2>&1; printf '%s' "${LAND_BASELINE_CMD:-}")
+  LAND_BASELINE_FILES=$(. "$main/.wt-dev.conf" >/dev/null 2>&1; printf '%s' "${LAND_BASELINE_FILES:-}")
+fi
+if [ -n "${LAND_BASELINE_CMD:-}" ]; then
+  [ -n "${LAND_BASELINE_FILES:-}" ] || fail "baseline needs LAND_BASELINE_FILES $(at)"
+  out=$(cd "$wt" && sh -c "$LAND_BASELINE_CMD" 2>&1) || { keep_tail; printf '%s\n' "$out" | tail -8; fail "baseline $(at)"; }
+  # Literal paths only; shell globs must not widen the commit or the clean-tree guard.
+  set -f
+  set -- .
+  for f in $LAND_BASELINE_FILES; do set -- "$@" ":(literal,exclude)$f"; done
+  changed=$(git -C "$wt" status --porcelain --untracked-files=no -- "$@")
+  [ -z "$changed" ] || { printf '%s\n' "$changed" | head -5; fail "baseline changed tracked files outside LAND_BASELINE_FILES $(at)"; }
+  set --
+  for f in $LAND_BASELINE_FILES; do set -- "$@" ":(literal)$f"; done
+  git -C "$wt" add -- "$@" || fail "baseline files $(at)"
+  if ! git -C "$wt" diff --cached --quiet -- "$@"; then
+    git -C "$wt" commit -q -m "chore(tooling): update baseline" -- "$@" || fail "baseline commit $(at)"
+    echo "baseline updated"
+  fi
+  set +f
+  tree_clean baseline
 fi
 
 # 3. Preflight: seconds-cheap guards that otherwise cost a full remote round.

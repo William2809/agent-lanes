@@ -1,10 +1,11 @@
 #!/bin/sh
-# ABOUTME: Prints a finished worker's final report (the text after its last "tokens used" line).
+# ABOUTME: Prints a worker's final message sidecar, with legacy transcript fallback.
 # ABOUTME: Flags logs that ended without a report, such as provider or startup errors.
 # Usage: report.sh <log-file> [<log-file> ...]
 for log in "$@"; do
   echo "=================== $log"
-  n=$(awk '/^tokens used/{n=NR} END{print n+0}' "$log")
+  if [ -s "$log.last" ]; then cat "$log.last"; continue; fi
+  n=$(awk '/^(\033\[[0-9;]*m)*tokens used/{n=NR} END{print n+0}' "$log")
   if [ "$n" -eq 0 ]; then
     echo "NO REPORT (still running, or failed). Last lines:"; tail -15 "$log"
   elif [ -z "$(tail -n +"$((n + 2))" "$log" | tr -d '[:space:]')" ]; then

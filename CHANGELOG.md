@@ -4,6 +4,30 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-07
+
+### Added
+
+- Run records: every worker attempt writes `<log>.run` (preset, harness, model, effort, sandbox, folder, tool revision, the launching Claude Code session), `<log>.last` (its final message) and `<log>.exit` (`rc=N ended=EPOCH`). A small supervisor keeps the registered PID the real worker, so `batches pause` still stops it. `batches`, `report.sh`, `mq`, `wk` and `session-stats` read these files first and fall back to the transcript only for runs started before this release. Before, every tool decided "finished" by finding a `tokens used` line in the transcript, which broke when Codex started to colour it.
+- Claude Code mods in `mods/`: `workers` (status band, `/workers` pane, and a prompt to the lead session when one of its workers finishes or fails) and `guards` (blocks risky commands; force pushes and pushes to main/staging need "Allow once"). Install with `claude plugin marketplace add` and `claude plugin install`. `GUARDS_BLOCK_SUBAGENT_MODELS` lists subagent models to block; none by default.
+- `html-shots` (ui-shots): screenshots of a local HTML file at several widths, light or dark, with one PNG per CSS selector; for pages the browser extension cannot scroll, such as a published Artifact.
+- `discuss` skill: a discussion mode that reads and talks but changes nothing until the owner says to start, then writes the decisions to a notes file.
+- `land` runs an optional baseline step from the main checkout's `.wt-dev.conf`: `LAND_BASELINE_CMD` on the stack tip, committing only `LAND_BASELINE_FILES`. A lane's own `.wt-dev.conf` cannot set it.
+
+### Changed
+
+- `land` no longer runs `tools/check-file-size.mjs` by itself. Projects that relied on it set `LAND_BASELINE_CMD='node tools/check-file-size.mjs --update'` and `LAND_BASELINE_FILES='tools/file-size-baseline.json'` in the main checkout's `.wt-dev.conf`.
+- `remote-ci` pass keys include a hash of the runner scripts that run the check, so a pass recorded by older scripts is not reused. Existing passes miss once after the update.
+- Codex workers run with `--color never`, and their final message goes to `<log>.last`.
+
+### Fixed
+
+- `remote-ci` ran the same check twice when two lanes or a retry submitted the same tree. A run now claims its tree on the runner; an identical run follows the running one and takes its result, and a run that waited for a slot checks the pass cache again before it starts. A stale claim (dead owner, or a PID now used by another program) is taken over; an owner whose suite still runs answers busy. Followers' `--summary` shows the owner's failing tests.
+- `wt-dev` passed Postgres URLs with their passwords as `psql`, `pg_dump`, `createdb` and `pg_restore` arguments, visible in `ps`. The password now goes to the client through its environment.
+- `wt-dev rm` reused one hold folder for SQLite files between runs and did not check the rollback `mv`. Each run gets a fresh folder, and a failed rollback names the held files.
+- Two `wt-dev new` at once could pick the same port. Ports are reserved during setup.
+- `batches`, `report.sh`, `mq`, `wk` and `session-stats` saw finished Codex workers as died: Codex 0.160 writes its `tokens used` line with colour codes. `wk -r` could not read a coloured session header.
+
 ## [0.7.0] - 2026-10-06
 
 ### Changed
@@ -102,7 +126,10 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 - First public release: `wk`, `mq` with `land`, `ao-model` presets, `ctrash`, and the skills `agent-workers`, `model-presets`, `remote-ci`, `session-stats`, `ui-audit`, `ui-shots`, `wt-compare` and `wt-dev`.
 - README example setup with a laptop and a second Mac as the check runner.
 
-[Unreleased]: ../../compare/v0.5.0...HEAD
+[Unreleased]: ../../compare/v0.8.0...HEAD
+[0.8.0]: ../../compare/v0.7.0...v0.8.0
+[0.7.0]: ../../compare/v0.6.0...v0.7.0
+[0.6.0]: ../../compare/v0.5.0...v0.6.0
 [0.5.0]: ../../compare/v0.4.0...v0.5.0
 [0.4.0]: ../../compare/v0.3.0...v0.4.0
 [0.3.0]: ../../compare/v0.2.0...v0.3.0
