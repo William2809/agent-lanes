@@ -1,8 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Context, Summary } from '../types'
-import { isProblem, lastTitle, notices, originLabel, origins, parse, repoOf } from './parse'
+import type { Collection, Context, Delivery, RunRecord, Summary } from '../types'
+import { events, identity, isProblem, lastTitle, notices, originLabel, origins, parse, remember, repoOf } from './parse'
 import { short, sparkline, weather } from './weather'
 
 const PANE = 'workers'
@@ -17,28 +17,129 @@ const isNudged = atom({ plugin: 'workers', key: 'isNudged' } as const, false)
 
 let isPolling = false
 
-// Run outside any repo: batches then skips its worktree scan (0.8 s, not 5 s).
-async function poll($: EngineInterface) {
+const DAY = 86_400
+const DELIVERED = 'delivered-runs-v1'
+
+// Read only run metadata and exit records, never transcripts. A private registry
+// per repo gives the name-only batches output a repo identity without changing state.
+export const COLLECT = String.raw`
+import json, os, pathlib, re, subprocess, sys, tempfile, time
+home = pathlib.Path(sys.argv[1])
+cutoff = float(sys.argv[2])
+state = home / '.claude/state'
+records = []
+metadata = {}
+root = state / 'logs'
+for folder in sorted(root.iterdir()) if root.exists() else []:
+    if not folder.is_dir():
+        continue
+    for path in folder.glob('*.log.run'):
+        if path.stat().st_mtime < cutoff:
+            continue
+        try:
+            raw = path.read_text()
+            values = dict(line.split('=', 1) for line in raw.splitlines() if '=' in line)
+            started = int(values.get('started', '0'))
+            run_id = values.get('run_id', '')
+            if started < cutoff or not run_id:
+                continue
+            physical = str(path)[:-4]
+            name = pathlib.Path(physical).name[:-4]
+            # ops_archive moves the same attempt; it must not become a new notice.
+            name = re.sub(r'\.[0-9]{4}-[0-9]{6}\.[0-9]+$', '', name)
+            log = str(folder / (name + '.log'))
+            record = dict(log=log, recordLog=physical, runId=run_id, repo=folder.name,
+                          name=name, dir=values.get('dir', ''), started=started,
+                          session=values.get('lead_session', ''), status='unknown')
+            exit_path = pathlib.Path(physical + '.exit')
+            if exit_path.exists():
+                terminal = re.fullmatch(r'rc=(-?[0-9]+) ended=([0-9]+)\s*', exit_path.read_text())
+                if terminal and int(terminal[2]) >= started:
+                    record['rc'] = int(terminal[1])
+            if path.read_text() != raw:
+                raise RuntimeError('run changed during scan')
+            metadata[physical] = (path, raw)
+            records.append(record)
+        except FileNotFoundError:
+            continue
+registry_path = state / 'workers.tsv'
+registry = registry_path.read_text() if registry_path.exists() else ''
+latest = {}
+for line in registry.splitlines():
+    fields = line.split('\t')
+    if len(fields) >= 4 and fields[2] in metadata:
+        latest[fields[2]] = line
+scopes = {}
+for log, line in latest.items():
+    scopes.setdefault(pathlib.Path(log).parent.name, []).append(line)
+batches = []
+deadline = time.monotonic() + 12
+with tempfile.TemporaryDirectory(prefix='workers-poll-') as tmp:
+    for repo, rows in sorted(scopes.items()):
+        scoped_home = pathlib.Path(tmp) / repo
+        scoped_state = scoped_home / '.claude/state'
+        scoped_state.mkdir(parents=True)
+        (scoped_state / 'workers.tsv').write_text('\n'.join(rows) + '\n')
+        # Preserve user pause/ack choices. batches writes only in the private state.
+        for filename in ('acked', 'paused-workers.tsv'):
+            source = state / filename
+            if source.exists():
+                (scoped_state / filename).write_bytes(source.read_bytes())
+        env = dict(os.environ, HOME=str(scoped_home))
+        result = subprocess.run([str(home / '.local/bin/batches')], cwd=tmp, env=env,
+                                capture_output=True, text=True, timeout=max(0.1, deadline-time.monotonic()))
+        if result.returncode not in (0, 3):
+            raise RuntimeError('batches poll failed')
+        batches.append(dict(repo=repo, text=result.stdout))
+# Fence status attribution if a same-name replacement started while batches ran.
+for path, raw in metadata.values():
+    if path.read_text() != raw:
+        raise RuntimeError('run changed during poll')
+print(json.dumps(dict(batches=batches, runs=records)))
+`
+
+async function collect($: EngineInterface, home: string, cutoff: number): Promise<Collection> {
+  const ran = await $.process.run(['python3', '-c', COLLECT, home, String(cutoff)], { cwd: home, timeoutMs: 15_000 })
+  if (ran.exitCode !== 0) throw new Error('worker records poll failed')
+  return JSON.parse(ran.stdout) as Collection
+}
+
+async function poll($: EngineInterface, notify = true) {
   if (isPolling) return
   isPolling = true
+  let before: Summary | null = null
   try {
+    before = await read($, summary)
     const home = (await $.env.get('HOME')) ?? '/'
-    const ran = await $.process.run([`${home}/.local/bin/batches`], { cwd: home, timeoutMs: 15_000 })
-    // Exit 3 means something needs the lead; it still printed the list.
-    const failed = ran.exitCode !== 0 && ran.exitCode !== 3
-    const next: Summary = failed
-      ? { workers: [], finished: 0, checkedAt: await $.clock.now(), error: ran.stderr.trim().slice(0, 120) || `exit ${ran.exitCode}` }
-      : await withOrigins($, home, { ...parse(ran.stdout), checkedAt: await $.clock.now() })
-    const before = await read($, summary)
-    await update($, summary, () => next)
-    if (before && !failed) {
-      announce($, before, next)
-      // Wake the lead for its own workers: a turn of its own once the session is idle.
-      const text = notices(before.workers, next.workers, await $.session.id())
-      if (text) void $.prompt.submit({ text })
+    const checkedAt = await $.clock.now()
+    const cutoff = checkedAt / 1000 - DAY
+    const data = await collect($, home, cutoff)
+    const next = await withOrigins($, home, data, checkedAt)
+    const mine = await $.session.id()
+    const deliveryKey = `${DELIVERED}:${mine}`
+    const saved = await $.store.get(deliveryKey)
+    const delivered: Delivery[] = Array.isArray(saved) ? saved : []
+    const fresh = events(data.runs, delivered, mine)
+    const text = notices(fresh)
+    if (text && notify) {
+      // Save before enqueueing. A failed enqueue restores history so it can retry.
+      await $.store.set(deliveryKey, remember(delivered, fresh, cutoff))
+      try {
+        const sent = await $.prompt.submit({ text })
+        if (sent.drop !== undefined) throw new Error('worker prompt was not queued')
+      } catch (error) {
+        await $.store.set(deliveryKey, delivered)
+        throw error
+      }
+      announce($, fresh)
     }
-  } catch (error) {
-    await update($, summary, () => ({ workers: [], finished: 0, checkedAt: Date.now(), error: String(error).slice(0, 120) }))
+    await update($, summary, () => next)
+  } catch {
+    // A failed read never replaces the last good workers or the delivery history.
+    await update($, summary, () => ({
+      workers: before?.workers ?? [], finished: before?.finished ?? 0,
+      checkedAt: before?.checkedAt ?? 0, error: 'worker poll failed',
+    }))
   } finally {
     isPolling = false
   }
@@ -55,46 +156,30 @@ async function titleOf($: EngineInterface, home: string, session: { id: string; 
   if (title) titles.set(session.id, title)
 }
 
-// Failed workers may belong to another session or project: say whose they are.
-async function withOrigins($: EngineInterface, home: string, now: Summary): Promise<Summary> {
-  if (now.workers.length === 0) return now
-  try {
-    const ran = await $.process.run(['tail', '-n', '500', `${home}/.claude/state/workers.tsv`], { timeoutMs: 5_000 })
-    const known = origins(ran.stdout)
-    const mine = await $.session.id()
-    const lead = new Map<string, string>()
-    for (const w of now.workers) {
-      const origin = known.get(w.name)
-      if (origin?.session) await titleOf($, home, origin.session)
-      if (origin?.log) {
-        const ran = await $.process.run(['sed', '-n', 's/^lead_session=//p', `${origin.log}.run`], { timeoutMs: 5_000 })
-        const id = ran.stdout.trim().split('\n')[0]
-        if (id) lead.set(w.name, id)
-      }
+// Scoped batches rows match only current logs in that repo. Run ID comes from
+// the fenced metadata scan; archived exits still reach events even with no row.
+async function withOrigins($: EngineInterface, home: string, data: Collection, checkedAt: number): Promise<Summary> {
+  const known = origins(data.runs)
+  const mine = await $.session.id()
+  const workers: Summary['workers'] = []
+  let finished = 0
+  for (const scope of data.batches) {
+    const rows = parse(scope.text)
+    finished += rows.finished
+    for (const w of rows.workers) {
+      const run = data.runs.find(r => r.repo === scope.repo && r.name === w.name && r.recordLog === r.log)
+      if (!run) continue
+      run.status = w.status
+      const origin = known.get(identity(run))
+      if (origin?.session?.slug) await titleOf($, home, origin.session)
+      workers.push({ ...w, log: run.log, runId: run.runId, repo: run.repo, session: run.session, origin: originLabel(origin, mine, titles) })
     }
-    return {
-      ...now,
-      workers: now.workers.map(w => {
-        const origin = known.get(w.name)
-        const session = lead.get(w.name) ?? origin?.session?.id
-        const label = session && !origin?.session ? { ...origin!, session: { id: session, slug: '' } } : origin
-        return { ...w, session, origin: originLabel(label, mine, titles) }
-      }),
-    }
-  } catch (error) {
-    return { ...now, workers: now.workers.map(w => ({ ...w, origin: `origin lookup failed: ${String(error).slice(0, 60)}` })) }
   }
+  return { workers, finished, checkedAt }
 }
 
-function announce($: EngineInterface, before: Summary, now: Summary) {
-  const was = new Map(before.workers.map(w => [w.name, w.status]))
-  const is = new Map(now.workers.map(w => [w.name, w.status]))
-  for (const [name, status] of was) {
-    if (status === 'running' && !is.has(name)) $.ui.toast(`Worker ${name} finished`)
-  }
-  for (const [name, status] of is) {
-    if (isProblem(status) && was.get(name) !== status) $.ui.toast(`Worker ${name} ${status} (${now.workers.find(w => w.name === name)?.origin ?? 'unknown'})`)
-  }
+function announce($: EngineInterface, fresh: RunRecord[]) {
+  for (const run of fresh) $.ui.toast(`Worker ${run.repo}/${run.name} ${run.rc === 0 && !isProblem(run.status) ? 'done' : 'failed'} (${run.runId})`)
 }
 
 async function measure($: EngineInterface) {
@@ -136,7 +221,8 @@ export const register: Register = on => {
   on('command.run', { command: 'workers' }, async $ => {
     await update($, detail, () => 'Loading…')
     await $.ui.open({ id: PANE, title: 'Workers' })
-    await poll($)
+    // The host forbids prompt submission while command.run holds the turn.
+    await poll($, false)
     const ran = await $.process.run([`${(await $.env.get('HOME')) ?? ''}/.local/bin/batches`], { timeoutMs: 30_000 })
     await update($, detail, () => (ran.stdout + ran.stderr).trim() || 'No workers.')
     return { text: 'Workers pane opened.' }
@@ -145,11 +231,12 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const text = (await read($, detail)) ?? 'Run /workers to load.'
-    const from = new Map((await read($, summary))?.workers.map(w => [w.name, w.origin]) ?? [])
+    const workers = (await read($, summary))?.workers ?? []
     return (
       <Box flexDirection="column">
         {text.split('\n').map(line => {
-          const origin = from.get(line.split(/\s+/)[0] ?? '')
+          const matches = workers.filter(w => w.name === (line.split(/\s+/)[0] ?? ''))
+          const origin = matches.length === 1 ? matches[0]?.origin : undefined
           return (
             <Box gap={1}>
               <Text dimColor={line.startsWith('wt ') || line.startsWith('(')} wrap="truncate-end">{line}</Text>

@@ -6,7 +6,8 @@ load_project() {
   dir=$ci/projects/$project
   # shellcheck disable=SC1091
   . "${2:-$dir/conf}"
-  : "${REMOTE_CI_CHECK:=pnpm run check}" "${REMOTE_CI_TIMEOUT:=1500}" "${REMOTE_CI_SLOTS:=1}"
+  : "${REMOTE_CI_CHECK:=pnpm run check}" "${REMOTE_CI_TIMEOUT:=1500}" "${REMOTE_CI_WAIT_TIMEOUT:=10800}" "${REMOTE_CI_SLOTS:=1}"
+  case "$REMOTE_CI_WAIT_TIMEOUT" in *[!0-9]* | "" | 0*) echo "REMOTE_CI_WAIT_TIMEOUT must be a positive integer" >&2; return 2 ;; esac
   case "$REMOTE_CI_SLOTS" in *[!0-9]* | "" | 0*) echo "REMOTE_CI_SLOTS must be a positive integer" >&2; return 2 ;; esac
   if [ -n "${REMOTE_CI_TEMPLATE_INPUTS:-}" ] && { [ -z "${REMOTE_CI_POSTGRES:-}" ] || [ -z "${REMOTE_CI_DB_PREPARE:-}" ]; }; then
     echo "template inputs require REMOTE_CI_POSTGRES and REMOTE_CI_DB_PREPARE" >&2; return 2
@@ -57,13 +58,25 @@ slots_active() {
   for f in "$ci"/projects/*/slots/*.lock; do lock_live "$f" && return 0; done
   return 1
 }
+# Each guard attempt has its own bound, including during final cleanup.
+acquire_lock() {
+  local deadline=$(( $(date +%s) + 60 ))
+  if [ -n "${2:-}" ] && [ "$2" -lt "$deadline" ]; then deadline=$2; fi
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! lock_live "$1" && /usr/bin/shlock -f "$1" -p $$; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
 acquire_guard() {
   [ "${guard_owned:-0}" = 1 ] && return 0
-  until ! lock_live "$ci/lock" && /usr/bin/shlock -f "$ci/lock" -p $$; do sleep 1; done
+  acquire_lock "$ci/lock" || return 1
   guard_owned=1
 }
 release_guard() {
-  rm -f "$ci/lock"
+  if [ "${guard_owned:-0}" = 1 ] && [ "$(cat "$ci/lock" 2>/dev/null)" = "$$" ]; then
+    rm -f "$ci/lock"
+  fi
   guard_owned=0
 }
 stop_idle_postgres() {

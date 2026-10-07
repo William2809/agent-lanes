@@ -65,7 +65,7 @@ class RunRecordTests(unittest.TestCase):
         self.assertRegex(self.finish('r1'), r'^rc=0 ended=\d+\n$')
         record = self.record('r1')
         self.assertEqual(set(record), {'run_id', 'started', 'preset', 'harness', 'route', 'model',
-                                      'effort', 'sandbox', 'dir', 'tool_rev', 'resume_of', 'lead_session'})
+                                      'effort', 'sandbox', 'dir', 'tool_rev', 'resume_of', 'lead_session', 'worker_pid', 'worker_birth'})
         self.assertEqual(record['harness'], 'codex')
         self.assertEqual(record['preset'], 'build')
         self.assertEqual(record['dir'], str(self.f.lanes['a']))
@@ -78,7 +78,7 @@ class RunRecordTests(unittest.TestCase):
         self.assertNotIn('transcript commentary', report)
         args = (self.f.root / 'codex-args').read_text().splitlines()
         self.assertEqual(args[args.index('--color') + 1], 'never')
-        self.assertEqual(args[args.index('-o') + 1], str(self.side('r1', '.last')))
+        self.assertEqual(args[args.index('-o') + 1], str(self.log('r1')) + '.' + record['run_id'] + '.last')
 
     def test_nonzero_exit_wins_over_legacy_marker_and_report(self):
         self.start(FAKE_WORKER_MODE='die')
@@ -213,6 +213,51 @@ class RunRecordTests(unittest.TestCase):
                    'ops_run_record "$2" build codex codex gpt-6.1-sol medium workspace-write "$3" ""',
                    'sh', str(SCRIPTS), str(log), str(self.f.lanes['a']))
 
+    def test_delayed_supervisor_rejects_replacement_before_start(self):
+        log = self.log('r1')
+        log.parent.mkdir(parents=True, exist_ok=True)
+        self.make_record(log)
+        old_id = self.record('r1')['run_id']
+        self.make_record(log)
+        before = {s: self.side('r1', s).read_text() for s in ('.run', '.last')}
+        result = self.f.run('sh', str(SCRIPTS / 'supervise-worker.sh'), str(log),
+                            str(self.f.lanes['a']), 'workspace-write', 'build', old_id,
+                            str(self.f.shims / 'codex'), '-o', str(log) + '.' + old_id + '.last',
+                            check=False)
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse((self.f.root / 'codex-args').exists())
+        self.assertFalse((self.f.home / '.claude/state/workers.tsv').exists())
+        for suffix in ('.pid', '.exit'):
+            self.assertFalse(self.side('r1', suffix).exists())
+        for suffix, value in before.items():
+            self.assertEqual(self.side('r1', suffix).read_text(), value)
+
+    def test_reaper_does_not_refresh_abandoned_lock_age(self):
+        lock = self.f.state / 'launch.lock'
+        (lock / 'reap').mkdir(parents=True)
+        (lock / 'reap/pid').write_text('99999999\n')
+        os.utime(lock, (1, 1))
+        result = self.f.run('sh', '-c', '. "$1/state.sh"; ops_try_lock "$2"',
+                            'sh', str(SCRIPTS), str(lock), check=False)
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue((lock / 'pid').read_text().strip().isdigit())
+
+    def test_dead_launcher_lock_keeps_live_supervisor_handoff(self):
+        lock = self.f.state / 'launch.lock'
+        lock.mkdir(parents=True)
+        (lock / 'pid').write_text('99999999\n')
+        proc = subprocess.Popen(['/bin/sleep', '120'])
+        try:
+            (lock / 'handoff').write_text(str(proc.pid) + '\n')
+            os.utime(lock / 'handoff', (1, 1))
+            result = self.f.run('sh', '-c', '. "$1/state.sh"; ops_try_lock "$2"',
+                                'sh', str(SCRIPTS), str(lock), check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual((lock / 'handoff').read_text(), str(proc.pid) + '\n')
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
     def test_replaced_attempt_cannot_publish_old_exit(self):
         for replacement_exit in ('', 'rc=0 ended=1\n'):
             with self.subTest(replacement_exit=replacement_exit):
@@ -223,8 +268,8 @@ class RunRecordTests(unittest.TestCase):
                 old_id = self.record(name)['run_id']
                 with log.open('w') as stream:
                     proc = subprocess.Popen(['sh', str(SCRIPTS / 'supervise-worker.sh'), str(log),
-                                             str(self.f.lanes['a']), 'workspace-write', 'build',
-                                             str(self.f.shims / 'codex'), '-o', str(self.side(name, '.last'))],
+                                             str(self.f.lanes['a']), 'workspace-write', 'build', old_id,
+                                             str(self.f.shims / 'codex'), '-o', str(log) + '.' + old_id + '.last'],
                                             env={**self.f.env, 'FAKE_WORKER_MODE': 'hold'},
                                             stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT)
                 pid = None
@@ -237,8 +282,11 @@ class RunRecordTests(unittest.TestCase):
                     self.assertNotEqual(self.record(name)['run_id'], old_id)
                     if replacement_exit:
                         self.side(name, '.exit').write_text(replacement_exit)
+                    self.side(name, '.last').write_text('replacement report\n')
+                    Path(str(log) + '.' + old_id + '.last').write_text('old report\n')
                     os.kill(pid, signal.SIGTERM)
                     self.assertEqual(proc.wait(timeout=10), 0)
+                    self.assertEqual(self.side(name, '.last').read_text(), 'replacement report\n')
                     if replacement_exit:
                         self.assertEqual(self.side(name, '.exit').read_text(), replacement_exit)
                     else:
@@ -276,12 +324,135 @@ class RunRecordTests(unittest.TestCase):
         os.kill(pid, signal.SIGTERM)
         self.finish('r1')
 
-    def test_pause_keeps_hidden_ps_fallback(self):
+    def test_registration_records_worker_birth_identity(self):
         self.start(FAKE_WORKER_MODE='hold')
+        pid = self.side('r1', '.pid').read_text().strip()
+        birth = self.f.run('ps', '-p', pid, '-o', 'lstart=', env={'LC_ALL': 'C'}).stdout.strip()
+        record = self.record('r1')
+        self.assertEqual(record.get('worker_pid'), pid)
+        self.assertEqual(record.get('worker_birth'), birth)
+        self.assertTrue(birth)
+
+    def test_pause_refuses_hidden_ps_without_signalling(self):
+        self.start(FAKE_WORKER_MODE='hold')
+        pid = self.side('r1', '.pid').read_text().strip()
         self.f.shim('ps', '#!/bin/sh\nexit 1\n')
         result = self.f.run(str(SCRIPTS / 'batches.sh'), 'pause', 'r1')
-        self.assertEqual(result.stdout.strip(), 'paused r1')
-        self.assertTrue(self.finish('r1').startswith('rc=143 '))
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(result.stderr.strip(), 'cannot pause r1: worker identity unavailable or changed')
+        self.f.run('kill', '-0', pid)
+        self.assertFalse((self.f.home / '.claude/state/paused-workers.tsv').exists())
+        os.kill(int(pid), signal.SIGTERM)
+        self.finish('r1')
+
+    def test_pause_refuses_birth_change_after_listing(self):
+        self.start(FAKE_WORKER_MODE='hold')
+        pid = self.side('r1', '.pid').read_text().strip()
+        birth = self.f.run('ps', '-p', pid, '-o', 'lstart=', env={'LC_ALL': 'C'}).stdout.strip()
+        self.f.shim('ps', '#!/bin/sh\ncase "$*" in *lstart=*) '
+                         'if [ -f "$FIXTURE_ROOT/birth-listed" ]; then echo changed-birth; '
+                         'else touch "$FIXTURE_ROOT/birth-listed"; echo "$FIXTURE_BIRTH"; fi ;; '
+                         '*) echo codex ;; esac\n')
+        result = self.f.run(str(SCRIPTS / 'batches.sh'), 'pause', 'r1', env={'FIXTURE_BIRTH': birth})
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(result.stderr.strip(), 'cannot pause r1: worker identity unavailable or changed')
+        self.f.run('kill', '-0', pid)
+        os.kill(int(pid), signal.SIGTERM)
+        self.finish('r1')
+
+    def test_pause_refuses_worker_registered_with_hidden_birth(self):
+        self.f.shim('ps', '#!/bin/sh\nexit 1\n')
+        self.start(FAKE_WORKER_MODE='hold')
+        self.f.shim('ps', '#!/bin/sh\nexec /bin/ps "$@"\n')
+        result = self.f.run(str(SCRIPTS / 'batches.sh'), 'pause', 'r1')
+        self.assertEqual(result.stdout, '')
+        self.assertEqual(result.stderr.strip(), 'cannot pause r1: worker identity unavailable or changed')
+        self.f.run('kill', '-0', self.side('r1', '.pid').read_text().strip())
+
+    def test_visible_birth_mismatch_ends_named_wait_without_exit(self):
+        self.start(FAKE_WORKER_MODE='hold')
+        self.f.shim('ps', '#!/bin/sh\ncase "$*" in *lstart=*) echo changed-birth ;; *) echo codex ;; esac\n')
+        self.assertEqual(self.mq_running().returncode, 1)
+        self.named_wait()
+        self.assertRegex(self.status().stdout, r'r1 +DIED')
+
+    def quiet(self):
+        # Wait for the stub header before changing mtime; registration can finish first.
+        until = time.monotonic() + 5
+        while not (self.f.root / 'codex-child.pid').exists() and time.monotonic() < until:
+            time.sleep(0.02)
+        self.assertTrue((self.f.root / 'codex-child.pid').exists())
+        os.utime(self.log('r1'), (1, 1))
+
+    def mq_running(self):
+        source = (ROOT / 'bin/mq').read_text()
+        begin = source.index('running() {')
+        helper = source[begin:source.index('\n\n# Shared', begin)]
+        script = '. "$1/state.sh"; main=$2; ' + helper + '\nrunning r1'
+        return self.f.run('sh', '-c', script, 'sh', str(SCRIPTS), str(self.f.repo), check=False)
+
+    def test_hidden_ps_stalled_worker_blocks_queue(self):
+        self.start(FAKE_WORKER_MODE='hold')
+        self.quiet()
+        self.f.shim('ps', '#!/bin/sh\nexit 1\n')
+        self.f.shim('batches', '#!/bin/sh\necho "r1 STALLED log quiet"\n')
+        self.assertRegex(self.status().stdout, r'r1 +STALLED')
+        self.assertEqual(self.mq_running().returncode, 0)
+
+    def test_hidden_ps_stalled_worker_blocks_writer_guard(self):
+        self.start(FAKE_WORKER_MODE='hold')
+        self.quiet()
+        self.f.shim('ps', '#!/bin/sh\nexit 1\n')
+        result = self.f.wk('second', '-d', 'a', '-t', 'fixture:new',
+                           env={'WK_FORCE': '0'}, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('r1 is already writing', result.stderr)
+        self.assertFalse(self.side('second', '.run').exists())
+
+    def test_exit_record_releases_writer_guard_with_live_pid(self):
+        self.start(FAKE_WORKER_MODE='hold')
+        self.side('r1', '.exit').write_text('rc=0 ended=1\n')
+        result = self.f.run('sh', '-c', '. "$1/state.sh"; . "$1/run-record.sh"; '
+                            'ops_writer_guard "$2" "$3" workspace-write',
+                            'sh', str(SCRIPTS), str(self.f.repo), str(self.f.lanes['a']),
+                            env={'WK_FORCE': '0'}, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def named_wait(self, env=None):
+        proc = subprocess.Popen([str(SCRIPTS / 'batches.sh'), 'wait', 'r1'],
+                                cwd=self.f.repo, env={**self.f.env, **(env or {})},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        try:
+            out, err = proc.communicate(timeout=2)
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertEqual(out.strip(), 'r1 finished')
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGTERM)
+            proc.communicate(timeout=5)
+
+    def test_named_wait_obeys_exit_even_with_live_registry_pid(self):
+        self.start(FAKE_WORKER_MODE='hold')
+        self.side('r1', '.exit').write_text('rc=0 ended=1\n')
+        self.named_wait()
+
+    def test_unnamed_wait_keeps_hidden_stalled_worker_until_exit(self):
+        self.start(FAKE_WORKER_MODE='hold')
+        self.quiet()
+        self.f.shim('ps', '#!/bin/sh\nexit 1\n')
+        self.f.shim('sleep', '#!/bin/sh\nprintf "rc=0 ended=1\\n" >"$WAIT_LOG.exit"\n')
+        result = self.f.run(str(SCRIPTS / 'batches.sh'), 'wait', env={'WAIT_LOG': str(self.log('r1'))})
+        self.assertEqual(result.stdout.strip(), 'r1 finished')
+        self.assertTrue(self.side('r1', '.exit').exists())
+
+    def test_named_wait_keeps_hidden_stalled_worker_until_exit(self):
+        self.start(FAKE_WORKER_MODE='hold')
+        self.quiet()
+        self.f.shim('ps', '#!/bin/sh\nexit 1\n')
+        self.f.shim('sleep', '#!/bin/sh\nprintf "rc=0 ended=1\\n" >"$WAIT_LOG.exit"\n')
+        self.named_wait({'WAIT_LOG': str(self.log('r1'))})
+        self.assertTrue(self.side('r1', '.exit').exists())
 
     def test_mq_running_exit_overrides_live_pid_and_batches(self):
         self.start(FAKE_WORKER_MODE='hold')
@@ -304,6 +475,85 @@ class RunRecordTests(unittest.TestCase):
         result = self.f.run('sh', str(SCRIPTS / 'report.sh'), str(self.log('r1'))).stdout
         self.assertIn('NO REPORT', result)
         self.assertIn('ERROR: startup failed', result)
+
+    def test_legacy_provider_stays_separate_from_profile_on_repeated_resume(self):
+        log = self.f.worker('legacy', 'a', 'workspace-write', at=int(time.time()))
+        log.write_text('provider: openai\n' + log.read_text())
+        self.f.run(str(ROOT / 'bin/wk'), 'legacy', '-r', 'continue')
+        self.finish('legacy')
+        self.assertEqual(self.record('legacy')['route'], 'codex')
+        self.assertIn('model_provider="openai"', (self.f.root / 'codex-args').read_text())
+        self.f.run(str(ROOT / 'bin/wk'), 'legacy', '-r', 'continue again')
+        self.finish('legacy')
+        self.assertNotIn('--profile', (self.f.root / 'codex-args').read_text().splitlines())
+
+    def test_recorded_profile_survives_resume(self):
+        self.start()
+        self.finish('r1')
+        record = self.side('r1', '.run')
+        record.write_text(record.read_text().replace('route=codex\n', 'route=fixture-profile\n'))
+        self.f.run(str(ROOT / 'bin/wk'), 'r1', '-r', 'continue')
+        self.finish('r1')
+        args = (self.f.root / 'codex-args').read_text().splitlines()
+        self.assertEqual(args[args.index('--profile') + 1], 'fixture-profile')
+        self.assertEqual(self.record('r1')['route'], 'fixture-profile')
+
+    def paused_file(self):
+        return self.f.home / '.claude/state/paused-workers.tsv'
+
+    def pause_worker(self):
+        self.start(FAKE_WORKER_MODE='hold')
+        self.f.run(str(SCRIPTS / 'batches.sh'), 'pause', 'r1')
+        self.finish('r1')
+        self.assertRegex(self.status().stdout, r'r1 +paused')
+
+    def test_new_attempt_retires_paused_marker_for_resume_and_fresh_launch(self):
+        for resume in (True, False):
+            with self.subTest(resume=resume):
+                self.pause_worker()
+                old_id = self.record('r1')['run_id']
+                with self.paused_file().open('a') as stream:
+                    stream.write('other\t/other\tother-run\n')
+                if resume:
+                    self.f.run(str(ROOT / 'bin/wk'), 'r1', '-r', 'continue')
+                else:
+                    self.start()
+                self.finish('r1')
+                self.assertNotEqual(self.record('r1')['run_id'], old_id)
+                self.assertRegex(self.status().stdout, r'r1 +done')
+                self.assertNotIn('r1\t', self.paused_file().read_text())
+                self.assertIn('other\t/other\tother-run\n', self.paused_file().read_text())
+
+    def test_pause_marker_belongs_to_registered_attempt(self):
+        self.pause_worker()
+        row = self.paused_file().read_text().strip().split('\t')
+        self.assertEqual(row, ['r1', str(self.f.lanes['a']), self.record('r1')['run_id']])
+
+    def test_status_ignores_pause_marker_for_another_attempt(self):
+        self.start()
+        self.finish('r1')
+        self.paused_file().write_text('r1\t' + str(self.f.lanes['a']) + '\told-run\n')
+        self.assertRegex(self.status().stdout, r'r1 +done')
+
+    def test_refused_resume_keeps_paused_marker(self):
+        self.pause_worker()
+        before = self.paused_file().read_text()
+        run_id = self.record('r1')['run_id']
+        result = self.f.run(str(ROOT / 'bin/wk'), 'r1', '-r', 'continue',
+                            env={'WK_MAX_WRITERS': '0'}, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.paused_file().read_text(), before)
+        self.assertEqual(self.record('r1')['run_id'], run_id)
+
+    def test_batches_resume_preserves_other_pause_changes(self):
+        self.pause_worker()
+        self.f.shim('wk', '#!/bin/sh\nprintf "other\\t/other\\tother-run\\n" >>"$HOME/.claude/state/paused-workers.tsv"\n'
+                         'exec "$REAL_WK" "$@"\n')
+        result = self.f.run(str(SCRIPTS / 'batches.sh'), 'resume', 'r1', env={'REAL_WK': str(ROOT / 'bin/wk')})
+        self.assertEqual(result.stdout.strip(), 'resumed r1')
+        self.finish('r1')
+        self.assertNotIn('r1\t', self.paused_file().read_text())
+        self.assertIn('other\t/other\tother-run\n', self.paused_file().read_text())
 
     def test_colored_legacy_log_and_resume(self):
         log = self.f.worker('legacy', 'a', 'workspace-write', at=int(time.time()))

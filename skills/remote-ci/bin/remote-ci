@@ -21,7 +21,7 @@ remote-ci log [-C n] <regex>                                           grep the 
 remote-ci info                                                         one-line route, ssh command, ports, paths (cheap lookup)
 remote-ci setup                                                        prepare the runner for this project
 remote-ci init                                                         add .remote-ci.conf + pre-push hook here
-Exit codes: check result, 3 = runner unreachable, 75 = busy (all slots unavailable).
+Exit codes: check result, 3 = runner unreachable, 74 = lost run/infrastructure failure, 75 = busy.
 USAGE
 }
 cmd=${1:-}; shift || true
@@ -56,6 +56,8 @@ fi
 : "${REMOTE_CI_NAME:?set REMOTE_CI_NAME in .remote-ci.conf}"
 case "$REMOTE_CI_NAME" in *[!a-zA-Z0-9_.-]*|''|.|..) echo 'remote-ci: unsafe project name' >&2; exit 2 ;; esac
 case "${REMOTE_CI_SLOTS:-1}" in *[!0-9]* | "" | 0*) [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: REMOTE_CI_SLOTS must be a positive integer" >&2; exit 2 ;; esac
+: "${REMOTE_CI_WAIT_TIMEOUT:=10800}"
+case "$REMOTE_CI_WAIT_TIMEOUT" in *[!0-9]* | "" | 0*) echo 'remote-ci: REMOTE_CI_WAIT_TIMEOUT must be a positive integer' >&2; exit 2 ;; esac
 
 base=(-o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 # A clean environment like an ssh session: the lane's DATABASE_URL, NODE_ENV and PATH must not reach the run.
@@ -88,6 +90,51 @@ fi
 remote() { "${ssh_cmd[@]}" "$@" 2>&1 | grep -v '^Pseudo-terminal'; return "${PIPESTATUS[0]}"; }
 p="~/ci/projects/$REMOTE_CI_NAME"
 
+# One client deadline covers submission, queue, all commands and cleanup.
+# A local watchdog also bounds a live SSH connection that stops returning data.
+wait_remote() {
+  local remaining payload wait_child wait_watchdog rc
+  remaining=$((wait_deadline - $(date +%s)))
+  if [ "$remaining" -le 0 ]; then
+    echo "lost-run: run $run total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds (log $p/logs/$run.log)"
+    return 74
+  fi
+  payload="deadline=\$(( \$(date +%s) + $remaining ))
+    await_file() {
+      while [ ! -f \"\$1\" ]; do
+        if [ \"\$(date +%s)\" -ge \"\$deadline\" ]; then
+          echo 'lost-run: run $run total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds (log $p/logs/$run.log)'
+          exit 74
+        fi
+        sleep 1
+      done
+    }
+    $1"
+  if [ "$route" = local ]; then
+    perl -e 'setpgrp(0,0); exec @ARGV' env -i HOME="$HOME" USER="$user" LOGNAME="$user" SHELL=/bin/bash PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash -c "cd ~ && $payload" &
+  else
+    perl -e 'setpgrp(0,0); exec @ARGV' "${ssh_cmd[@]}" "$payload" &
+  fi
+  wait_child=$!
+  perl -e 'setpgrp(0,0); exec @ARGV' /bin/bash -c '
+    while [ "$(date +%s)" -lt "$1" ]; do
+      kill -0 "$2" 2>/dev/null || exit 0
+      sleep 1
+    done
+    kill -TERM -"$2" 2>/dev/null
+    sleep 1; kill -KILL -"$2" 2>/dev/null
+  ' _ "$wait_deadline" "$wait_child" &
+  wait_watchdog=$!
+  wait "$wait_child" 2>/dev/null; rc=$?
+  kill -TERM -"$wait_watchdog" 2>/dev/null || kill -TERM "$wait_watchdog" 2>/dev/null
+  wait "$wait_watchdog" 2>/dev/null
+  if [ "$rc" != 0 ] && [ "$rc" != 74 ] && [ "$(date +%s)" -ge "$wait_deadline" ]; then
+    echo "lost-run: run $run total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds (log $p/logs/$run.log)"
+    return 74
+  fi
+  return "$rc"
+}
+
 snapshot_kit() {
   [ -z "$kit_snapshot" ] || return 0
   kit_snapshot=$(mktemp -d) || return 1
@@ -96,7 +143,12 @@ snapshot_kit() {
 sync_kit() {
   snapshot_kit || return 1
   local run_dir=""
-  [ -n "${1:-}" ] && run_dir="$p/runs/$1"
+  if [ -n "${1:-}" ]; then
+    run_dir="$p/runs/$1"
+    remote "umask 077; mkdir -p $p/runs && mkdir $run_dir 2>/dev/null" || {
+      echo "remote-ci: cannot reserve run directory $run_dir"; return 1;
+    }
+  fi
   # Runner scripts and this project's config travel on every call, so changes apply at once.
   tar -C "$kit_snapshot" -cf - . | remote 'mkdir -p ~/ci/bin; tmp=$(mktemp -d ~/ci/bin/.sync.XXXXXX) && tar -C "$tmp" -xf - && for f in "$tmp"/*; do mv -f "$f" ~/ci/bin/; done; rmdir "$tmp"' || return 1
   remote "mkdir -p $p; tmp=\$(mktemp $p/.conf.XXXXXX) && chmod 600 \"\$tmp\" && cat >\"\$tmp\" && mv -f \"\$tmp\" $p/conf" <"$conf" || return 1
@@ -182,7 +234,11 @@ if [ "$force" = 0 ] && [ -z "$command" ] && remote "test -f $p/results/tree-$tre
   echo "remote-ci: this exact code already passed on the runner ($route); skipping."
   exit 0
 fi
-run=$(date +%Y%m%d-%H%M%S)-${sha:0:8}-$$
+wait_deadline=$(( $(date +%s) + REMOTE_CI_WAIT_TIMEOUT ))
+nonce=$(openssl rand -hex 12) || { echo "remote-ci: cannot create run ID" >&2; exit 1; }
+case "$nonce" in *[!0-9a-f]* | "") echo "remote-ci: invalid random run ID" >&2; exit 1 ;; esac
+[ "${#nonce}" = 24 ] || { echo "remote-ci: invalid random run ID" >&2; exit 1; }
+run=$(date +%Y%m%d-%H%M%S)-${sha:0:8}-$$-$nonce
 sync_kit "$run" || exit 1
 remote "test -f $p/.ready" || remote "bash ~/ci/bin/setup.sh $REMOTE_CI_NAME" || exit 1
 # One ref per run, so parallel callers never overwrite each other's commit while queued.
@@ -192,8 +248,8 @@ encoded=$(printf '%s' "$command" | base64)
 remote "nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$encoded' $force </dev/null >/dev/null 2>&1 &" || exit 1
 # If this connection drops, the run still finishes and cleans up on the runner (see: remote-ci status).
 if [ "$summary" = 1 ]; then
-  remote "done=$p/results/$run.exit
-    while [ ! -f \$done ]; do sleep 2; done
+  wait_remote "done=$p/results/$run.exit
+    await_file \"\$done\"
     log=$p/logs/$run.log
     followed=\$(sed -n 's/^== following run \([a-zA-Z0-9_.-][a-zA-Z0-9_.-]*\) sha .*/\1/p' \"\$log\" | head -1)
     set -- \"\$log\"
@@ -201,15 +257,16 @@ if [ "$summary" = 1 ]; then
       set -- \"\$@\" $p/logs/\$followed.log
     fi
     sed 's/\x1b\[[0-9;]*m//g' \"\$@\" |
-      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|== following|== cached:|== timing|== finished|maximum resident' |
+      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|lost-run:|== following|== cached:|== timing|== finished|maximum resident' |
       sed 's/^[^ :]*:[a-z:-]*: *//' | awk '!seen[\$0]++' | head -60
     exit \$(cat \$done)"
   rc=$?
   echo "remote-ci: full log on the runner at $p/logs/$run.log"
   exit $rc
 fi
-remote "log=$p/logs/$run.log; done=$p/results/$run.exit
-  while [ ! -f \$log ]; do sleep 1; done
+wait_remote "log=$p/logs/$run.log; done=$p/results/$run.exit
+  await_file \"\$log\"
   tail -n +1 -f \$log & t=\$!
-  while [ ! -f \$done ]; do sleep 2; done
-  sleep 1; kill \$t; exit \$(cat \$done)"
+  trap 'kill \"\$t\" 2>/dev/null; wait \"\$t\" 2>/dev/null' EXIT HUP INT TERM
+  await_file \"\$done\"
+  sleep 1; exit \$(cat \$done)"

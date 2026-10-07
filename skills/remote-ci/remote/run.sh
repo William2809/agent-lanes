@@ -18,14 +18,24 @@ force=${6:-0}
 log=$dir/logs/$run.log
 exec >"$log" 2>&1
 submitted=$(date +%s)
+wait_deadline=$((submitted + REMOTE_CI_WAIT_TIMEOUT))
 child="" watchdog="" locked=0 slot=0 template_lock="" pg_started=0 guard_owned=0 template_locked=0
 claim=$dir/results/tree-$tree.running
-claim_owned=0 cache_result=0
+claim_owned=0 cache_result=0 claim_guard_owned=0
 work=$dir/work
 base_db=$REMOTE_CI_DB
 role=ci
+acquire_claim_guard() {
+  [ "$claim_guard_owned" = 1 ] && return 0
+  acquire_lock "$claim.guard" "${1:-}" || return 1
+  claim_guard_owned=1
+}
+release_claim_guard() {
+  [ "$claim_guard_owned" = 1 ] && rm -f "$claim.guard"
+  claim_guard_owned=0
+}
 finish() {
-  local rc=${1:-1} cleanup_start owner_filter=""
+  local rc=${1:-1} cleanup_start owner_filter="" published=0 claim_pid="" claim_run=""
   trap '' HUP INT TERM
   if [ -n "$watchdog" ]; then
     kill -TERM -"$watchdog" 2>/dev/null || kill -TERM "$watchdog" 2>/dev/null
@@ -56,85 +66,117 @@ SQL
   fi
   if [ "$locked" = 1 ]; then
     if [ "$REMOTE_CI_SLOTS" -gt 1 ]; then
-      acquire_guard
-      rm -f "$dir/slots/$slot.lock" "$dir/slots/$slot.run"
+      if acquire_guard; then
+        rm -f "$dir/slots/$slot.lock" "$dir/slots/$slot.run"
+      else
+        echo "lost-run: run $run cleanup guard unavailable after 60 seconds; slot retained"
+        rc=74
+      fi
     fi
-    stop_idle_postgres
-    release_guard
+    if [ "$guard_owned" = 1 ]; then
+      stop_idle_postgres
+      release_guard
+    fi
   fi
   git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null
+  if [ "$claim_owned" = 1 ] && ! acquire_claim_guard; then
+    echo "lost-run: run $run claim release guard unavailable after 60 seconds; claim retained"
+    rc=74
+  fi
+  echo "== timing cleanup $(( $(date +%s) - cleanup_start ))s"
+  echo "== timing total $(( $(date +%s) - submitted ))s (including queue)"
+  # Publish completion atomically after resource cleanup. Keep the claim guard
+  # until publication and ownership-checked release have both completed.
+  if echo "$rc" >"$dir/results/$run.exit.new" &&
+     mv "$dir/results/$run.exit.new" "$dir/results/$run.exit"; then
+    published=1
+  else
+    echo "lost-run: run $run terminal result could not be published (log $log)"
+    rc=74
+    [ "$cache_result" = 1 ] && rm -f "$dir/results/tree-$tree.pass"
+  fi
   if [ "$cache_result" = 1 ]; then
     if [ "$rc" = 0 ]; then echo "$sha" >"$dir/results/tree-$tree.pass"
     else rm -f "$dir/results/tree-$tree.pass"; fi
   fi
-  echo "== timing cleanup $(( $(date +%s) - cleanup_start ))s"
-  echo "== timing total $(( $(date +%s) - submitted ))s (including queue)"
   echo "== finished rc=$rc $(date '+%F %T')"
-  # Publish completion atomically after cleanup, logging and slot release.
-  echo "$rc" >"$dir/results/$run.exit.new"
-  mv "$dir/results/$run.exit.new" "$dir/results/$run.exit"
-  if [ "$claim_owned" = 1 ]; then
-    rm -f "$claim.run" "$claim"
-    claim_owned=0
+  if [ "$claim_guard_owned" = 1 ]; then
+    read -r claim_pid claim_run 2>/dev/null <"$claim.run" || true
+    if [ "$published" = 1 ] && [ "$claim_pid" = "$$" ] && [ "$claim_run" = "$run" ]; then
+      rm -f "$claim.run" "$claim"
+    fi
+    release_claim_guard
   fi
+  claim_owned=0
+  exit "$rc"
 }
-trap 'finish 1; exit 1' HUP INT TERM
+trap 'finish 1' HUP INT TERM
+# 0: runner, 1: dead/invalid PID, 2: positively another program, 3: unobservable.
 run_live() {
+  local owner_command
   case "$1" in *[!0-9]* | "" | 0) return 1 ;; esac
-  kill -0 "$1" 2>/dev/null && ps -p "$1" -o command= 2>/dev/null | grep -q 'run.sh'
+  kill -0 "$1" 2>/dev/null || return 1
+  owner_command=$(ps -p "$1" -o command= 2>/dev/null) || return 3
+  [ -n "$owner_command" ] || return 3
+  case "$owner_command" in *run.sh*) return 0 ;; *) return 2 ;; esac
 }
-busy_claim() { echo "busy: $*"; finish 75; exit 75; }
+busy_claim() { echo "busy: $*"; finish 75; }
 # shlock publishes the PID atomically. The sidecar binds that PID to a run ID;
 # readers wait for matching metadata rather than following a previous owner.
 if [ -z "$command" ] && [ "$force" = 0 ]; then
   while :; do
+    acquire_claim_guard "$wait_deadline" || busy_claim "tree claim guard wait reached the guard or total deadline"
     owner_pid="" followed=""
     read -r owner_pid followed 2>/dev/null <"$claim.run" || true
-    if [ -n "$followed" ] && ! run_live "$owner_pid" && run_child_live "$followed" "$owner_pid"; then
+    owner=$(cat "$claim" 2>/dev/null)
+    run_live "$owner"; owner_state=$?
+    if [ "$owner_state" = 3 ]; then
+      release_claim_guard
+      busy_claim "cannot inspect owner pid $owner; keeping tree claim"
+    fi
+    if [ "$owner_state" != 0 ] && [ -n "$followed" ] && run_child_live "$followed" "$owner_pid"; then
+      release_claim_guard
       busy_claim "run $followed still has a live slot child (log $dir/logs/$followed.log)"
     fi
+    if [ "$owner_state" = 2 ]; then
+      echo "== stale tree claim (pid $owner is not run.sh); replacing it"
+      rm -f "$claim" "$claim.run"
+    fi
     if /usr/bin/shlock -f "$claim" -p $$; then
-      # The owner may die between inspection and shlock. Preserve its metadata
-      # if a child still runs, so the next retry can make the same check.
-      owner_pid="" followed=""
-      read -r owner_pid followed 2>/dev/null <"$claim.run" || true
       if [ -n "$followed" ] && run_child_live "$followed" "$owner_pid"; then
         rm -f "$claim"
+        release_claim_guard
         busy_claim "run $followed still has a live slot child (log $dir/logs/$followed.log)"
       fi
+      claim_owned=1
+      printf '%s %s\n' "$$" "$run" >"$claim.run.new"
+      mv "$claim.run.new" "$claim.run"
+      release_claim_guard
       break
     fi
+    release_claim_guard
     [ $(( $(date +%s) - submitted )) -lt 300 ] || busy_claim "tree claim metadata unavailable after 300 seconds"
-    owner=$(cat "$claim" 2>/dev/null)
-    case "$owner" in *[!0-9]* | "" | 0) sleep 1; continue ;; esac
-    if kill -0 "$owner" 2>/dev/null && ! run_live "$owner"; then
-      # The pid was reused by another program: the claim is stale, so take it over.
-      echo "== stale tree claim (pid $owner is not run.sh); replacing it"
-      rm -f "$claim" "$claim.run"; continue
-    fi
-    if [ "$owner" = "$owner_pid" ] && [ -n "$followed" ] && run_live "$owner"; then
+    [ "$(date +%s)" -lt "$wait_deadline" ] || busy_claim "tree claim total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds"
+    if [ "$owner" = "$owner_pid" ] && [ -n "$followed" ] && [ "$owner_state" = 0 ]; then
       echo "== following run $followed sha $sha (log $dir/logs/$followed.log)"
-      follow_started=$(date +%s)
       while [ ! -f "$dir/results/$followed.exit" ]; do
-        [ $(( $(date +%s) - follow_started )) -lt "$REMOTE_CI_TIMEOUT" ] ||
-          busy_claim "followed run $followed exceeded $REMOTE_CI_TIMEOUT seconds (log $dir/logs/$followed.log)"
-        if ! run_live "$owner"; then
+        [ "$(date +%s)" -lt "$wait_deadline" ] ||
+          busy_claim "followed run $followed total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds (log $dir/logs/$followed.log)"
+        run_live "$owner"; owner_state=$?
+        if [ "$owner_state" = 1 ] || [ "$owner_state" = 2 ]; then
           # Recheck publication after death: finish writes the exit before releasing its claim.
           [ -f "$dir/results/$followed.exit" ] && break
-          echo "Error: followed run ended without a result (log $dir/logs/$followed.log)"
-          finish 1; exit 1
+          echo "lost-run: followed run $followed ended without a result (log $dir/logs/$followed.log)"
+          finish 74
         fi
         sleep 1
       done
       rc=$(cat "$dir/results/$followed.exit")
       [ "$rc" = 0 ] || echo "Error: followed run rc=$rc (log $dir/logs/$followed.log)"
-      finish "$rc"; exit "$rc"
+      finish "$rc"
     fi
     sleep 1
   done
-  claim_owned=1
-  printf '%s %s\n' "$$" "$run" >"$claim.run.new"
-  mv "$claim.run.new" "$claim.run"
 fi
 mkdir -p "$dir/slots"
 while [ "$locked" = 0 ]; do
@@ -160,27 +202,27 @@ while [ "$locked" = 0 ]; do
     if [ "$REMOTE_CI_SLOTS" -gt 1 ] || [ "$locked" = 0 ]; then release_guard; fi
   fi
   [ "$locked" = 1 ] && break
-  if [ $(( $(date +%s) - submitted )) -ge 300 ]; then
+  if [ "$(date +%s)" -ge "$wait_deadline" ] || [ $(( $(date +%s) - submitted )) -ge 300 ]; then
     echo "busy: all $REMOTE_CI_SLOTS slots unavailable (or exclusive runner/prune active)"
-    finish 75; exit 75
+    finish 75
   fi
   sleep 2
 done
 if [ -z "$command" ] && [ "$force" = 0 ] && [ -f "$dir/results/tree-$tree.pass" ]; then
   echo "== cached: identical tree passed while queued"
-  finish 0; exit 0
+  finish 0
 fi
 [ -z "$command" ] && cache_result=1
 started=$(date +%s)
 echo "== $project run $run sha $sha slot $slot/$REMOTE_CI_SLOTS start $(date '+%F %T')"
 echo "== timing queue $((started - submitted))s"
-step() { echo "== $*"; "$@" || { finish 1; exit 1; }; }
+step() { echo "== $*"; "$@" || { finish 1; }; }
 phase() {
   local label=$1 start rc; shift
   start=$(date +%s)
   "$@"; rc=$?
   echo "== timing $label $(( $(date +%s) - start ))s"
-  [ "$rc" = 0 ] || { finish "$rc"; exit "$rc"; }
+  [ "$rc" = 0 ] || { finish "$rc"; }
 }
 supervised() {
   local rc
@@ -220,7 +262,7 @@ phase checkout checkout
 if [ -n "${REMOTE_CI_INSTALL:-}" ]; then
   install_marker=$dir/slots/$(basename "$work").install
   hash_command=$REMOTE_CI_INSTALL
-  install_hash=$(input_hash ${REMOTE_CI_INSTALL_INPUTS:-pnpm-lock.yaml}) || { finish 1; exit 1; }
+  install_hash=$(input_hash ${REMOTE_CI_INSTALL_INPUTS:-pnpm-lock.yaml}) || { finish 1; }
   if [ -d node_modules ] && [ "$(cat "$install_marker" 2>/dev/null)" = "$install_hash" ]; then
     echo "== install cached"; echo "== timing install 0s"
   else
@@ -230,7 +272,10 @@ if [ -n "${REMOTE_CI_INSTALL:-}" ]; then
   fi
 fi
 prepare_database() {
-  [ "$REMOTE_CI_SLOTS" -gt 1 ] && acquire_guard
+  if [ "$REMOTE_CI_SLOTS" -gt 1 ] && ! acquire_guard; then
+    echo "lost-run: run $run database guard unavailable after 60 seconds"
+    return 74
+  fi
   if ! pg_ctl -D "$pgdata" status >/dev/null 2>&1; then
     pg_ctl -D "$pgdata" -l "$ci/pg/$REMOTE_CI_POSTGRES.log" start -w || {
       [ "$REMOTE_CI_SLOTS" -gt 1 ] && release_guard; return 1;
@@ -253,7 +298,10 @@ prepare_database() {
     mkdir -p "$dir/templates"
     template_lock=$dir/templates/$template.lock
     template_start=$(date +%s)
-    until ! lock_live "$template_lock" && /usr/bin/shlock -f "$template_lock" -p $$; do sleep 1; done
+    until ! lock_live "$template_lock" && /usr/bin/shlock -f "$template_lock" -p $$; do
+      [ "$(date +%s)" -lt "$wait_deadline" ] || { echo "busy: template total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds"; return 75; }
+      sleep 1
+    done
     template_locked=1
     echo "== timing template-wait $(( $(date +%s) - template_start ))s"
     template_start=$(date +%s)
@@ -290,4 +338,3 @@ supervised /usr/bin/time -l nice -n 10 /bin/bash -c "$check"; rc=$?
 echo "== timing check $(( $(date +%s) - check_start ))s"
 echo "== timing run $(( $(date +%s) - started ))s (before cleanup)"
 finish "$rc"
-exit "$rc"

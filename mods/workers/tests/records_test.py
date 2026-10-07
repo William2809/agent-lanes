@@ -1,0 +1,149 @@
+"""Exercise the exact embedded collector with real files and subprocesses."""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+SOURCE = (Path(__file__).parent.parent / 'hooks/register.tsx').read_text()
+COLLECT = re.search(r'export const COLLECT = String.raw`(.*?)`', SOURCE, re.S)[1]
+
+STUB = """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+state = Path(os.environ['HOME']) / '.claude/state'
+rows = (state / 'workers.tsv').read_text().splitlines()
+repos = {Path(row.split('\\t')[2]).parent.name for row in rows}
+assert len(repos) == 1, 'registry was not scoped'
+for row in rows:
+    log = Path(row.split('\\t')[2])
+    values = dict(line.split('=', 1) for line in Path(str(log) + '.run').read_text().splitlines() if '=' in line)
+    status = values.get('test_status', 'running')
+    if status == 'poll-failure':
+        sys.exit(1)
+    if status == 'replace':
+        path = Path(str(log) + '.run')
+        path.write_text(path.read_text().replace(values['run_id'], 'replacement'))
+    if status != 'done':
+        print(log.stem, status)
+sys.exit(3)
+"""
+
+
+class Records(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.started = int(time.time())
+        self.state = self.home / '.claude/state'
+        self.state.mkdir(parents=True)
+        self.binary = self.home / '.local/bin/batches'
+        self.binary.parent.mkdir(parents=True)
+        self.binary.write_text(STUB)
+        self.binary.chmod(0o700)
+
+    def record(self, repo, name='review', run_id='one', session='S', rc=None,
+               status='running', register=True, started=None):
+        folder = self.state / 'logs' / repo
+        folder.mkdir(parents=True, exist_ok=True)
+        log = folder / (name + '.log')
+        started = self.started if started is None else started
+        Path(str(log) + '.run').write_text(
+            f'run_id={run_id}\nstarted={started}\nlead_session={session}\n'
+            f'dir=/code/{repo}\ntest_status={status}\nprivate_note=not-output\n')
+        log.write_text('')
+        if rc is not None:
+            Path(str(log) + '.exit').write_text(f'rc={rc} ended={self.started}\n')
+        if register:
+            with (self.state / 'workers.tsv').open('a') as registry:
+                registry.write(f'{started}\t99999999\t{log}\t/code/{repo}\n')
+        return log
+
+    def poll(self):
+        return subprocess.run([sys.executable, '-c', COLLECT, str(self.home),
+                               str(self.started - 86400)], capture_output=True,
+                              text=True, timeout=20)
+
+    def data(self):
+        result = self.poll()
+        self.assertEqual(result.returncode, 0, 'collector failed')
+        self.assertNotIn('private_note', result.stdout)
+        return json.loads(result.stdout)
+
+    def test_scopes_same_name_in_two_repos(self):
+        self.record('a', session='A', status='DIED')
+        self.record('b', session='B', status='STALLED')
+        data = self.data()
+        self.assertEqual([(s['repo'], s['text'].strip()) for s in data['batches']],
+                         [('a', 'review DIED'), ('b', 'review STALLED')])
+        self.assertEqual({r['repo']: r['session'] for r in data['runs']},
+                         {'a': 'A', 'b': 'B'})
+
+    def test_fast_exit_without_registry_and_old_run_filter(self):
+        self.record('a', rc=0, register=False)
+        self.record('b', run_id='failed', rc=137, register=False)
+        self.record('old', rc=0, register=False, started=self.started - 86401)
+        data = self.data()
+        self.assertEqual(data['batches'], [])
+        self.assertEqual(sorted((r['repo'], r['rc']) for r in data['runs']),
+                         [('a', 0), ('b', 137)])
+
+    def test_failure_then_recovery(self):
+        log = self.record('a', status='poll-failure')
+        self.assertNotEqual(self.poll().returncode, 0)
+        path = Path(str(log) + '.run')
+        path.write_text(path.read_text().replace('poll-failure', 'DIED'))
+        self.assertEqual(self.data()['batches'][0]['text'].strip(), 'review DIED')
+
+    def test_stalled_then_exit_is_read_from_records(self):
+        log = self.record('a', status='STALLED')
+        self.assertNotIn('rc', self.data()['runs'][0])
+        Path(str(log) + '.exit').write_text(f'rc=0 ended={self.started}\n')
+        path = Path(str(log) + '.run')
+        path.write_text(path.read_text().replace('STALLED', 'done'))
+        data = self.data()
+        self.assertEqual(data['batches'][0]['text'], '')
+        self.assertEqual(data['runs'][0]['rc'], 0)
+
+    def test_archived_run_keeps_launch_identity(self):
+        physical = self.record('a', name='review.1007-123456.123', rc=0, register=False)
+        record = self.data()['runs'][0]
+        self.assertEqual(record['log'], str(physical.parent / 'review.log'))
+        self.assertEqual(record['recordLog'], str(physical))
+        self.assertEqual(record['name'], 'review')
+
+    def test_replacement_during_batches_fails_the_poll(self):
+        self.record('a', status='replace')
+        self.assertNotEqual(self.poll().returncode, 0)
+
+    def test_invalid_or_older_exit_is_not_terminal(self):
+        log = self.record('a', register=False)
+        path = Path(str(log) + '.exit')
+        path.write_text(f'rc=0 ended={self.started - 1}\n')
+        self.assertNotIn('rc', self.data()['runs'][0])
+        path.write_text('not an exit record')
+        self.assertNotIn('rc', self.data()['runs'][0])
+
+    def test_installed_batches_with_fixture_records(self):
+        installed = Path.home() / '.local/bin/batches'
+        if not installed.exists():
+            self.skipTest('installed batches unavailable')
+        self.binary.unlink()
+        self.binary.symlink_to(installed.resolve())
+        self.record('a', session='A', rc=137)
+        done = self.record('b', session='B', rc=0)
+        Path(str(done) + '.last').write_text('fixture report\n')
+        data = self.data()
+        self.assertIn('DIED', data['batches'][0]['text'])
+        self.assertIn('finished workers', data['batches'][1]['text'])
+        self.assertEqual({r['repo']: r['rc'] for r in data['runs']}, {'a': 137, 'b': 0})
+
+
+if __name__ == '__main__':
+    unittest.main()
