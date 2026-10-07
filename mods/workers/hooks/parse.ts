@@ -1,4 +1,4 @@
-import type { Worker } from '../types'
+import type { Delivery, RunRecord, Worker } from '../types'
 
 // One `batches` worker row: "<name>  <status> ...". Worktree rows ("wt ...")
 // and the "(N finished workers ...)" line are not workers.
@@ -30,28 +30,23 @@ export type Origin = {
   session?: { id: string; slug: string }
   // The transcript log; <log>.run names the launching session (lead_session=).
   log?: string
+  repo?: string
 }
 
-// Where each worker came from, from the registry `wk` keeps (~/.claude/state/workers.tsv):
-// start, pid, log (logs/<project>/<name>.log), working dir. The latest row per name wins.
-export const origins = (registry: string): Map<string, Origin> => {
+// The immutable attempt metadata supplies its directory and launching session.
+export const origins = (runs: RunRecord[]): Map<string, Origin> => {
   const found = new Map<string, Origin>()
-  for (const line of registry.split('\n')) {
-    const [, , log, dir = ''] = line.split('\t')
-    if (!log) continue
-    const parts = log.split('/')
-    const name = (parts.pop() ?? '').replace(/\.log$/, '')
-    const folder = parts.pop()
+  for (const run of runs) {
+    const { log, dir, repo } = run
     const scratch = /\/claude-\d+\/([^/]+)\/([0-9a-f]{8}-[0-9a-f-]{27})\//.exec(dir)
     const worktree = /\/worktrees\/([^/]+)\/([^/]+)/.exec(dir)
-    // wk keeps logs per repo (logs/<repo>/); "w" is the folder for runs outside a repo.
-    const repo = folder && folder !== 'w' ? folder : undefined
     const place = scratch
       ? 'scratch folder'
       : worktree
         ? `${worktree[1]} worktree ${worktree[2]}`
-        : repo ?? 'unknown folder'
-    found.set(name, { place, log, session: scratch ? { slug: scratch[1]!, id: scratch[2]! } : undefined })
+        : repo === 'w' ? 'unknown folder' : repo
+    const session = run.session ? { id: run.session, slug: scratch?.[1] ?? '' } : undefined
+    found.set(identity(run), { place, log, repo, session })
   }
   return found
 }
@@ -76,19 +71,50 @@ export const lastTitle = (grepOutput: string): string | undefined => {
 // The short repo name for the band: "my-app worktree x" → "my-app".
 export const repoOf = (label: string): string => label.split(' · ').pop()!.split(' worktree ')[0]!
 
-// What the lead must hear about its own workers since the last poll: finished ones (gone from
-// the list) and new failures. One prompt per poll; undefined when there is nothing.
-export const notices = (before: Worker[], now: Worker[], mine: string): string | undefined => {
-  const is = new Map(now.map(w => [w.name, w]))
-  const was = new Map(before.map(w => [w.name, w.status]))
-  const lines: string[] = []
-  for (const w of before) {
-    if (w.session === mine && w.status === 'running' && !is.has(w.name)) lines.push(`- ${w.name} finished: read \`batches report ${w.name}\`, verify, continue.`)
+// A basename cannot identify a worker across repos or repeated launches.
+export const identity = (w: Pick<RunRecord, 'log' | 'runId'>): string => JSON.stringify([w.log, w.runId])
+export const isFailure = (status: string): boolean => /^(DIED|ERRORED|STALLED)$/.test(status)
+const quote = (text: string): string => `'${text.replace(/'/g, "'\\''")}'`
+
+// Report by exact log, and resume from the recorded repo directory. Check the run ID
+// before resuming: the same name may already have a replacement attempt.
+export const commands = (run: RunRecord): { report: string; resume: string } => ({
+  report: `test "$(sed -n 's/^run_id=//p' ${quote(`${run.recordLog ?? run.log}.run`)})" = ${quote(run.runId)} && sh ~/.claude/skills/agent-workers/scripts/report.sh ${quote(run.recordLog ?? run.log)}`,
+  resume: `cd ${quote(run.dir)} && test "$(sed -n 's/^run_id=//p' ${quote(`${run.log}.run`)})" = ${quote(run.runId)} && wk ${quote(run.name)} -r`,
+})
+
+// Each run is announced at most twice: once for a live problem (STALLED, DIED without an
+// exit record) and once for its exit record, so a STALLED worker that finishes still wakes the lead.
+export const eventKey = (run: RunRecord): string | undefined =>
+  run.rc !== undefined ? `${identity(run)}:end` : isFailure(run.status) ? `${identity(run)}:problem` : undefined
+
+export const events = (runs: RunRecord[], delivered: Delivery[], mine: string): RunRecord[] => {
+  const sent = new Set(delivered.map(d => d.key))
+  const fresh = new Map<string, RunRecord>()
+  for (const run of runs) {
+    const key = eventKey(run)
+    if (run.session === mine && key && !sent.has(key)) fresh.set(key, run)
   }
-  for (const w of now) {
-    if (w.session === mine && isProblem(w.status) && was.get(w.name) !== w.status) {
-      lines.push(`- ${w.name} ${w.status}${w.detail ? ` ${w.detail}` : ''}: find the cause (log tail, batches report), fix the brief or the tool, resume or relaunch.`)
-    }
-  }
+  return [...fresh.values()]
+}
+
+// One prompt holds every new event. Disappearance is never a completion signal.
+export const notices = (runs: RunRecord[]): string | undefined => {
+  const lines = runs.map(run => {
+    const failed = (run.rc !== undefined && run.rc !== 0) || isFailure(run.status)
+    const command = commands(run)
+    return `- ${run.repo}/${run.name} (${run.runId}) ${failed ? 'failed' : 'done'}${run.rc !== undefined ? ` rc=${run.rc}` : ` ${run.status}`}: read \`${command.report}\`, verify, continue.${failed ? ` Check the cause; resume with \`${command.resume}\` or relaunch.` : ''}`
+  })
   return lines.length ? `[workers mod, automatic] Your workers changed state:\n${lines.join('\n')}` : undefined
+}
+
+export const DELIVERY_LIMIT = 4096
+export const remember = (delivered: Delivery[], runs: RunRecord[], cutoff: number): Delivery[] => {
+  const kept = new Map(delivered.filter(d => d.started >= cutoff).map(d => [d.key, d]))
+  for (const run of runs) {
+    const key = eventKey(run)
+    if (key) kept.set(key, { key, started: run.started })
+  }
+  // Entries leave with the 24 h scan window; past the cap the oldest go first (never block new notices).
+  return [...kept.values()].sort((a, b) => a.started - b.started).slice(-DELIVERY_LIMIT)
 }

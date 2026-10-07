@@ -11,6 +11,7 @@
 #        batches report NAME…  final report of finished workers (report.sh on their logs)
 #        batches overlap   unlanded worktrees that touch the same files (future land conflicts)
 # Exit 3 when something needs the lead (DIED, STALLED). Run inside the repo for worktrees.
+. "$(dirname "$(readlink -f "$0")")/state.sh"
 . "$(dirname "$(readlink -f "$0")")/run-record.sh"
 state="$HOME/.claude/state"; reg="$state/workers.tsv"; acked="$state/acked"; paused="$state/paused-workers.tsv"
 mkdir -p "$state"; touch "$acked"
@@ -18,7 +19,7 @@ mkdir -p "$state"; touch "$acked"
 if [ -s "$state/dock/paused.txt" ]; then
   cat "$state/dock/paused.txt" >>"$paused" && ctrash "$state/dock/paused.txt" >/dev/null || exit 1
 fi
-is_paused() { awk -F'\t' -v n="$1" '$1==n {found=1} END {exit !found}' "$paused" 2>/dev/null; }
+is_paused() { ops_is_paused "$1" "${2:-}"; }
 if [ "${1:-}" = "ack" ]; then shift; for n in "$@"; do echo "$n" >>"$acked"; done; exit 0; fi
 # Latest registry row for a worker name (log basename without .log): "pid<TAB>log".
 row() { awk -F'\t' -v n="$1" '{b=$3; sub(/.*\//,"",b); sub(/\.log$/,"",b)} b==n {r=$2"\t"$3} END {if (r) print r}' "$reg"; }
@@ -31,42 +32,52 @@ case "${1:-}" in
     [ $# -eq 0 ] && set -- $live
     for n in "$@"; do
       printf '%s\n' "$live" | grep -qx "$n" || { echo "$n is not running" >&2; continue; }
-      is_paused "$n" && continue
       r=$(row "$n"); [ -n "$r" ] || continue
       pid=${r%%"$(printf '\t')"*}
       kill -0 "$pid" 2>/dev/null || continue
       log=${r#*"$(printf '\t')"}
+      is_paused "$n" "$log" && continue
       dir=$(awk -F'\t' -v target="$log" '$3==target {d=$4} END {print d}' "$reg")
-      if ops_worker_live "$pid" && [ ! -f "$log.exit" ] && kill "$pid" 2>/dev/null; then
-        printf '%s\t%s\n' "$n" "$dir" >>"$paused"
-        echo "paused $n"
-      fi
+      (
+        ops_lock "$log.record.lock" || exit 1
+        trap 'ops_unlock "$log.record.lock"' EXIT
+        [ ! -f "$log.exit" ] || exit 0
+        if ! ops_worker_live "$pid" "$log" signal; then
+          echo "cannot pause $n: worker identity unavailable or changed" >&2; exit 0
+        fi
+        if [ ! -f "$log.exit" ] && kill "$pid" 2>/dev/null; then
+          ops_pause_record "$n" "$dir" "$(sed -n 's/^run_id=//p' "$log.run")" && echo "paused $n"
+        fi
+      )
     done
     exit 0 ;;
   resume) shift
     [ -s "$paused" ] || { echo "no paused workers"; exit 0; }
-    cp "$paused" "$paused.$(date +%Y%m%d-%H%M%S).$$" || exit 1
-    left="$paused.new"; : >"$left" || exit 1
-    sort -u "$paused" | while IFS="$(printf '\t')" read -r n dir; do
+    snapshot="$paused.$(date +%Y%m%d-%H%M%S).$$"
+    cp "$paused" "$snapshot" || exit 1
+    sort -u "$snapshot" | while IFS="$(printf '\t')" read -r n dir run_id; do
       selected=0; [ $# -eq 0 ] && selected=1
       for wanted in "$@"; do [ "$wanted" = "$n" ] && selected=1; done
-      if [ "$selected" -eq 0 ]; then printf '%s\t%s\n' "$n" "$dir" >>"$left"; continue; fi
+      [ "$selected" -eq 1 ] || continue
+      # Another resume may have accepted a new attempt since the snapshot.
+      r=$(row "$n"); l=${r#*"$(printf '\t')"}
+      if [ -n "$run_id" ] && [ -n "$r" ] && [ "$(sed -n 's/^run_id=//p' "$l.run" 2>/dev/null)" != "$run_id" ]; then
+        echo "$n already resumed"; continue
+      fi
       msg='You were paused. Continue the same task from where you stopped: check git status/diff, finish the remaining steps and checks, then give the final report in the requested format.'
       if [ -n "$dir" ] && (cd "$dir" && wk "$n" -r "$msg" </dev/null) >/dev/null 2>&1; then
         echo "resumed $n"
       else
         echo "FAILED to resume $n" >&2
-        printf '%s\t%s\n' "$n" "$dir" >>"$left"
       fi
     done
-    mv "$left" "$paused"
     exit $? ;;
   wait) shift
     if [ $# -eq 0 ]; then  # no names: block until ANY running worker exits, name it
-      before=$("$0" 2>/dev/null | awk '$2=="running"{print $1}')
+      before=$("$0" 2>/dev/null | awk '$2=="running" || $2=="STALLED"{print $1}')
       [ -n "$before" ] || { echo "no running workers"; exit 0; }
       while sleep 20; do
-        now=$("$0" 2>/dev/null | awk '$2=="running"{print $1}')
+        now=$("$0" 2>/dev/null | awk '$2=="running" || $2=="STALLED"{print $1}')
         gone=$(printf '%s\n' "$before" | grep -vxF "$(printf '%s\n' "$now")")
         [ -n "$now" ] || gone=$before
         [ -n "$gone" ] && { printf '%s finished\n' $gone; exit 0; }
@@ -74,8 +85,10 @@ case "${1:-}" in
     fi
     for n in "$@"; do
       ( r=$(row "$n"); [ -n "$r" ] || { echo "$n unknown"; exit; }
-        pid=${r%%"$(printf '\t')"*}; while kill -0 "$pid" 2>/dev/null; do sleep 10; done
-        l=${r#*"$(printf '\t')"}; tail -5 "$l" 2>/dev/null | grep -q '^ERROR:' && echo "$n ERRORED -> wk $n -r" || echo "$n finished" ) &
+        pid=${r%%"$(printf '\t')"*}; l=${r#*"$(printf '\t')"}
+        run_id=$(sed -n 's/^run_id=//p' "$l.run" 2>/dev/null)
+        while [ "$(sed -n 's/^run_id=//p' "$l.run" 2>/dev/null)" = "$run_id" ] && ops_running "$l" "$pid"; do sleep 10; done
+        tail -5 "$l" 2>/dev/null | grep -q '^ERROR:' && echo "$n ERRORED -> wk $n -r" || echo "$n finished" ) &
     done; wait; exit 0 ;;
   report) shift
     for n in "$@"; do r=$(row "$n"); [ -n "$r" ] && sh "$(dirname "$(readlink -f "$0")")/report.sh" "${r#*"$(printf '\t')"}" || echo "$n unknown"; done
@@ -101,19 +114,7 @@ all=0; [ "${1:-}" = "--all" ] && all=1
 now=$(date +%s); stall=${BATCHES_STALL_MIN:-12}
 flag=$(mktemp); done_n=$(mktemp); trap 'ctrash "$flag" "$done_n" >/dev/null' EXIT
 age() { m=$(( (now - $1) / 60 )); [ $m -lt 60 ] && echo "${m}m" || echo "$((m / 60))h$((m % 60))m"; }
-# A pid counts only while it is still a worker process, Codex or harness_run.py (pids get reused).
-# ps can be blind inside a sandboxed shell, so also trust kill -0 and a log written in the last 3 minutes.
-alive() {
-  [ -z "${2:-}" ] || [ ! -f "$2.exit" ] || return 1
-  _batch_cmd=$(ps -p "$1" -o command= 2>/dev/null)
-  printf '%s\n' "$_batch_cmd" | grep -qE 'codex|harness_run' && return 0
-  # A hidden ps result can still have a live PID; a visible unrelated command is reuse.
-  if [ -n "${2:-}" ] && [ -f "$2.run" ]; then
-    [ -z "$_batch_cmd" ] && kill -0 "$1" 2>/dev/null; return
-  fi
-  kill -0 "$1" 2>/dev/null || { [ -n "${2:-}" ] && ! ops_completed "$2" &&
-    [ $((now - $(stat -f %m "$2" 2>/dev/null || echo 0))) -lt 180 ]; }
-}
+alive() { ops_running "$2" "$1"; }
 is_acked() { grep -qx "$1" "$acked"; }
 # Why a worker stopped: last error-looking line of its log (secret-looking lines skipped), ~80 chars.
 cause() { m=$(tail -200 "$1" 2>/dev/null | grep -E "${2:-ERROR|[Ee]rror:|panic|Killed|capacity|usage limit|rate limit|exit code|stream disconnected}")
@@ -126,7 +127,7 @@ cause() { m=$(tail -200 "$1" 2>/dev/null | grep -E "${2:-ERROR|[Ee]rror:|panic|K
   sort -n | while IFS="$(printf '\t')" read -r start pid log dir; do
     name=$(basename "$log" .log)
     mt=$(stat -f %m "$log" 2>/dev/null || echo "$start")
-    if is_paused "$name"; then st="paused (batches resume $name)"
+    if is_paused "$name" "$log"; then st="paused (batches resume $name)"
     elif [ -f "$log.exit" ]; then
       rc=$(sed -n 's/^rc=\([^ ]*\) ended=.*/\1/p' "$log.exit")
       if ops_reported "$log"; then
@@ -159,7 +160,7 @@ cause() { m=$(tail -200 "$1" 2>/dev/null | grep -E "${2:-ERROR|[Ee]rror:|panic|K
     [ -f "$out.done" ] && continue
     name=$(basename "$out"); is_acked "$name" && continue
     up=0
-    for s in build review fix fix2; do p=$(cat "$out.$s.log.pid" 2>/dev/null) && alive "$p" && up=1; done
+    for s in build review fix fix2; do p=$(cat "$out.$s.log.pid" 2>/dev/null) && alive "$p" "$out.$s.log" && up=1; done
     pgrep -f "pipeline.sh .*$out" >/dev/null && up=1
     [ $up -eq 0 ] && { printf '%-26s pipeline DIED before .done\n' "$name"; echo 1 >"$flag"; }
   done
@@ -169,8 +170,8 @@ if git rev-parse --git-dir >/dev/null 2>&1 && command -v wt-dev >/dev/null; then
   base=$(git rev-parse --abbrev-ref HEAD)
   # Worktree dirs that still host a live worker are busy, never "remove?".
   busy=$(mktemp); trap 'ctrash "$flag" "$done_n" "$busy" >/dev/null' EXIT
-  [ -s "$reg" ] && awk -F'\t' '{print $2"\t"$4}' "$reg" | while IFS="$(printf '\t')" read -r pid dir; do
-    alive "$pid" && echo "$dir"; done >"$busy"
+  [ -s "$reg" ] && awk -F'\t' '{last[$3]=$0} END{for (l in last) print last[l]}' "$reg" | while IFS="$(printf '\t')" read -r at pid log dir; do
+    alive "$pid" "$log" && echo "$dir"; done >"$busy"
   wt-dev ls 2>/dev/null | while read -r name _ url dirty _rest; do
     path=$(wt-dev path "$name" 2>/dev/null) || continue
     ahead=$(git -C "$path" rev-list --count "$base..HEAD" 2>/dev/null || echo 0)

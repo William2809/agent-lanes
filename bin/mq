@@ -62,11 +62,7 @@ main_overlap() { _lp=$(wt-dev path "$1" 2>/dev/null) && [ -d "$_lp" ] || return 
   { git -C "$main" status --porcelain=v1 -uall 2>/dev/null | cut -c4- | sed 's/.* -> //' | grep -v '^\.reviews/'
     echo "--lane--"; git -C "$_lp" diff --name-only "$_mb...HEAD" 2>/dev/null; } |
     awk 'l && ($0 in d) {print; if (++n == 3) exit} $0 == "--lane--" {l = 1; next} !l {d[$0] = 1}' | tr '\n' ' '; }
-running() { [ -n "$1" ] || return 1; f="$HOME/.claude/state/logs/$(basename "$main")/$1.log.pid"
-  [ ! -f "${f%.pid}.exit" ] || return 1
-  # Alive = the pid exists AND is still a worker process (pids get reused; a stranger would wedge the lane).
-  [ -f "$f" ] && ops_agent_pid "$(cat "$f")" && return 0
-  batches 2>/dev/null | awk -v n="$1" '$1==n && $2=="running"{f=1} END{exit !f}'; }
+running() { [ -n "$1" ] && ops_running "$HOME/.claude/state/logs/$(basename "$main")/$1.log"; }
 
 # Shared by add and run: reserve the same atomic lock before detaching a runner.
 lock="$st/run.lock"

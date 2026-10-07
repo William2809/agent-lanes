@@ -38,7 +38,7 @@ if [ "${1:-}" = "-r" ]; then
     exit 1
   fi
   # A worker stopped by `batches pause` is known dead (pid checked above): skip the recent-log guard.
-  paused=$(awk -F'\t' -v n="$name" '$1==n {f=1} END {print f+0}' "$HOME/.claude/state/paused-workers.tsv" 2>/dev/null || echo 0)
+  if ops_is_paused "$name" "$log"; then paused=1; else paused=0; fi
   # A resume that failed at startup leaves a log without a session header: read the newest older log that has one.
   src="$log"
   ops_plain "$log" | head -20 | grep -q '^session id: ' || src=$(ls -t "$logs/$name".[0-9]*-[0-9]*.log 2>/dev/null | while read -r f; do ops_plain "$f" | head -20 | grep -q '^session id: ' && { echo "$f"; break; }; done)
@@ -56,7 +56,7 @@ if [ "${1:-}" = "-r" ]; then
   # The name/log may have been reused while waiting. mq resumes only its own writable lane.
   sid=$(hv "session id"); model=$(hv model); eff=$(hv "reasoning effort"); sb=$(hv sandbox | cut -d" " -f1); dir=$(hv workdir); prov=$(hv provider); h=$(hv harness)
   [ -n "$sid" ] && [ -d "$dir" ] || { echo "cannot read session id/workdir from $log" >&2; exit 1; }
-  preset=resume; record_route=${prov:-codex}; resume_route=""
+  preset=resume; record_route=codex; resume_route=""
   if [ -f "$src.run" ]; then
     rv() { sed -n "s/^$1=//p" "$src.run" | head -1; }
     model=$(rv model); sb=$(rv sandbox); dir=$(rv dir); h=$(rv harness)
@@ -71,13 +71,13 @@ if [ "${1:-}" = "-r" ]; then
   cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}; [ -f "$cfg" ] && . "$cfg"; codex=${CODEX_BIN:-$(command -v codex || true)}
   [ "$eff" = xhigh ] && [ -z "${WK_ALLOW_XHIGH:-}" ] && eff=high  # effort cap: xhigh runs as high unless WK_ALLOW_XHIGH is set
   [ -z "${WK_LAUNCH_INTENT:-}" ] || [ -d "$WK_LAUNCH_INTENT" ] || { echo "wk: repair launch cancelled" >&2; exit 1; }
-  ops_run_record "$log" "$preset" "${h:-codex}" "$record_route" "$model" "$eff" "$sb" "$dir" "$sid"
+  run_id=$(ops_run_record "$log" "$preset" "${h:-codex}" "$record_route" "$model" "$eff" "$sb" "$dir" "$sid")
   if [ -n "$h" ] && [ "$h" != codex ]; then
     [ "$src" = "$log" ] && src=$old
-    (cd "$dir" || exit 1; ops_launch "$log" "$dir" "$sb" "$preset" python3 "$_run_scripts/harness_run.py" resume "$src" "$msg" "$eff")
+    (cd "$dir" || exit 1; ops_launch "$log" "$dir" "$sb" "$preset" "$run_id" python3 "$_run_scripts/harness_run.py" resume "$src" "$msg" "$eff")
     echo "resumed $name ($h $model $eff, $sid); previous log $old"; exit 0
   fi
-  (cd "$dir" || exit 1; ops_launch "$log" "$dir" "$sb" "$preset" "$codex" exec $resume_route --color never resume -o "$log.last" --model "$model" -c "model_reasoning_effort=\"$eff\"" -c "sandbox_mode=\"$sb\"" ${prov:+-c "model_provider=\"$prov\""} \
+  (cd "$dir" || exit 1; ops_launch "$log" "$dir" "$sb" "$preset" "$run_id" "$codex" exec $resume_route --color never resume -o "$log.$run_id.last" --model "$model" -c "model_reasoning_effort=\"$eff\"" -c "sandbox_mode=\"$sb\"" ${prov:+-c "model_provider=\"$prov\""} \
     --skip-git-repo-check "$sid" "$msg")
   echo "resumed $name ($model $eff, $sid); previous log $old"; exit 0
 fi
@@ -164,7 +164,7 @@ case "$hdr" in *"Report style"*) ;; *) hdr="$hdr
 Report style: about 80% ASD-STE100 (short sentences, one fact each, active voice, plain words). Final report fields: Changed: · Verified live: (command → result) · Verified by stub or reasoning only: · Not done / risks:. A claim without a live check never goes under Verified live." ;; esac
 printf '%s\n%s\n' "$hdr" "$body" >"$p"
 [ -z "${WK_LAUNCH_INTENT:-}" ] || [ -d "$WK_LAUNCH_INTENT" ] || { echo "wk: repair launch cancelled" >&2; exit 1; }
-WK_PRESET=$m WK_ROUTE=$route WK_HARNESS=$harness sh "$skills/agent-workers/scripts/run-worker.sh" "$model" "$eff" "$sb" "$dir" "$p" "$log" >/dev/null || { echo "wk: launch of $name FAILED (run-worker refused; see above)" >&2; exit 1; }
+launch_lock=$launch_lock WK_PRESET=$m WK_ROUTE=$route WK_HARNESS=$harness sh "$skills/agent-workers/scripts/run-worker.sh" "$model" "$eff" "$sb" "$dir" "$p" "$log" >/dev/null || { echo "wk: launch of $name FAILED (run-worker refused; see above)" >&2; exit 1; }
 where=""; [ "$dir" = "$main" ] && [ "$sb" != "read-only" ] && where=" — MAIN CHECKOUT (edits land on the branch; use -w for a worktree)"
 # Tags append the tool revision; the first five fields retain their meaning (workers.tsv stays four).
 if [ -n "$tag" ]; then printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$repo" "$name" "${tag%%:*}" "${tag#*:}" "$tool_rev" >>"$HOME/.claude/state/worker-tags.tsv"
