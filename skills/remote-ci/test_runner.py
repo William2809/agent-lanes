@@ -158,11 +158,12 @@ exit "$FIXTURE_RC"
                     self.assertIn('FAIL src/check.test.ts', '\n'.join(
                         failure.latest(self.dir / 'logs', self.sha, tail=True)['summary']))
 
-    def live_owner(self):
+    def live_owner(self, run):
+        # Real owners carry their run ID on the command line (run.sh PROJECT SHA TREE RUN ...).
         path = self.home / 'owner/run.sh'
         path.parent.mkdir(exist_ok=True)
         path.write_text('#!/bin/bash\nwhile :; do sleep 1; done\n')
-        proc = subprocess.Popen(['/bin/bash', str(path)], env=self.env,
+        proc = subprocess.Popen(['/bin/bash', str(path), 'fixture', 'sha', 'tree', run, '', '0'], env=self.env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.procs.append(proc)
         return proc
@@ -201,7 +202,7 @@ exit "$FIXTURE_RC"
         self.assertNotIn('following run', self.log('reused-pid'))
         self.assertIn('stale tree claim', self.log('reused-pid'))
         self.assertEqual(self.count(), 1)
-        owner = self.live_owner()
+        owner = self.live_owner('stalled-owner')
         claim.write_text(str(owner.pid))
         metadata.unlink(missing_ok=True)
         self.fake_clock()
@@ -224,7 +225,7 @@ exit "$FIXTURE_RC"
         self.assertTrue(claim.exists())
 
     def test_follower_total_deadline_is_separate_and_includes_claim_wait(self):
-        owner = self.live_owner()
+        owner = self.live_owner('total-owner')
         claim = self.dir / 'results' / ('tree-' + self.tree + '.running')
         claim.write_text(str(owner.pid))
         metadata = claim.with_name(claim.name + '.run')
@@ -249,7 +250,7 @@ exit "$FIXTURE_RC"
         self.assertEqual(self.count(), 0)
 
     def test_claim_metadata_must_match_live_pid(self):
-        owner = self.live_owner()
+        owner = self.live_owner('published-owner')
         claim = self.dir / 'results' / ('tree-' + self.tree + '.running')
         claim.write_text(str(owner.pid))
         metadata = claim.with_name(claim.name + '.run')
@@ -371,7 +372,7 @@ exec /bin/rm "$@"
         self.assertEqual(claim.read_text(), str(os.getpid()))
 
     def test_unobservable_owner_keeps_claim_and_retry_returns_busy(self):
-        owner = self.live_owner()
+        owner = self.live_owner('hidden-owner')
         claim = self.dir / 'results' / ('tree-' + self.tree + '.running')
         metadata = claim.with_name(claim.name + '.run')
         (self.home / 'release').touch()
@@ -388,7 +389,7 @@ exec /bin/rm "$@"
                 self.assertIn('cannot inspect owner', self.log(run))
 
     def test_attached_follower_waits_when_owner_becomes_unobservable(self):
-        owner = self.live_owner()
+        owner = self.live_owner('visible-owner')
         claim = self.dir / 'results' / ('tree-' + self.tree + '.running')
         claim.write_text(str(owner.pid))
         claim.with_name(claim.name + '.run').write_text(f'{owner.pid} visible-owner\n')
@@ -429,7 +430,7 @@ exec /bin/ps "$@"
         self.assertTrue((self.dir / 'slots/1.run').exists())
 
     def test_dead_followed_owner_without_result_reports_lost_run(self):
-        owner = self.live_owner()
+        owner = self.live_owner('lost-owner')
         claim = self.dir / 'results' / ('tree-' + self.tree + '.running')
         claim.write_text(str(owner.pid))
         claim.with_name(claim.name + '.run').write_text(f'{owner.pid} lost-owner\n')
@@ -491,6 +492,46 @@ exec /bin/mv "$@"
                 self.assertIn('lost-run:', self.log(run))
                 self.assertFalse((self.dir / 'results' / (run + '.exit')).exists())
                 self.assertFalse((self.dir / 'results' / ('tree-' + self.tree + '.pass')).exists())
+
+    def test_setup_lock_wait_respects_the_total_deadline(self):
+        (self.ci / 'lock').write_text(str(os.getpid()))
+        setup = subprocess.run(['/bin/bash', str(self.bin / 'setup.sh'), 'fixture', '1'], env=self.env,
+                               capture_output=True, text=True, timeout=10)
+        self.assertEqual(setup.returncode, 74, setup.stdout + setup.stderr)
+        self.assertIn('lost-run:', setup.stdout)
+        self.assertEqual((self.ci / 'lock').read_text(), str(os.getpid()))
+
+    def test_setup_slot_wait_respects_the_total_deadline(self):
+        (self.dir / 'slots/1.lock').write_text(str(os.getpid()))
+        setup = subprocess.run(['/bin/bash', str(self.bin / 'setup.sh'), 'fixture', '1'], env=self.env,
+                               capture_output=True, text=True, timeout=10)
+        self.assertEqual(setup.returncode, 74, setup.stdout + setup.stderr)
+        self.assertFalse((self.ci / 'lock').exists())
+
+    def test_log_is_final_when_the_exit_is_published(self):
+        self.configure(rc=7)
+        (self.home / 'release').touch()
+        self.stub('mv', '''case "$1" in *.exit.new)
+  r=$(basename "$1" .exit.new); cp "$(dirname "$(dirname "$1")")/logs/$r.log" "$HOME/log-at-exit" ;;
+esac
+exec /bin/mv "$@"
+''')
+        self.assert_result(self.start('red'), 'red', 7)
+        seen = (self.home / 'log-at-exit').read_text()
+        self.assertIn('== finished rc=7', seen)
+        self.assertTrue(failure.parse(seen)['failed'])
+
+    def test_reused_pid_of_another_runner_is_not_the_claim_owner(self):
+        other = self.live_owner('other-run')
+        claim = self.dir / 'results' / ('tree-' + self.tree + '.running')
+        claim.write_text(str(other.pid))
+        claim.with_name(claim.name + '.run').write_text(f'{other.pid} old-run\n')
+        (self.dir / 'results/old-run.exit').write_text('74\n')
+        (self.home / 'release').touch()
+        proc = self.start('retry')
+        self.assert_result(proc, 'retry', 0)
+        self.assertEqual(self.count(), 1)
+        self.assertNotIn('following run old-run', self.log('retry'))
 
     def test_stale_claim_is_replaced(self):
         dead = subprocess.Popen(['/bin/bash', '-c', 'exit 0'])
@@ -678,6 +719,18 @@ os.execv('/bin/bash', ['bash', '-c', command])
         self.assertEqual(conf.read_text(), 'keep existing run config\n')
         self.assertEqual((self.home / 'push-stub').read_text(), pushes)
         self.assertEqual(len(list((self.dir / 'runs').iterdir())), 1)
+
+    def test_first_setup_runs_the_runs_own_scripts_within_the_deadline(self):
+        (self.dir / '.ready').unlink()
+        (self.kit / 'remote/setup.sh').write_text('#!/bin/bash\nprintf "%s %s\\n" "$0" "$2" >"$HOME/setup-call"\n')
+        self.env['FIXTURE_CLIENT_MODE'] = 'completed'
+        proc = self.start(summary=True)
+        out, err = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 7, out + err)
+        run = (self.home / 'submitted').read_text()
+        script, budget = (self.home / 'setup-call').read_text().split()
+        self.assertEqual(script, str(self.dir / 'runs' / run / 'bin/setup.sh'))
+        self.assertEqual(budget, '100')
 
     def test_client_returns_published_result_in_stream_and_summary_modes(self):
         self.env['FIXTURE_CLIENT_MODE'] = 'completed'

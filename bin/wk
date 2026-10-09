@@ -67,11 +67,11 @@ if [ "${1:-}" = "-r" ]; then
     [ "$dir" = "$WK_RESUME_DIR" ] && [ "$sb" != read-only ] || { echo "wk: $name session does not match writable lane $WK_RESUME_DIR" >&2; exit 1; }
   fi
   [ "$dir" = "$main" ] || ops_writer_guard "$main" "$dir" "$sb" || exit $?
-  old="$logs/$name.$(date +%m%d-%H%M%S).$$.log"; ops_archive "$log" "$old"
+  old="$logs/$name.$(date +%m%d-%H%M%S).$$.log"; ops_archive "$log" "$old" || { echo "$name is still running" >&2; exit 1; }
   cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}; [ -f "$cfg" ] && . "$cfg"; codex=${CODEX_BIN:-$(command -v codex || true)}
   [ "$eff" = xhigh ] && [ -z "${WK_ALLOW_XHIGH:-}" ] && eff=high  # effort cap: xhigh runs as high unless WK_ALLOW_XHIGH is set
   [ -z "${WK_LAUNCH_INTENT:-}" ] || [ -d "$WK_LAUNCH_INTENT" ] || { echo "wk: repair launch cancelled" >&2; exit 1; }
-  run_id=$(ops_run_record "$log" "$preset" "${h:-codex}" "$record_route" "$model" "$eff" "$sb" "$dir" "$sid")
+  ops_run_record "$log" "$preset" "${h:-codex}" "$record_route" "$model" "$eff" "$sb" "$dir" "$sid" || exit 1
   if [ -n "$h" ] && [ "$h" != codex ]; then
     [ "$src" = "$log" ] && src=$old
     (cd "$dir" || exit 1; ops_launch "$log" "$dir" "$sb" "$preset" "$run_id" python3 "$_run_scripts/harness_run.py" resume "$src" "$msg" "$eff")
@@ -151,7 +151,7 @@ if [ -n "$own" ]; then
 fi
 # Recheck after acquiring the launch lock so concurrent callers cannot reuse a worker name.
 if ops_running "$log"; then echo "$name is already running" >&2; exit 1; fi
-[ ! -f "$log" ] || ops_archive "$log" "$logs/$name.$(date +%m%d-%H%M%S).$$.log"
+[ ! -f "$log" ] || ops_archive "$log" "$logs/$name.$(date +%m%d-%H%M%S).$$.log" || { echo "$name is still running" >&2; exit 1; }
 p="$logs/$name.prompt"
 # Workers commit only inside their own wt-dev worktree; in the main checkout they leave edits for the lead.
 if [ "$dir" != "$main" ] && wt-dev ls 2>/dev/null | awk -v n="$(basename "$dir")" '$1==n{f=1} END{exit !f}'; then

@@ -79,17 +79,19 @@ done
 minutes=$((10#$minutes))
 [ -z "$name" ] || { [[ "$name" =~ ^[a-zA-Z0-9_.-]+$ ]] && [ "$name" != . ] && [ "$name" != .. ]; } || die "invalid worktree name"
 wt="$root/$name"
-# Optional settings (committed, sourced as shell): WT_DEV_APP, WT_DEV_CMD, WT_DEV_INSTALL, WT_DEV_CACHE,
-# WT_DEV_URL_VARS, WT_DEV_READY_TIMEOUT, WT_DEV_READY_ANY, WT_DEV_DB_VAR, WT_DEV_DB_CLONE, WT_DEV_DB_DROP.
+# Optional settings (committed KEY=value data, never run as shell): WT_DEV_APP, WT_DEV_CMD, WT_DEV_INSTALL,
+# WT_DEV_CACHE, WT_DEV_URL_VARS, WT_DEV_READY_TIMEOUT, WT_DEV_READY_ANY, WT_DEV_DB_VAR, WT_DEV_DB_CLONE, WT_DEV_DB_DROP.
 # A lane's own file, so a lane can change and test it (land's install runs the stacked tip's); `new` reads
-# the file committed at --from, which the lane will hold. Repo-wide commands use the main checkout's.
-# shellcheck disable=SC1090,SC1091
-if [ "$cmd" = new ]; then
-  conf=$(git -C "$repo" show "$from:.wt-dev.conf" 2>/dev/null) && eval "$conf"
+# the file committed at --from, which the lane will hold. Repo-wide commands use the main checkout's. `path` reads none.
+# load_conf FILE|-: the helper parses literals only and prints shell-quoted assignments.
+load_conf() { local out; out=$(python3 "$helper" conf "$1") || exit 1; eval "$out"; }
+if [ "$cmd" = path ]; then :
+elif [ "$cmd" = new ]; then
+  if conf=$(git -C "$repo" show "$from:.wt-dev.conf" 2>/dev/null); then load_conf - <<<"$conf"; fi
 elif [ -n "$name" ] && [ -d "$wt" ]; then
-  [ ! -f "$wt/.wt-dev.conf" ] || . "$wt/.wt-dev.conf"
+  [ ! -f "$wt/.wt-dev.conf" ] || load_conf "$wt/.wt-dev.conf"
 else
-  [ ! -f "$repo/.wt-dev.conf" ] || . "$repo/.wt-dev.conf"
+  [ ! -f "$repo/.wt-dev.conf" ] || load_conf "$repo/.wt-dev.conf"
 fi
 dbvar=${WT_DEV_DB_VAR:-DATABASE_URL}
 shared_db=${shared_db:-${WT_DEV_SHARED_DB:-0}}
@@ -298,9 +300,9 @@ drop_db() {
   # What to drop was recorded at `new`: the lane's settings may have changed since. A lane made before
   # that was recorded was made with the main checkout's settings.
   if [ -f "$state/$name.dbvar" ]; then dbvar=$(cat "$state/$name.dbvar")
-  else dbvar=$(unset WT_DEV_DB_VAR; [ ! -f "$repo/.wt-dev.conf" ] || . "$repo/.wt-dev.conf"; echo "${WT_DEV_DB_VAR:-DATABASE_URL}"); fi
+  else dbvar=$(unset WT_DEV_DB_VAR; [ ! -f "$repo/.wt-dev.conf" ] || load_conf "$repo/.wt-dev.conf"; echo "${WT_DEV_DB_VAR:-DATABASE_URL}"); fi
   if [ -f "$state/$name.dbdrop" ]; then WT_DEV_DB_DROP=$(cat "$state/$name.dbdrop")
-  else WT_DEV_DB_DROP=$(unset WT_DEV_DB_DROP; [ ! -f "$repo/.wt-dev.conf" ] || . "$repo/.wt-dev.conf"; printf '%s' "${WT_DEV_DB_DROP:-}"); fi
+  else WT_DEV_DB_DROP=$(unset WT_DEV_DB_DROP; [ ! -f "$repo/.wt-dev.conf" ] || load_conf "$repo/.wt-dev.conf"; printf '%s' "${WT_DEV_DB_DROP:-}"); fi
   u=$(main_url); read -r kind tok <"$state/$name.db" || true
   case "$kind" in
     sqlite|mysql) python3 "$helper" drop "$kind" "$repo" "$wt" "$tok" "$dbvar";;

@@ -4,6 +4,24 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-09
+
+### Changed
+
+- `.wt-dev.conf` is parsed as data, not sourced as shell: only `WT_DEV_*` and `LAND_*` keys with literal values ('single quoted', which may span lines, "double quoted" without `$`, backticks or backslashes, or a bare word). Any other line stops `wt-dev` and `land` with the line number. `wt-dev path` reads no config. Before, a lane's `.wt-dev.conf` ran as shell code when `land` looked up the lane's path or installed it. Command values (`WT_DEV_CMD`, `WT_DEV_INSTALL`, ...) still run, and `land` still runs lane code (install, preflight, baseline, `check:remote`); the README says what it trusts.
+
+### Fixed
+
+- workers mod (0.1.1): past 4,096 deliveries a day, the delivery history keeps a floor at the newest evicted event, so an evicted event is not announced again on every poll. An exit counts by its end time, so a long run that started before the floor still reports.
+- `remote-ci`: first-time setup runs the run's own copy of the runner scripts and config (the ones its pass key hashes), not the shared copy another client may have just replaced. Setup counts against `REMOTE_CI_WAIT_TIMEOUT`: its runner-lock wait stops at the deadline with `lost-run:` (exit 74), and it removes only a lock it owns.
+- `remote-ci`: a live `run.sh` owns a tree claim only if its command line carries the claim's run ID. Before, a reused PID that now belonged to another check made a retry follow the old run and return its stale result.
+- `wk`, `batches`, `mq`: an attempt counts as running until its supervisor has published `.last` and `.exit`, not only until the worker exits (`.run` now records `supervisor_pid=` and `supervisor_birth=`). Before, relaunching the same name in that gap archived the finished attempt without its report and exit record. `wk` now says "still running" when it cannot archive, and `wait-workers.sh` uses the same rule.
+- `wk`: the run record is written by `wk` (or `run-worker.sh`) itself, not by a subshell. Before, killing `wk -r` at the wrong moment left that subshell alive; a fresh `wk` of the same name could then start, and the leftover subshell overwrote the new worker's `.run` and removed its `.pid`. `run-worker.sh` also stops if the `wk` that started it no longer holds the launch lock.
+- `remote-ci`: the runner writes the final `== finished rc=N` log line before it publishes the result. Before, `remote-ci fail` or `blame` run right after a red result could find no failure, and `mq` then landed one lane at a time instead of naming a suspect.
+- workers mod: a worker stopped by `batches pause` is reported as paused, without a "resume it" instruction to the lead. `batches pause` writes `paused_at=` into the attempt's `.run`, so this holds after a resume archives the attempt.
+- workers mod: an archived attempt that exited 0 without a final report is reported as failed (DIED), the same rule `batches` uses, not as done.
+- `batches pause` rows name the worker's log and run ID, and only a new attempt for that log retires them (rows from older versions match by directory). `mq` and `batches resume` look pauses up by log, not by name. Before, launching a same-named worker in another repo deleted this repo's pause, and `batches resume` then said "no paused workers".
+
 ## [0.8.0] - 2026-10-07
 
 ### Added
@@ -132,7 +150,8 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 - First public release: `wk`, `mq` with `land`, `ao-model` presets, `ctrash`, and the skills `agent-workers`, `model-presets`, `remote-ci`, `session-stats`, `ui-audit`, `ui-shots`, `wt-compare` and `wt-dev`.
 - README example setup with a laptop and a second Mac as the check runner.
 
-[Unreleased]: ../../compare/v0.8.0...HEAD
+[Unreleased]: ../../compare/v0.8.1...HEAD
+[0.8.1]: ../../compare/v0.8.0...v0.8.1
 [0.8.0]: ../../compare/v0.7.0...v0.8.0
 [0.7.0]: ../../compare/v0.6.0...v0.7.0
 [0.6.0]: ../../compare/v0.5.0...v0.6.0

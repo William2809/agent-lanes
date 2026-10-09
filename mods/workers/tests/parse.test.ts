@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import type { RunRecord } from '../types'
 
-import { commands, DELIVERY_LIMIT, events, identity, remember, isProblem, lastTitle, notices, originLabel, origins, parse, repoOf } from '../hooks/parse'
+import { commands, DELIVERY_LIMIT, FLOOR, outcome, events, identity, remember, isProblem, lastTitle, notices, originLabel, origins, parse, repoOf } from '../hooks/parse'
 
 const SAMPLE = `reports                    ERRORED (high demand) -> wk reports -r  @reports
 guide-w1                 running 17m  @guide-w1
@@ -92,6 +92,18 @@ test('STALLED then done notifies the problem and then the exit, each once', asyn
   expect(events([{ ...stalled, runId: 'second', status: 'done', rc: 0 }], delivered, 'S').length).toBe(1)
 })
 
+test('a paused worker is reported once, without a resume instruction', async () => {
+  const paused = { ...run('a', 'held', 'paused'), rc: 143 }
+  const text = notices(events([paused], [], 'S'))!
+  expect(text).toContain('a/review (held) paused by `batches pause`')
+  expect(text.includes('wk ')).toBe(false)
+  expect(text.includes('failed')).toBe(false)
+  expect(outcome(paused)).toBe('paused')
+  expect(events([paused], remember([], [paused], 0), 'S')).toEqual([])
+  expect(outcome({ status: 'DIED', rc: 0 })).toBe('failed')
+  expect(notices([{ ...run('a', 'blank', 'DIED'), rc: 0 }])).toContain('failed rc=0')
+})
+
 test('a missing row without an exit never counts as done', async () => {
   expect(events([run('a', 'still-live')], [], 'S')).toEqual([])
   expect(notices([])).toBeUndefined()
@@ -104,9 +116,26 @@ test('delivery history survives reload and stays bounded', async () => {
   expect(events([{ ...runs[runs.length - 1]!, rc: 0 }], saved, 'S')).toEqual([])
   const overflow = { ...run('a', 'overflow'), rc: 0, started: 2_000 }
   const next = remember(saved, [overflow], 0)
-  expect(next.length).toBe(DELIVERY_LIMIT)
+  expect(next.filter(d => d.key !== FLOOR).length).toBe(DELIVERY_LIMIT)
   expect(events([overflow], next, 'S')).toEqual([])
   expect(remember(saved, [], 101)).toEqual([])
+})
+
+test('past the cap an evicted event is not announced again', async () => {
+  // Review of PR #9, finding 11: 4,097 events in the window gave 4097, 1, 1, ... events per poll.
+  const runs = Array.from({ length: DELIVERY_LIMIT + 1 }, (_, i) => ({ ...run('a', String(i)), rc: 0, ended: 200 }))
+  let delivered = remember([], events(runs, [], 'S'), 0)
+  const counts = [DELIVERY_LIMIT + 1]
+  for (let poll = 0; poll < 2; poll++) {
+    const fresh = events(runs, delivered, 'S')
+    counts.push(fresh.length)
+    delivered = remember(delivered, fresh, 0)
+  }
+  expect(counts).toEqual([DELIVERY_LIMIT + 1, 0, 0])
+  // A run that started long ago but exits after the floor still reports, once.
+  const late = { ...run('a', 'long'), started: 50, rc: 0, ended: 300 }
+  expect(events([late], delivered, 'S')).toEqual([late])
+  expect(JSON.parse(JSON.stringify(delivered)).length).toBe(DELIVERY_LIMIT + 1)
 })
 
 test('report and resume paths quote shell characters', async () => {

@@ -165,7 +165,7 @@ reported() {
   [ -n "$lg" ] || lg="$HOME/.claude/state/logs/$(basename "$main")/$1.log"
   ops_reported "$lg"
 }
-paused_worker() { awk -F'\t' -v n="$1" '$1==n{f=1} END{exit !f}' "$HOME/.claude/state/paused-workers.tsv" 2>/dev/null; }
+paused_worker() { ops_is_paused "$1" "$HOME/.claude/state/logs/$(basename "$main")/$1.log"; }
 disk_low() {
   # status reads df freshly; check would pause workers, which belongs to diskguard's timer.
   if command -v diskguard >/dev/null 2>&1; then

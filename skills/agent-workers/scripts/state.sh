@@ -27,10 +27,20 @@ ops_worker_live() {
   fi
 }
 # Terminal records win; quiet logs and hidden ps never prove a worker is dead.
+# An attempt runs until its supervisor has published .last and .exit, not only until the worker exits.
 ops_running() {
   [ ! -f "$1.exit" ] || return 1
   _run_pid=$(cat "$1.pid" 2>/dev/null) || _run_pid=${2:-}
-  ops_worker_live "$_run_pid" "$1"
+  ops_worker_live "$_run_pid" "$1" || ops_supervisor_live "$1"
+}
+ops_supervisor_live() {
+  _run_sup=$(sed -n 's/^supervisor_pid=//p' "$1.run" 2>/dev/null)
+  ops_pid_live "$_run_sup" || return 1
+  _run_cmd=$(ps -p "$_run_sup" -o command= 2>/dev/null)
+  [ -z "$_run_cmd" ] || printf '%s\n' "$_run_cmd" | grep -q 'supervise-worker' || return 1
+  _run_birth=$(sed -n 's/^supervisor_birth=//p' "$1.run" 2>/dev/null)
+  _run_current=$(ops_birth "$_run_sup")
+  [ -z "$_run_birth" ] || [ -z "$_run_current" ] || [ "$_run_current" = "$_run_birth" ]
 }
 ops_stat() {
   case "$(uname -s)" in Darwin) stat -f "$1" "$3" 2>/dev/null ;; *) stat -c "$2" "$3" 2>/dev/null ;; esac
@@ -75,28 +85,47 @@ ops_register() {
   mkdir -p "$HOME/.claude/state"
   # The supervisor holds the record lock through identity and PID publication.
   cp "$2.run" "$2.run.new" &&
-    printf 'worker_pid=%s\nworker_birth=%s\n' "$1" "$(ops_birth "$1")" >>"$2.run.new" &&
+    printf 'worker_pid=%s\nworker_birth=%s\nsupervisor_pid=%s\nsupervisor_birth=%s\n' \
+      "$1" "$(ops_birth "$1")" "$$" "$(ops_birth "$$")" >>"$2.run.new" &&
     mv "$2.run.new" "$2.run" || return 1
   _ops_at=$(date +%s)
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$_ops_at" "$1" "$2" "$4" "${5:-}" "$tool_rev" >>"$HOME/.claude/state/worker-roles.tsv"
   printf '%s\t%s\t%s\t%s\n' "$_ops_at" "$1" "$2" "$3" >>"$HOME/.claude/state/workers.tsv"
 }
+# NAME LOG: rows name the log and run (4 columns); older rows the run (3) or only the directory (2).
 ops_is_paused() {
   _ops_pause_run=$(sed -n 's/^run_id=//p' "${2:-}.run" 2>/dev/null)
-  awk -F'\t' -v n="$1" -v r="$_ops_pause_run" '$1==n && (NF<3 || $3==r) {found=1} END {exit !found}' "$HOME/.claude/state/paused-workers.tsv" 2>/dev/null
+  _ops_pause_dir=$(sed -n 's/^dir=//p' "${2:-}.run" 2>/dev/null)
+  awk -F'\t' -v n="$1" -v r="$_ops_pause_run" -v l="${2:-}" -v d="$_ops_pause_dir" \
+    '$1==n && ((NF>=4 && $4==l && $3==r) || (NF==3 && $3==r) || (NF<3 && (d=="" || $2==d))) {found=1} END {exit !found}' \
+    "$HOME/.claude/state/paused-workers.tsv" 2>/dev/null
 }
-# Replace a name's pause record; omit DIR and RUN_ID to retire it on acceptance.
-ops_pause_record() (
+# Replace one worker's pause row: NAME DIR RUN_ID LOG. Same-named workers of other repos keep theirs.
+# Runs in the caller's process, so the lock names the process that writes.
+ops_pause_record() {
   _ops_paused="$HOME/.claude/state/paused-workers.tsv"
-  [ $# -gt 1 ] || [ -f "$_ops_paused" ] || exit 0
-  ops_lock "$_ops_paused.lock" || exit 1
-  trap 'ops_unlock "$_ops_paused.lock"' EXIT
-  if [ -f "$_ops_paused" ]; then
-    awk -F'\t' -v n="$1" '$1!=n' "$_ops_paused" >"$_ops_paused.new" || exit 1
-  else : >"$_ops_paused.new"; fi
-  [ $# -eq 1 ] || printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$_ops_paused.new" || exit 1
-  mv "$_ops_paused.new" "$_ops_paused"
-)
+  ops_lock "$_ops_paused.lock" || return 1
+  _ops_rc=0
+  { if [ -f "$_ops_paused" ]; then
+      awk -F'\t' -v n="$1" -v d="$2" -v l="$4" '!($1==n && ($4==l || (NF<4 && $2==d)))' "$_ops_paused" >"$_ops_paused.new"
+    else : >"$_ops_paused.new"; fi &&
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$_ops_paused.new" &&
+    mv "$_ops_paused.new" "$_ops_paused"; } || _ops_rc=1
+  ops_unlock "$_ops_paused.lock" || _ops_rc=1
+  return $_ops_rc
+}
+# A new attempt was accepted for LOG: retire NAME's pause rows for that log. Rows without a log
+# column match by directory, so a same-named worker of another repo keeps its pause.
+ops_pause_retire() {
+  _ops_paused="$HOME/.claude/state/paused-workers.tsv"
+  [ -f "$_ops_paused" ] || return 0
+  ops_lock "$_ops_paused.lock" || return 1
+  _ops_rc=0
+  { awk -F'\t' -v n="$1" -v l="$2" -v d="$3" '!($1==n && ($4==l || (NF<4 && $2==d)))' "$_ops_paused" >"$_ops_paused.new" &&
+    mv "$_ops_paused.new" "$_ops_paused"; } || _ops_rc=1
+  ops_unlock "$_ops_paused.lock" || _ops_rc=1
+  return $_ops_rc
+}
 ops_sandbox() {
   _ops_sb=$(awk -F'\t' -v l="$1" '$3==l {s=$4} END{print s}' "$HOME/.claude/state/worker-roles.tsv" 2>/dev/null)
   [ -n "$_ops_sb" ] || _ops_sb=$(sed -n '1,20s/^sandbox: //p' "$1" 2>/dev/null | head -1)

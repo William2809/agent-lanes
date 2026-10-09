@@ -22,7 +22,23 @@ fi
 is_paused() { ops_is_paused "$1" "${2:-}"; }
 if [ "${1:-}" = "ack" ]; then shift; for n in "$@"; do echo "$n" >>"$acked"; done; exit 0; fi
 # Latest registry row for a worker name (log basename without .log): "pid<TAB>log".
-row() { awk -F'\t' -v n="$1" '{b=$3; sub(/.*\//,"",b); sub(/\.log$/,"",b)} b==n {r=$2"\t"$3} END {if (r) print r}' "$reg"; }
+row() { awk -F'\t' -v n="$1" -v d="${2:-}" '{b=$3; sub(/.*\//,"",b); sub(/\.log$/,"",b)} b==n && (d=="" || $4==d) {r=$2"\t"$3} END {if (r) print r}' "$reg"; }
+# pause_one NAME PID LOG DIR: runs in this process, so the record lock names the process that writes.
+pause_one() {
+  ops_lock "$3.record.lock" || return 1
+  _p_rc=0
+  if [ -f "$3.exit" ]; then :
+  elif ! ops_worker_live "$2" "$3" signal; then
+    echo "cannot pause $1: worker identity unavailable or changed" >&2
+  elif kill "$2" 2>/dev/null; then
+    # The attempt's own record keeps the pause after a resume archives it (workers mod reads it).
+    { cp "$3.run" "$3.run.new" && printf 'paused_at=%s\n' "$(date +%s)" >>"$3.run.new" &&
+      mv "$3.run.new" "$3.run"; } || echo "batches: could not mark $1 paused in its record" >&2
+    if ops_pause_record "$1" "$4" "$(sed -n 's/^run_id=//p' "$3.run")" "$3"; then echo "paused $1"; else _p_rc=1; fi
+  fi
+  ops_unlock "$3.record.lock" || _p_rc=1
+  return $_p_rc
+}
 case "${1:-}" in
   pause) shift
     stalled=0; [ "${1:-}" = --stalled ] && { stalled=1; shift; }
@@ -38,29 +54,20 @@ case "${1:-}" in
       log=${r#*"$(printf '\t')"}
       is_paused "$n" "$log" && continue
       dir=$(awk -F'\t' -v target="$log" '$3==target {d=$4} END {print d}' "$reg")
-      (
-        ops_lock "$log.record.lock" || exit 1
-        trap 'ops_unlock "$log.record.lock"' EXIT
-        [ ! -f "$log.exit" ] || exit 0
-        if ! ops_worker_live "$pid" "$log" signal; then
-          echo "cannot pause $n: worker identity unavailable or changed" >&2; exit 0
-        fi
-        if [ ! -f "$log.exit" ] && kill "$pid" 2>/dev/null; then
-          ops_pause_record "$n" "$dir" "$(sed -n 's/^run_id=//p' "$log.run")" && echo "paused $n"
-        fi
-      )
+      pause_one "$n" "$pid" "$log" "$dir" || true
     done
     exit 0 ;;
   resume) shift
     [ -s "$paused" ] || { echo "no paused workers"; exit 0; }
     snapshot="$paused.$(date +%Y%m%d-%H%M%S).$$"
     cp "$paused" "$snapshot" || exit 1
-    sort -u "$snapshot" | while IFS="$(printf '\t')" read -r n dir run_id; do
+    sort -u "$snapshot" | while IFS="$(printf '\t')" read -r n dir run_id plog; do
       selected=0; [ $# -eq 0 ] && selected=1
       for wanted in "$@"; do [ "$wanted" = "$n" ] && selected=1; done
       [ "$selected" -eq 1 ] || continue
       # Another resume may have accepted a new attempt since the snapshot.
-      r=$(row "$n"); l=${r#*"$(printf '\t')"}
+      # Rows name their log; a bare name could pick a same-named worker of another repo.
+      if [ -n "$plog" ]; then l=$plog; r=$plog; else r=$(row "$n" "$dir"); l=${r#*"$(printf '\t')"}; fi
       if [ -n "$run_id" ] && [ -n "$r" ] && [ "$(sed -n 's/^run_id=//p' "$l.run" 2>/dev/null)" != "$run_id" ]; then
         echo "$n already resumed"; continue
       fi

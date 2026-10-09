@@ -7,7 +7,8 @@
 #   wtdev_db.py env-set SRC DST VAR < VALUE               -> copy SRC to DST (mode 600) with VAR=VALUE (stdin)
 #   wtdev_db.py env-exec ENVFILE -- CMD...                -> exec CMD with ENVFILE's vars (existing env wins)
 #   wtdev_db.py pgname SRC NAME                           -> the lane's Postgres database name
-import fcntl, hashlib, os, re, shutil, sqlite3, subprocess, sys, tempfile, time
+#   wtdev_db.py conf FILE|-                               -> .wt-dev.conf as shell-quoted KEY=value lines
+import fcntl, hashlib, os, re, shlex, shutil, sqlite3, subprocess, sys, tempfile, time
 from urllib.parse import urlsplit, urlunsplit, unquote, parse_qsl, urlencode
 
 sys.dont_write_bytecode = True
@@ -312,6 +313,36 @@ def mysql_drop(repo, state, var):
         os.remove(defaults)
 
 
+# .wt-dev.conf is data, never code: WT_DEV_*/LAND_* keys with literal values, so reading a lane's
+# file runs nothing. Values: 'single quoted' (may span lines), "double quoted" without $ ` \\, or bare.
+CONF_LINE = re.compile(r"""(WT_DEV_[A-Z0-9_]+|LAND_[A-Z0-9_]+)=(?:'([^']*)'|"([^"$`\\]*)"|([^\s'"$`\\;&|<>(){}#]*))\s*(?:#.*)?""")
+
+
+def parse_conf(text, source):
+    values, pending, start = {}, None, 0
+    for number, line in enumerate(text.splitlines(), 1):
+        if pending is not None:
+            pending += '\n' + line
+            if "'" not in line:
+                continue
+            line, pending = pending, None
+        elif not line.strip() or line.lstrip().startswith('#'):
+            continue
+        else:
+            start = number
+            if re.match(r"\s*(WT_DEV_|LAND_)[A-Z0-9_]+='[^']*$", line):
+                pending = line
+                continue
+        match = CONF_LINE.fullmatch(line.strip())
+        if not match:
+            fail(f'wt-dev: {source} line {start or number}: not KEY=literal (WT_DEV_*/LAND_* keys; no $, `, ;, export or commands)')
+        values[match[1]] = next(v for v in match.groups()[1:] if v is not None)
+        start = 0
+    if pending is not None:
+        fail(f'wt-dev: {source} line {start}: unterminated quote')
+    return values
+
+
 def main(argv):
     if len(argv) < 2:
         fail(open(__file__).read().split('\n')[3])
@@ -329,6 +360,12 @@ def main(argv):
         return
     if cmd == 'pg-exec':
         pg_exec(argv[2:])
+    if cmd == 'conf':
+        source = argv[2]
+        text = sys.stdin.read() if source == '-' else open(source).read()
+        for key, value in parse_conf(text, '.wt-dev.conf' if source == '-' else source).items():
+            print(f'{key}={shlex.quote(value)}')
+        return
     if cmd == 'pgname':
         print(pgname(argv[2], argv[3]))
         return
