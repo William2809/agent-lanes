@@ -5,6 +5,8 @@ export type RunRecord = Worker & {
   log: string; runId: string; repo: string; dir: string; started: number; rc?: number; ended?: number; recordLog?: string
   // <recordLog>.delivered names this run ID: a session received the report.
   delivered?: boolean
+  // owner=mq: the merge queue launched it and reads its report.
+  owner?: string
 }
 // at: when the event happened (the exit time for an exit). FLOOR's at: newest evicted event.
 export type Delivery = { key: string; started: number; at?: number }

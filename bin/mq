@@ -9,8 +9,8 @@
 #   mq drop WT              remove WT from the queue
 #   mq waiting              ready lanes blocked by uncommitted main-checkout edits (silent when none)
 # A claim is live while its worktree exists, so land's `wt-dev rm` releases it. Output: one line per event.
-# A repair that changes or removes existing test lines, baselines or check config (MQ_GUARD_PATHS) is parked
-# for review instead of requeued; adding tests is fine. A manual `mq add` after review lands it.
+# A repair that changes or removes existing test lines, or changes baselines or check config, is parked
+# for review instead of requeued (bin/mq-guard.py); adding tests is fine. A manual `mq add` after review lands it.
 set -u
 # Run from a private copy: sh parses as it runs, so in-place edits can break a live runner.
 if [ -z "${MQ_COPY:-}" ]; then
@@ -47,6 +47,7 @@ _setq() { _qt=$(mktemp "$st/queue.XXXXXX") || return 1
 setq() { mutate _setq "$@"; }
 _delq() { _qt=$(mktemp "$st/queue.XXXXXX") || return 1
   awk -F'\t' -v w="$1" '$1!=w' "$q" >"$_qt" && mv "$_qt" "$q" || return 1
+  git -C "$main" update-ref -d "refs/mq/bounce/$1" 2>/dev/null
   ctrash "$st/bounce-head.$1" "$st/deferred.$1" "$st/guarded.$1" >/dev/null; }
 delq() { mutate _delq "$@"; }
 field() { awk -F'\t' -v w="$1" -v f="$2" '$1==w{print $f}' "$q"; }
@@ -85,6 +86,7 @@ _legacy_head() {
     t==at {ambiguous=1} t<at && !h {h=$1} END{if(at>0 && !ambiguous) print h}')
   if [ -n "$_head" ]; then
     printf '%s\n' "$_head" >"$st/bounce-head.$1" || return 1
+    keep_head "$1" "$_head"
     ev "$1" repair-migrated "baseline from reflog"; return 0
   fi
   # Missing/expired or same-second evidence needs a fresh, supervised repair baseline.
@@ -98,27 +100,17 @@ repair_moved() {
   _after=$(git -C "$(wt-dev path "$1")" rev-parse HEAD 2>/dev/null) || return 1
   [ -n "$_before" ] && [ "$_before" != "$_after" ]
 }
-# Tests, baselines and check config: a repair may add to them, but changing or removing an existing
-# line (or adding a skip) needs review. MQ_GUARD_PATHS (an ERE over repo paths) replaces the default.
-guard_paths=${MQ_GUARD_PATHS:-'(^|/)(tests?|__tests__|specs?|e2e|playwright)/|\.(test|spec)\.[^/]+$|(^|/)test_[^/]+\.py$|_test\.(py|go)$|(^|/)(vitest|jest|playwright|cypress)\.config\.|(^|/)(pytest\.ini|conftest\.py|\.wt-dev\.conf|\.remote-ci\.conf|\.remote-ci\.conf)$|baseline[^/]*$'}
-# repair_weakens WT: guarded files the repair's own commits (no merges, none already on main: a
-# rebase or merge brings in others' edits) weakened: deleted, renamed away, retyped, mode-changed,
-# changed or removed existing lines, or added a skip. A skip outside guarded files is not seen.
+# repair_weakens WT: the test and check-config files the repair weakened (bin/mq-guard.py has the rules;
+# MQ_GUARD_PATHS / MQ_GUARD_CONFIG replace its patterns). Anything it cannot inspect parks (fails closed).
 repair_weakens() {
-  # Unreadable state parks (fails closed).
   _rw_p=$(wt-dev path "$1" 2>/dev/null) && _rw_base=$(cat "$st/bounce-head.$1" 2>/dev/null) &&
-    _rw_main=$(git -C "$main" rev-parse HEAD 2>/dev/null) || { echo "(guard check failed)"; return 0; }
-  for _rw_c in $(git -C "$_rw_p" rev-list --no-merges HEAD --not "$_rw_base" "$_rw_main" 2>/dev/null); do
-    git -C "$_rw_p" diff-tree -r -z --no-commit-id --no-renames --raw "$_rw_c" | tr '\0' '\n' |
-      awk -v re="$guard_paths" 'NR%2 {split($0, m, " "); next}
-        $0 ~ re && (m[5]=="D" || m[5]=="T" || (m[5]=="M" && substr(m[1], 2)!=m[2])) {print}'
-    git -C "$_rw_p" diff-tree -r -z --no-commit-id --no-renames --numstat --diff-filter=M "$_rw_c" | tr '\0' '\n' |
-      awk -F'\t' -v re="$guard_paths" '{p=$0; sub(/^[^\t]*\t[^\t]*\t/, "", p)} $2!="0" && p ~ re {print p}'
-    git -C "$_rw_p" diff-tree -p -U0 --no-commit-id --no-renames "$_rw_c" | awk -v re="$guard_paths" '
-      /^\+\+\+ b\// {f=substr($0,7); next}
-      /^\+/ && f ~ re && /(\.skip\(|\.only\(|(^|[^a-z])xit\(|(^|[^a-z])xdescribe\(|@skip|mark\.skip|skipTest|test\.fixme|t\.Skip\()/ {print f}'
-  done | sort -u
+    _rw_main=$(git -C "$main" rev-parse HEAD 2>/dev/null) &&
+    _rw=$(python3 "$MQ_TOOL_ROOT/bin/mq-guard.py" "$_rw_p" "$_rw_base" "$_rw_main" 2>/dev/null) ||
+    { echo "(guard check failed)"; return 0; }
+  printf '%s\n' "$_rw" | sed '/^$/d'
 }
+# A ref keeps the bounce baseline's commits from being pruned while the repair is pending.
+keep_head() { git -C "$main" update-ref "refs/mq/bounce/$1" "$2" 2>/dev/null || :; }
 _ready_again() {
   repair_moved "$1" || return $?
   _rw=$(repair_weakens "$1")
@@ -139,6 +131,7 @@ park() { mutate _park "$@"; }
 _fixer_state() {
   if [ "$1" = accept ]; then
     printf '%s\n' "$6" >"$st/bounce-head.$2" || return 1
+    keep_head "$2" "$6"
     [ "$5" != 1 ] || printf '%s\n' "$4" >"$st/retry.$2.$3" || return 1
     ctrash "$st/deferred.$2" >/dev/null || return 1
     _setq "$2" bounced "$3" "$4"
@@ -388,7 +381,7 @@ Fix it in THIS worktree only. If it conflicts: \`git rebase $base\`, resolve kee
   launched=0
   if [ "$retry" = 0 ] && [ -n "$k" ] && ! running "$k"; then
     intent=$(mutate _prepare_launch "$w" "$b" "$k" "$retry" "$before" "$why") || exit 1
-    if printf '%s\n' "$msg" | WK_RESUME_DIR="$d" WK_LAUNCH_INTENT="$intent" wk "$k" -r - >/dev/null 2>&1; then result=accept
+    if printf '%s\n' "$msg" | WK_OWNER=mq WK_RESUME_DIR="$d" WK_LAUNCH_INTENT="$intent" wk "$k" -r - >/dev/null 2>&1; then result=accept
     else result=refuse; fi
     mutate _reconcile_launch "$w" "$intent" "$result"; accepted=$?
     [ "$accepted" != 2 ] || exit 1
@@ -400,7 +393,7 @@ Fix it in THIS worktree only. If it conflicts: \`git rebase $base\`, resolve kee
   if [ "$launched" = 0 ]; then
     k="$w-mq$b$suffix"
     intent=$(mutate _prepare_launch "$w" "$b" "$k" "$retry" "$before" "$why") || exit 1
-    if (cd "$(wt-dev path "$w")" && printf '%s\n' "$msg" | WK_LAUNCH_INTENT="$intent" wk "$k" -d "$w" -m build-hard -t "$f:bounce" >/dev/null 2>&1); then result=accept
+    if (cd "$(wt-dev path "$w")" && printf '%s\n' "$msg" | WK_OWNER=mq WK_LAUNCH_INTENT="$intent" wk "$k" -d "$w" -m build-hard -t "$f:bounce" >/dev/null 2>&1); then result=accept
     else result=refuse; fi
     mutate _reconcile_launch "$w" "$intent" "$result" 1 || { echo "PARKED $w: fixer launch deferred ($why)"; exit 1; }
   fi

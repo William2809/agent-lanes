@@ -11,7 +11,12 @@ import unittest
 
 SOURCE = (Path(__file__).parent.parent / 'hooks/register.tsx').read_text()
 COLLECT = re.search(r'export const COLLECT = String.raw`(.*?)`', SOURCE, re.S)[1]
-MARK = re.search(r'export const MARK = String.raw`(.*?)`', SOURCE, re.S)[1]
+DELIVER = str(Path(__file__).resolve().parents[3] / 'skills/agent-workers/scripts/deliver.sh')
+
+
+def deliver(mode, *pairs, by='S', stale=None):
+    env = dict(os.environ, **({'DELIVER_STALE': str(stale)} if stale is not None else {}))
+    return subprocess.run(['sh', DELIVER, mode, by, *map(str, pairs)], capture_output=True, text=True, timeout=40, env=env)
 
 STUB = """#!/usr/bin/env python3
 import os
@@ -50,14 +55,14 @@ class Records(unittest.TestCase):
         self.binary.chmod(0o700)
 
     def record(self, repo, name='review', run_id='one', session='S', rc=None,
-               status='running', register=True, started=None):
+               status='running', register=True, started=None, owner=''):
         folder = self.state / 'logs' / repo
         folder.mkdir(parents=True, exist_ok=True)
         log = folder / (name + '.log')
         started = self.started if started is None else started
         Path(str(log) + '.run').write_text(
             f'run_id={run_id}\nstarted={started}\nlead_session={session}\n'
-            f'dir=/code/{repo}\ntest_status={status}\nprivate_note=not-output\n')
+            f'dir=/code/{repo}\ntest_status={status}\nprivate_note=not-output\nowner={owner}\n')
         log.write_text('')
         if rc is not None:
             Path(str(log) + '.exit').write_text(f'rc={rc} ended={self.started}\n')
@@ -116,24 +121,76 @@ class Records(unittest.TestCase):
         # v0.8.2: a session that received a report marks it; a same-name replacement is not covered.
         log = self.record('a', rc=0, register=False)
         self.assertFalse(self.data()['runs'][0]['delivered'])
-        subprocess.run([sys.executable, '-c', MARK, str(log), 'one'], check=True, timeout=10)
+        self.assertEqual(deliver('claim', log, 'one').stdout, 'claimed one\n')
+        # Pending: not delivered yet; another session must wait.
+        self.assertFalse(self.data()['runs'][0]['delivered'])
+        self.assertEqual(deliver('claim', log, 'one', by='T').stdout, 'busy one\n')
+        deliver('confirm', log, 'one')
         self.assertEqual(Path(str(log) + '.delivered').read_text(), 'one\n')
+        self.assertEqual(deliver('claim', log, 'one', by='T').stdout, 'taken one\n')
         self.assertTrue(self.data()['runs'][0]['delivered'])
         self.record('a', run_id='replacement', rc=1, register=False)
         self.assertFalse(self.data()['runs'][0]['delivered'])
 
-    def test_marker_follows_a_record_archived_after_the_poll(self):
+    def test_queue_owner_is_collected(self):
+        self.record('a', rc=0, register=False, owner='mq')
+        self.assertEqual(self.data()['runs'][0]['owner'], 'mq')
+
+    def test_receipt_follows_a_record_archived_after_the_poll(self):
         log = self.record('a', rc=0, register=False)
         archived = log.parent / 'review.1009-120000.77.log'
         for suffix in ('', '.run', '.exit'):
             Path(str(log) + suffix).rename(str(archived) + suffix)
         self.record('a', run_id='next', register=False)
-        done = subprocess.run([sys.executable, '-c', MARK, str(log), 'one'], timeout=10)
-        self.assertEqual(done.returncode, 0)
+        self.assertEqual(deliver('claim', log, 'one').stdout, 'claimed one\n')
         self.assertFalse(Path(str(log) + '.delivered').exists())
-        self.assertEqual(Path(str(archived) + '.delivered').read_text(), 'one\n')
-        gone = subprocess.run([sys.executable, '-c', MARK, str(log), 'nowhere'], timeout=10)
-        self.assertEqual(gone.returncode, 1)
+        self.assertTrue(Path(str(archived) + '.delivered').read_text().startswith('one pending S '))
+        gone = deliver('claim', log, 'nowhere')
+        self.assertEqual((gone.returncode, gone.stdout), (1, ''))
+        deliver('release', log, 'one', by='T')  # not T's claim: kept
+        self.assertTrue(Path(str(archived) + '.delivered').exists())
+        deliver('release', log, 'one')
+        self.assertFalse(Path(str(archived) + '.delivered').exists())
+
+    def test_stale_pending_receipt_is_taken_over(self):
+        # Review of v083: a sender that crashed after claiming must not hide the report forever.
+        log = self.record('a', rc=0, register=False)
+        deliver('claim', log, 'one', by='CRASHED')
+        self.assertEqual(deliver('claim', log, 'one', by='T', stale=0).stdout, 'claimed one\n')
+        self.assertIn('pending T ', Path(str(log) + '.delivered').read_text())
+
+    def test_malformed_or_future_pending_receipt_counts_as_stale(self):
+        log = self.record('a', rc=0, register=False)
+        for stamp in ('08', '9999999999', 'x'):
+            with self.subTest(stamp=stamp):
+                Path(str(log) + '.delivered').write_text(f'one pending OTHER {stamp}\n')
+                self.assertEqual(deliver('claim', log, 'one', by='T').stdout, 'claimed one\n')
+
+    def test_claim_waits_for_the_record_lock(self):
+        # Review of v0.8.2, finding 3: the lookup and the write must not straddle an archive.
+        log = self.record('a', rc=0, register=False)
+        lock = Path(str(log) + '.record.lock')
+        lock.mkdir()
+        (lock / 'pid').write_text(f'{os.getpid()}\n')
+        claim = subprocess.Popen(['sh', DELIVER, 'claim', 'S', str(log), 'one'], stdout=subprocess.PIPE, text=True)
+        try:
+            time.sleep(1)
+            self.assertFalse(Path(str(log) + '.delivered').exists())
+            # While the lock is held, a relaunch archives attempt one and starts attempt two.
+            archived = log.parent / 'review.1009-120000.77.log'
+            for suffix in ('', '.run', '.exit'):
+                Path(str(log) + suffix).rename(str(archived) + suffix)
+            self.record('a', run_id='two', rc=0, register=False)
+            Path(str(log) + '.delivered').write_text('two\n')
+            (lock / 'pid').unlink()
+            lock.rmdir()
+            out, _ = claim.communicate(timeout=20)
+        finally:
+            if claim.poll() is None:
+                claim.kill()
+        self.assertEqual(out, 'claimed one\n')
+        self.assertTrue(Path(str(archived) + '.delivered').read_text().startswith('one pending S '))
+        self.assertEqual(Path(str(log) + '.delivered').read_text(), 'two\n')
 
     def test_archived_run_keeps_launch_identity(self):
         physical = self.record('a', name='review.1007-123456.123', rc=0, register=False)
