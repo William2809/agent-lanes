@@ -10,7 +10,8 @@ export type RunRecord = Worker & {
 }
 // at: when the event happened (the exit time for an exit). FLOOR's at: newest evicted event.
 export type Delivery = { key: string; started: number; at?: number }
-export type Collection = { batches: { repo: string; text: string }[]; runs: RunRecord[] }
+// live: current sessions of running Claude clients; receiptSessions: sessions whose mod writes receipts.
+export type Collection = { batches: { repo: string; text: string }[]; runs: RunRecord[]; live?: string[]; receiptSessions?: string[] }
 // unclaimed: finished runs whose report no session received (origin set to its label).
 export type Summary = { workers: Worker[]; finished: number; checkedAt: number; error?: string; unclaimed?: RunRecord[] }
 export type Context = { tokens: number; window: number; percent: number; history: number[]; delta: number; limit5h?: number }

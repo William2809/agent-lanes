@@ -192,6 +192,25 @@ class Records(unittest.TestCase):
         deliver('release', log, 'one', by='OTHER')
         self.assertEqual(deliver('claim', log, 'one').stdout, 'claimed one\n')
 
+    def test_live_sessions_and_receipt_writers_are_collected(self):
+        # A live lead on an older mod writes no receipt; the mod must not count its reports as lost.
+        client = subprocess.Popen(['perl', '-e', '$0 = "claude"; sleep 30'])  # ps shows it as claude
+        self.addCleanup(client.kill)
+        until = time.monotonic() + 5
+        while 'claude' not in subprocess.run(['ps', '-o', 'comm=', '-p', str(client.pid)],
+                                             capture_output=True, text=True).stdout and time.monotonic() < until:
+            time.sleep(0.05)
+        sessions = self.home / '.claude/sessions'
+        sessions.mkdir()
+        (sessions / f'{client.pid}.json').write_text(json.dumps({'pid': client.pid, 'sessionId': 'OLD'}))
+        (sessions / '99998.json').write_text(json.dumps({'pid': 99998, 'sessionId': 'DEAD'}))
+        (sessions / f'{os.getpid()}.json').write_text(json.dumps({'pid': os.getpid(), 'sessionId': 'NOTCLAUDE'}))
+        (self.state / 'receipt-sessions').mkdir()
+        (self.state / 'receipt-sessions/NEW').write_text('')
+        data = self.data()
+        self.assertEqual(data['live'], ['OLD'])
+        self.assertEqual(data['receiptSessions'], ['NEW'])
+
     def test_stale_pending_receipt_is_taken_over(self):
         # Review of v083: a sender that crashed after claiming must not hide the report forever.
         log = self.record('a', rc=0, register=False)

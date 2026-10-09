@@ -22,6 +22,8 @@ const adopted = new Set<string>()
 
 const DAY = 86_400
 const DELIVERED = 'delivered-runs-v1'
+// The session this mod last named in ~/.claude/state/receipt-sessions/ (it writes receipts).
+let registered = ''
 
 // Read only run metadata and exit records, never transcripts. A private registry
 // per repo gives the name-only batches output a repo identity without changing state.
@@ -109,7 +111,29 @@ with tempfile.TemporaryDirectory(prefix='workers-poll-') as tmp:
 for path, raw in metadata.values():
     if path.read_text() != raw:
         raise RuntimeError('run changed during poll')
-print(json.dumps(dict(batches=batches, runs=records)))
+# A live lead whose workers mod writes no receipts (an older mod) received its reports in memory.
+# Live: the current session of a Claude client (~/.claude/sessions/PID.json) whose PID runs claude.
+sessions = {}
+for path in (home / '.claude/sessions').glob('*.json'):
+    try:
+        info = json.loads(path.read_text())
+        pid = int(info['pid'])
+        if 0 < pid < 1 << 22:
+            os.kill(pid, 0)
+            sessions[pid] = str(info['sessionId'])
+    except (OSError, ValueError, KeyError, TypeError):
+        continue
+live = []
+if sessions:
+    found = subprocess.run(['ps', '-o', 'pid=,comm=', '-p', ','.join(map(str, sessions))],
+                           capture_output=True, text=True, timeout=5).stdout
+    for line in found.splitlines():
+        pid, _, command = line.strip().partition(' ')
+        if pid.isdigit() and int(pid) in sessions and 'claude' in command.lower():
+            live.append(sessions[int(pid)])
+writers_dir = state / 'receipt-sessions'
+writers = sorted(path.name for path in writers_dir.iterdir()) if writers_dir.is_dir() else []
+print(json.dumps(dict(batches=batches, runs=records, live=live, receiptSessions=writers)))
 `
 
 // Receipts (<record>.delivered) change only under the record lock, in deliver.sh. A session
@@ -131,6 +155,17 @@ async function receipts($: EngineInterface, home: string, mode: 'claim' | 'confi
   return found
 }
 
+// Name this session as one whose reports get receipts, so other sessions can tell a live lead on
+// an older mod (it received its reports in memory) from one that never received them.
+async function markReceipts($: EngineInterface, home: string, mine: string) {
+  if (registered === mine || !/^[A-Za-z0-9-]+$/.test(mine)) return
+  try {
+    const ran = await $.process.run(['sh', '-c', 'mkdir -p "$1" && : >"$1/$2"', 'sh',
+      `${home}/.claude/state/receipt-sessions`, mine], { timeoutMs: 5_000 })
+    if (ran.exitCode === 0) registered = mine
+  } catch {}
+}
+
 async function collect($: EngineInterface, home: string, cutoff: number): Promise<Collection> {
   const ran = await $.process.run(['python3', '-c', COLLECT, home, String(cutoff)], { cwd: home, timeoutMs: 15_000 })
   if (ran.exitCode !== 0) throw new Error('worker records poll failed')
@@ -146,8 +181,9 @@ async function poll($: EngineInterface, notify = true) {
     const home = (await $.env.get('HOME')) ?? '/'
     const checkedAt = await $.clock.now()
     const cutoff = checkedAt / 1000 - DAY
-    const data = await collect($, home, cutoff)
     const mine = await $.session.id()
+    await markReceipts($, home, mine)
+    const data = await collect($, home, cutoff)
     const deliveryKey = `${DELIVERED}:${mine}`
     const saved = await $.store.get(deliveryKey)
     const delivered: Delivery[] = Array.isArray(saved) ? saved : []
@@ -246,7 +282,9 @@ async function withOrigins($: EngineInterface, home: string, data: Collection, c
     }
   }
   const lost: RunRecord[] = []
-  for (const run of unclaimed(data.runs, mine, checkedAt / 1000, sent).filter(r => !adopted.has(identity(r)))) {
+  const writers = new Set(data.receiptSessions ?? [])
+  const oldLeads = new Set((data.live ?? []).filter(session => !writers.has(session) && session !== mine))
+  for (const run of unclaimed(data.runs, mine, checkedAt / 1000, sent, oldLeads).filter(r => !adopted.has(identity(r)))) {
     const origin = known.get(identity(run))
     if (origin?.session?.slug) await titleOf($, home, origin.session)
     lost.push({ ...run, origin: originLabel(origin, mine, titles) })
