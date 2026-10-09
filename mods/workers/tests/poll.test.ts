@@ -236,6 +236,18 @@ test('another session\'s undelivered report is unclaimed; the band never prompts
   expect(w.calls.length).toBe(0)
 })
 
+test('a live lead on an older mod received its reports; a cleared or receipt-writing lead did not', async ($, on) => {
+  // Clients started before 0.2.1 deliver in memory and write no receipt; they were counted as lost.
+  const w = world(on)
+  w.data({
+    ...collection([finished('old', 'OLD'), finished('gone', 'GONE'), finished('new', 'NEW')]),
+    live: ['OLD', 'NEW'], receiptSessions: ['NEW', 'S'],
+  })
+  await $.session.start(start)
+  await w.clock.settle()
+  expect((w.memory.get('summary') as Summary).unclaimed?.map(r => r.runId)).toEqual(['gone', 'new'])
+})
+
 test('/workers adopt claims, sends one prompt; a second adopt has nothing', async ($, on) => {
   const w = world(on)
   const lost = [finished('lost1', 'GONE'), finished('lost2', 'GONE', { rc: 1, status: 'unknown' })]
