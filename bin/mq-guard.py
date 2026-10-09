@@ -24,11 +24,33 @@ class Unknown(Exception):
     pass
 
 
-def git(lane, *args, ok=(0,)):
+def git(lane, *args, ok=(0,), status=False):
     done = subprocess.run(['git', '-C', lane, *args], capture_output=True, text=True, timeout=60)
     if done.returncode not in ok:
         raise Unknown('git ' + ' '.join(args[:2]))
-    return done.stdout
+    return (done.returncode, done.stdout) if status else done.stdout
+
+
+def replay_conflicts(out):
+    """Paths `git merge-tree -z --name-only` reports in conflict: the conflicted-file list, plus the
+    paths of CONFLICT messages (some directory rename conflicts list no file)."""
+    parts = out.split('\0')
+    end = parts.index('', 1)
+    paths, at = set(parts[1:end]), end + 1
+    while at < len(parts) and parts[at]:
+        count = int(parts[at])
+        named, kind = parts[at + 1:at + 1 + count], parts[at + 1 + count]
+        if kind.startswith('CONFLICT'):
+            paths |= set(named)
+        at += count + 3
+    return paths
+
+
+def guarded_conflicts(paths):
+    """The conflict paths a guard pattern matches, a directory also as dir/."""
+    probe = set(paths) | {p.rstrip('/') + '/' for p in paths}
+    hit = matching(TESTS, probe) | matching(CONFIG, probe) | matching(PACKAGE, probe)
+    return {p for p in paths if p in hit or p.rstrip('/') + '/' in hit}
 
 
 def matching(pattern, paths):
@@ -40,7 +62,7 @@ def matching(pattern, paths):
                           timeout=60, env={**os.environ, 'MQ_GUARD_RE': regex})
     if done.returncode:
         raise Unknown(f'{name} is not a valid ERE')
-    return set(done.stdout.splitlines()) | {p for p in paths if '\n' in p}
+    return set(done.stdout.split('\n')[:-1]) | {p for p in paths if '\n' in p}
 
 
 def scripts(lane, tree, path, exists):
@@ -87,11 +109,19 @@ def main():
         # The repair's own changes: HEAD against the pre-bounce work replayed onto the main commit
         # HEAD now builds on. Whatever the lane did before the bounce, and whatever came from main by
         # a rebase or merge, is in both; a change made and undone within the repair is in neither.
-        # Replay conflicts stay as conflict markers, so a guarded file Git could not merge shows.
+        # A guarded file the replay conflicts on needs review however it was resolved: a
+        # modify/delete conflict leaves no markers to diff.
         on = git(lane, 'merge-base', 'HEAD', main_head).strip()
         fork = git(lane, 'merge-base', base, on).strip()
-        expected = git(lane, 'merge-tree', '--write-tree', '--merge-base=' + fork, on, base, ok=(0, 1)).split('\n')[0]
+        rc, replay = git(lane, 'merge-tree', '--write-tree', '-z', '--name-only', '--merge-base=' + fork, on, base,
+                         ok=(0, 1), status=True)
+        expected = replay.split('\0')[0]
         found = weakened(lane, expected, 'HEAD^{tree}')
+        if rc == 1:
+            conflicts = replay_conflicts(replay)
+            found |= guarded_conflicts(conflicts)
+            if not conflicts:
+                found.add('(replay conflict that names no file)')
         # A merge's own changes (conflict resolutions, edits no parent had) need review when they
         # touch guarded files; what it brings in from main does not.
         # A guarded file both sides changed was resolved by hand or by Git; either way someone must

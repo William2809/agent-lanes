@@ -219,6 +219,46 @@ class RepairGuardTests(unittest.TestCase):
         self.assertEqual(step.returncode, 0)
         out = self.repair('src.txt', 'source fix\n').stdout
         self.assertIn('PARKED b: repair changed existing tests or check config (tests/test_a.py)', out)
+    def test_modify_delete_replay_conflict_on_check_config_parks(self):
+        # Review of v0.8.3 (round 2), finding 1: no markers; the lane kept a config file main deleted.
+        lane = self.f.lanes['b']
+        self.f.commit(self.f.repo, 'pytest.ini', '[pytest]\n')
+        self.f.git('merge', '-q', '--no-edit', 'main', cwd=lane)
+        self.f.commit(lane, 'pytest.ini', '[pytest]\naddopts = -q\n')
+        self.bounce_here()
+        self.f.git('rm', '-q', 'pytest.ini', cwd=self.f.repo)
+        self.f.git('commit', '-qm', 'config moved', cwd=self.f.repo)
+        step = self.f.run('git', 'rebase', '-q', 'main', cwd=lane, check=False)
+        self.assertNotEqual(step.returncode, 0)
+        self.f.git('add', 'pytest.ini', cwd=lane)
+        self.f.run('git', '-c', 'core.editor=true', 'rebase', '--continue', cwd=lane)
+        out = self.repair('src.txt', 'source fix\n').stdout
+        self.assertIn('PARKED b: repair changed existing tests or check config (pytest.ini)', out)
+
+    def test_test_name_with_a_vertical_tab_stays_guarded(self):
+        # Review of v0.8.3 (round 2), finding 4: splitlines() split the name awk matched.
+        lane = self.f.lanes['b']
+        self.f.commit(lane, 'tests/test_\vtotal.py', 'assert total() == 3\n')
+        self.bounce_here()
+        out = self.repair('tests/test_\vtotal.py', 'assert total() >= 0\n').stdout
+        self.assertIn('PARKED b', out)
+
+class ReplayConflictParseTests(unittest.TestCase):
+    """`git merge-tree -z --name-only` output; Git documents conflicts with no conflicted-file entry."""
+
+    def setUp(self):
+        from importlib.machinery import SourceFileLoader
+        from workflow_fixture import ROOT
+        self.guard = SourceFileLoader('mq_guard', str(ROOT / 'bin/mq-guard.py')).load_module()
+
+    def test_clean_replay_has_no_conflicts(self):
+        self.assertEqual(self.guard.replay_conflicts('OID\0'), set())
+
+    def test_message_only_directory_conflict_is_guarded(self):
+        out = 'OID\0\0' + '1\0tests\0CONFLICT (directory rename split)\0msg\0' + '1\0app\0Auto-merging\0msg\0'
+        conflicts = self.guard.replay_conflicts(out)
+        self.assertNotIn('app', conflicts)
+        self.assertEqual(self.guard.guarded_conflicts(conflicts), {'tests'})
 
 
 if __name__ == '__main__':

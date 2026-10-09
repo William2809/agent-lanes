@@ -49,28 +49,31 @@ ops_lock_held() {
   _ops_pid=$(cat "$1/pid" 2>/dev/null || true)
   ops_pid_live "$_ops_pid" && return 0
   ops_pid_live "$(cat "$1/handoff" 2>/dev/null)" && return 0
+  ops_pid_live "$(cat "$1/mover" 2>/dev/null)" && return 0
   [ -d "$1" ] && { [ -z "$_ops_pid" ] || [ -f "$1/handoff" ]; } || return 1
   _ops_age=$1; [ ! -f "$1/handoff" ] || _ops_age=$1/handoff
   _ops_mt=$(ops_stat %m %Y "$_ops_age" || echo 0)
   [ $(( $(date +%s) - _ops_mt )) -lt 10 ]
 }
-ops_try_lock() (
-  if mkdir "$1" 2>/dev/null; then echo $$ >"$1/pid"; exit 0; fi
-  _ops_ident=$(ops_stat '%d:%i' '%d:%i' "$1" || true)
-  ops_lock_held "$1" && exit 1
+# A function, not a subshell: the PID it writes is the process that reaps and moves, so killing
+# the caller leaves no unregistered subshell acting on the lock.
+ops_try_lock() {
+  if mkdir "$1" 2>/dev/null; then echo $$ >"$1/pid"; return 0; fi
+  # $2: the lock's identity before reaping (the nested reap-lock call reuses the globals).
+  set -- "$1" "$(ops_stat '%d:%i' '%d:%i' "$1" || true)"
+  ops_lock_held "$1" && return 1
   # Serialize stale-lock reclamation so a contender cannot move a newly acquired lock.
   # Reapers use the same recoverable protocol, including their own PID.
-  [ -n "$_ops_ident" ] && ops_try_lock "$1/reap" || exit 1
-  _ops_current=$(ops_stat '%d:%i' '%d:%i' "$1" || true)
+  [ -n "$2" ] && ops_try_lock "$1/reap" || return 1
   # Reaping changes the parent mtime; recheck owners/handoffs, not its missing-PID grace.
-  if [ "$_ops_ident" != "$_ops_current" ] || ops_pid_live "$(cat "$1/pid" 2>/dev/null)" ||
-    { [ -f "$1/handoff" ] && ops_lock_held "$1"; }; then
-    ops_unlock "$1/reap"; exit 1
+  if [ "$2" != "$(ops_stat '%d:%i' '%d:%i' "$1" || true)" ] || ops_pid_live "$(cat "$1/pid" 2>/dev/null)" ||
+    ops_pid_live "$(cat "$1/mover" 2>/dev/null)" || { [ -f "$1/handoff" ] && ops_lock_held "$1"; }; then
+    ops_unlock "$1/reap"; return 1
   fi
-  ctrash "$1" >/dev/null || exit 1
-  mkdir "$1" 2>/dev/null || exit 1
+  ops_move_lock "$1" "$1/reap" || { ops_unlock "$1/reap"; return 1; }
+  mkdir "$1" 2>/dev/null || return 1
   echo $$ >"$1/pid"
-)
+}
 ops_lock() {
   _ops_wait=0
   until ops_try_lock "$1"; do
@@ -79,7 +82,20 @@ ops_lock() {
     sleep 0.1
   done
 }
-ops_unlock() { [ "$(cat "$1/pid" 2>/dev/null)" != "$$" ] || ctrash "$1" >/dev/null; }
+ops_unlock() { [ "$(cat "$1/pid" 2>/dev/null)" != "$$" ] || ops_move_lock "$1" "$1"; }
+# ops_move_lock LOCK HOLD: move LOCK to the trash. The moving process is named in HOLD/mover before it
+# moves anything and is the mv itself, so HOLD counts as held for as long as it lives: a releaser
+# killed mid-move leaves no unregistered child that could later move a successor's lock.
+ops_move_lock() {
+  # A second release (an exit trap during the first) leaves a live registered mover alone.
+  ! ops_pid_live "$(cat "$2/mover" 2>/dev/null)" || return 0
+  _ops_to="$HOME/.claude-trash/$(date +%F)"; mkdir -p "$_ops_to" || return 1
+  sh -c 'n=0; until [ "$(cat "$1/mover" 2>/dev/null)" = "$$" ]; do
+      n=$((n + 1)); [ "$n" -lt 500 ] || exit 1; sleep 0.01; done
+    exec mv "$2" "$3.$$"' sh "$2" "$1" "$_ops_to/$(basename "$1").$(date +%H%M%S)" &
+  _ops_mover=$!
+  echo "$_ops_mover" >"$2/mover" && wait "$_ops_mover"
+}
 ops_register() {
   # Role publication precedes the legacy registry: readers need not wait for a Codex header.
   mkdir -p "$HOME/.claude/state"

@@ -1,8 +1,8 @@
 #!/bin/sh
 # ABOUTME: Delivery receipts for worker reports (<record>.delivered), changed only under the record lock.
 # Usage: deliver.sh claim|confirm|release SESSION LOG RUN_ID [LOG RUN_ID ...]
-# A receipt is "RUN_ID" once a session queued the report, or "RUN_ID pending SESSION EPOCH" while
-# one is sending it. The workers mod claims before it sends and confirms after, so two sessions never
+# A receipt is "RUN_ID" once a session queued the report, or "pending RUN_ID SESSION EPOCH" while
+# one is sending it (state first: a cut-off pending write can never read as a final receipt). The workers mod claims before it sends and confirms after, so two sessions never
 # both send a report, and a relaunch cannot archive the record between the lookup and the write.
 #   claim:   prints "claimed RUN_ID" (send it), "taken RUN_ID" (already sent) or "busy RUN_ID" (another
 #            session is sending; retry later). A pending receipt older than DELIVER_STALE seconds
@@ -31,10 +31,12 @@ while [ $# -ge 2 ]; do
   if [ -z "$rec" ]; then rc=1
   else
     receipt=$(cat "$rec.delivered" 2>/dev/null) || receipt=""
-    # $receipt fields: RUN_ID [pending SESSION EPOCH]
-    read -r r_run r_state r_by r_at <<EOF
+    # $receipt fields: RUN_ID, or pending RUN_ID SESSION EPOCH
+    read -r r_state r_run r_by r_at <<EOF
 $receipt
 EOF
+    # An older helper wrote RUN_ID pending SESSION EPOCH: its sender may still be sending.
+    [ "$r_run" != pending ] || { r_run=$r_state; r_state=pending; }
     # A malformed or future time counts as stale.
     now=$(date +%s); r_at=$(printf '%s' "$r_at" | sed 's/^0*//')
     case "$r_at" in ''|*[!0-9]*|??????????????*) r_at=0 ;; esac
@@ -45,7 +47,7 @@ EOF
       if [ "$receipt" = "$run" ]; then echo "taken $run"
       elif [ "$r_run" = "$run" ] && [ "$r_state" = pending ] && [ "$ours" = 0 ] &&
         [ "$((now - r_at))" -lt "$stale" ]; then echo "busy $run"
-      elif write "$rec" "$run pending $by $now"; then echo "claimed $run"
+      elif write "$rec" "pending $run $by $now"; then echo "claimed $run"
       else rc=1
       fi ;;
     confirm) [ "$ours" = 0 ] || write "$rec" "$run" || rc=1 ;;
