@@ -198,6 +198,33 @@ exec /bin/mkdir "$@"
                 waiter.kill()
             os.kill(int(self.wait_for(self.f.root / 'codex-child.pid').strip()), signal.SIGTERM)
             self.wait_for(self.side('r1', '.exit'))
+    def test_wait_workers_notes_every_attempt_before_waiting(self):
+        # Review of v0.8.3, finding 3: the second log's attempt was noted only after the first ended.
+        hold = {'FAKE_WORKER_MODE': 'hold'}
+        pids = self.f.root / 'codex-child.pid'
+        self.f.add_lane('b')
+        self.f.wk('r1', '-d', 'a', '-t', 'fixture:new', env=hold)
+        first = int(self.wait_for(pids).strip())
+        pids.unlink()
+        self.f.wk('r2', '-d', 'b', '-t', 'fixture:new', env=hold)
+        second = int(self.wait_for(pids).strip())
+        waiter = subprocess.Popen(['sh', str(SCRIPTS / 'wait-workers.sh'), str(self.log('r1')), str(self.log('r2'))],
+                                  env={**self.f.env, 'WAIT_WORKERS_POLL': '1'}, stdout=subprocess.PIPE, text=True)
+        try:
+            time.sleep(0.5)
+            os.kill(second, signal.SIGTERM)
+            self.wait_for(self.side('r2', '.exit'))
+            pids.unlink()
+            self.f.wk('r2', '-d', 'b', '-t', 'fixture:new', env=hold)
+            self.wait_for(pids)
+            os.kill(first, signal.SIGTERM)
+            out, _ = waiter.communicate(timeout=10)
+            self.assertEqual(out.strip(), 'all workers finished')
+        finally:
+            if waiter.poll() is None:
+                waiter.kill()
+            os.kill(int(self.wait_for(pids).strip()), signal.SIGTERM)
+            self.wait_for(self.side('r2', '.exit'))
 
 
 if __name__ == '__main__':

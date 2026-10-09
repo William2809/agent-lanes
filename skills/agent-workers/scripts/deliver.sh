@@ -9,7 +9,7 @@
 #            (default 300: its sender crashed or timed out) is taken over, so no report is lost; a sender
 #            that crashed after queueing but before confirming can make it arrive twice.
 #   confirm: the report was queued: the receipt becomes final.
-#   release: the prompt was not queued: this session's pending receipt goes.
+#   release: the prompt was not queued: this session's pending receipt is emptied.
 # A run with no output line could not be read (retry later).
 PATH="$HOME/.local/bin:$PATH"
 . "$(cd "$(dirname "$0")" && pwd)/state.sh"
@@ -17,7 +17,10 @@ mode=${1:-}; by=${2:-}
 case "$mode:$by" in claim:?*|confirm:?*|release:?*) shift 2 ;; *) echo "usage: deliver.sh claim|confirm|release SESSION LOG RUN_ID ..." >&2; exit 2 ;; esac
 stale=${DELIVER_STALE:-300}
 rc=0
-write() { printf '%s\n' "$2" >"$1.delivered.new" && mv "$1.delivered.new" "$1.delivered"; }
+# Receipts are written by this shell itself (builtin printf, no mv or ctrash): a helper killed while
+# holding the lock leaves no child that could later change a newer attempt's receipt at the same path.
+# Readers only ask whether a receipt is exactly its run ID, so a torn read means "not delivered".
+write() { printf '%s\n' "$2" >"$1.delivered"; }
 while [ $# -ge 2 ]; do
   log=$1 run=$2; shift 2
   ops_lock "$log.record.lock" || { rc=1; continue; }
@@ -46,7 +49,7 @@ EOF
       else rc=1
       fi ;;
     confirm) [ "$ours" = 0 ] || write "$rec" "$run" || rc=1 ;;
-    release) [ "$ours" = 0 ] || ctrash "$rec.delivered" >/dev/null || rc=1 ;;
+    release) [ "$ours" = 0 ] || : >"$rec.delivered" || rc=1 ;;
     esac
   fi
   ops_unlock "$log.record.lock" || rc=1

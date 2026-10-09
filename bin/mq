@@ -48,7 +48,7 @@ setq() { mutate _setq "$@"; }
 _delq() { _qt=$(mktemp "$st/queue.XXXXXX") || return 1
   awk -F'\t' -v w="$1" '$1!=w' "$q" >"$_qt" && mv "$_qt" "$q" || return 1
   git -C "$main" update-ref -d "refs/mq/bounce/$1" 2>/dev/null
-  ctrash "$st/bounce-head.$1" "$st/deferred.$1" "$st/guarded.$1" >/dev/null; }
+  ctrash "$st/bounce-head.$1" "$st/deferred.$1" "$st/guarded.$1" "$st/guard-err.$1" >/dev/null; }
 delq() { mutate _delq "$@"; }
 field() { awk -F'\t' -v w="$1" -v f="$2" '$1==w{print $f}' "$q"; }
 # Prefix overlap in either direction.
@@ -103,10 +103,11 @@ repair_moved() {
 # repair_weakens WT: the test and check-config files the repair weakened (bin/mq-guard.py has the rules;
 # MQ_GUARD_PATHS / MQ_GUARD_CONFIG replace its patterns). Anything it cannot inspect parks (fails closed).
 repair_weakens() {
+  : >"$st/guard-err.$1"
   _rw_p=$(wt-dev path "$1" 2>/dev/null) && _rw_base=$(cat "$st/bounce-head.$1" 2>/dev/null) &&
     _rw_main=$(git -C "$main" rev-parse HEAD 2>/dev/null) &&
-    _rw=$(python3 "$MQ_TOOL_ROOT/bin/mq-guard.py" "$_rw_p" "$_rw_base" "$_rw_main" 2>/dev/null) ||
-    { echo "(guard check failed)"; return 0; }
+    _rw=$(python3 "$MQ_TOOL_ROOT/bin/mq-guard.py" "$_rw_p" "$_rw_base" "$_rw_main" 2>"$st/guard-err.$1") ||
+    { echo "(guard check failed: $(tail -1 "$st/guard-err.$1" 2>/dev/null | sed 's/^mq-guard: //'))"; return 0; }
   printf '%s\n' "$_rw" | sed '/^$/d'
 }
 # A ref keeps the bounce baseline's commits from being pruned while the repair is pending.
