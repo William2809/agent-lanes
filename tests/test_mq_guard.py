@@ -131,7 +131,7 @@ class RepairGuardTests(unittest.TestCase):
         # Review of v0.8.2, finding 7: a pruned baseline let a test-weakening repair through.
         (self.f.state / 'bounce-head.b').write_text('0' * 40 + '\n')
         out = self.repair('tests/test_a.py', 'assert total() == 4\n').stdout
-        self.assertIn('PARKED b: repair changed existing tests or check config ((guard check failed))', out)
+        self.assertIn('PARKED b: repair changed existing tests or check config ((guard check failed: cannot inspect the repair', out)
 
     def test_bounce_baseline_is_kept_by_a_ref(self):
         # Lane a's first land fails in the fixture, so it bounces to its worker.
@@ -152,6 +152,73 @@ class RepairGuardTests(unittest.TestCase):
         self.f.commit(self.f.lanes['b'], 'tests/test_a.py', 'assert total() == 4\n')
         out = self.f.mq('run', env={'MQ_GUARD_PATHS': r'^golden/'}).stdout
         self.assertIn('requeued b', out)
+
+    def bounce_here(self):
+        lane = self.f.lanes['b']
+        (self.f.state / 'bounce-head.b').write_text(self.f.git('rev-parse', 'HEAD', cwd=lane) + '\n')
+
+    def test_same_edit_to_another_assertion_is_the_repair(self):
+        # Review of v0.8.3, finding 1: identical edits at two places share a context-free patch ID.
+        lane = self.f.lanes['b']
+        self.f.commit(lane, 'tests/test_a.py', 'assert total() == 3\n\nx = 1\n\nassert total() == 3\n')
+        self.f.commit(lane, 'tests/test_a.py', 'assert total() >= 0\n\nx = 1\n\nassert total() == 3\n')
+        self.bounce_here()
+        out = self.repair('tests/test_a.py', 'assert total() >= 0\n\nx = 1\n\nassert total() >= 0\n').stdout
+        self.assertIn('PARKED b: repair changed existing tests or check config (tests/test_a.py)', out)
+
+    def test_rebase_that_absorbs_part_of_a_lane_commit_keeps_its_test_change(self):
+        # Review of v0.8.3, finding 4: main already has the source half of a lane commit.
+        lane = self.f.lanes['b']
+        (lane / 'app.py').write_text('def total(): return 4\n')
+        (lane / 'tests/test_a.py').write_text('assert total() == 4\n')
+        self.f.git('add', '-A', cwd=lane)
+        self.f.git('commit', '-qm', 'total is 4', cwd=lane)
+        self.bounce_here()
+        self.f.commit(self.f.repo, 'app.py', 'def total(): return 4\n')
+        self.f.git('rebase', '-q', 'main', cwd=lane)
+        self.assertEqual(self.f.git('diff', (self.f.state / 'bounce-head.b').read_text().strip(), 'HEAD',
+                                    '--', 'tests/test_a.py', cwd=lane), '')
+        self.assertIn('requeued b', self.repair('src.txt', 'source fix\n').stdout)
+
+    def test_custom_guard_paths_keep_posix_ere_syntax(self):
+        # Review of v0.8.3, finding 2: MQ_GUARD_PATHS has always been an awk ERE.
+        self.f.commit(self.f.lanes['b'], 'b.txt', 'b\nrepair\n')
+        self.f.commit(self.f.lanes['b'], 'tests/test_a.py', 'assert total() >= 0\n')
+        out = self.f.mq('run', env={'MQ_GUARD_PATHS': r'^tests/test_[[:alpha:]]+\.py$'}).stdout
+        self.assertIn('PARKED b: repair changed existing tests or check config (tests/test_a.py)', out)
+
+    def test_invalid_guard_pattern_parks_with_the_reason(self):
+        self.f.commit(self.f.lanes['b'], 'b.txt', 'b\nrepair\n')
+        out = self.f.mq('run', env={'MQ_GUARD_PATHS': '('}).stdout
+        self.assertIn('PARKED b', out)
+        self.assertIn('MQ_GUARD_PATHS', (self.f.state / 'guarded.b').read_text())
+    def test_rebase_conflict_outside_tests_is_not_the_repair(self):
+        # The replayed pre-bounce work conflicts in app.py only; the lane resolved it by hand.
+        lane = self.f.lanes['b']
+        self.f.commit(lane, 'app.py', 'lane\n')
+        self.bounce_here()
+        self.f.commit(self.f.repo, 'app.py', 'main\n')
+        self.f.run('git', 'rebase', '-q', 'main', cwd=lane, check=False)
+        (lane / 'app.py').write_text('main\nlane\n')
+        self.f.git('add', 'app.py', cwd=lane)
+        self.f.run('git', '-c', 'core.editor=true', 'rebase', '--continue', cwd=lane)
+        self.assertIn('requeued b', self.repair('src.txt', 'source fix\n').stdout)
+    def test_rebase_conflict_in_a_test_parks(self):
+        # Git could not replay the lane's test change; the hand resolution needs a person.
+        lane = self.f.lanes['b']
+        self.f.commit(lane, 'tests/test_a.py', 'assert total() == 4\n')
+        self.bounce_here()
+        self.f.commit(self.f.repo, 'tests/test_a.py', 'assert total() == 5\n')
+        step = self.f.run('git', 'rebase', '-q', 'main', cwd=lane, check=False)
+        for _ in range(3):  # each replayed lane commit stops on the test file
+            if not step.returncode:
+                break
+            (lane / 'tests/test_a.py').write_text('assert total() >= 0\n')
+            self.f.git('add', 'tests/test_a.py', cwd=lane)
+            step = self.f.run('git', '-c', 'core.editor=true', 'rebase', '--continue', cwd=lane, check=False)
+        self.assertEqual(step.returncode, 0)
+        out = self.repair('src.txt', 'source fix\n').stdout
+        self.assertIn('PARKED b: repair changed existing tests or check config (tests/test_a.py)', out)
 
 
 if __name__ == '__main__':

@@ -54,7 +54,7 @@ More detail and the reasoning: [docs/concepts.md](docs/concepts.md).
 
 ### 1. Prerequisites
 
-- macOS with `git` and `python3`, plus your project's own toolchain (Node, Python, Ruby, ...).
+- macOS with `git` (2.40 or later) and `python3`, plus your project's own toolchain (Node, Python, Ruby, ...).
 - Optional, for a dev server per lane: a framework `wt-dev` knows, or a dev command in `.wt-dev.conf` (see [Supported stacks](#supported-stacks)). Without one, lanes still get their own worktree, just no server.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for the lead, and a logged-in worker CLI: the [Codex CLI](https://github.com/openai/codex) by default, or one of the [supported harnesses](#supported-harnesses).
 - Optional, for a database copy per lane: a `DATABASE_URL` on `localhost` in the repo's root `.env` and that database's client tools (PostgreSQL: `psql`, `createdb`, `pg_dump`, `pg_restore`; MySQL/MariaDB: `mysql`, `mysqldump`; SQLite: nothing). Without a `DATABASE_URL`, lanes have no database; a remote one stays shared.

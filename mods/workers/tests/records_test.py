@@ -150,7 +150,22 @@ class Records(unittest.TestCase):
         deliver('release', log, 'one', by='T')  # not T's claim: kept
         self.assertTrue(Path(str(archived) + '.delivered').exists())
         deliver('release', log, 'one')
-        self.assertFalse(Path(str(archived) + '.delivered').exists())
+        self.assertEqual(Path(str(archived) + '.delivered').read_text(), '')
+
+    def test_receipts_are_written_by_the_helper_itself(self):
+        # Review of v0.8.3, finding 5: a ctrash or mv child outliving a killed helper changed a
+        # newer attempt's receipt. Only lock directories may go through child processes.
+        calls = self.home / 'calls'
+        for name, real in (('mv', '/bin/mv'), ('ctrash', str(Path(DELIVER).parents[3] / 'bin/ctrash'))):
+            shim = self.home / '.local/bin' / name
+            shim.write_text(f'#!/bin/sh\necho "{name} $*" >>"{calls}"\nexec "{real}" "$@"\n')
+            shim.chmod(0o700)
+        log = self.record('a', rc=0, register=False)
+        env = dict(os.environ, HOME=str(self.home))
+        for mode in ('claim', 'release', 'claim', 'confirm'):
+            subprocess.run(['sh', DELIVER, mode, 'S', str(log), 'one'], env=env, check=True, timeout=40)
+        self.assertEqual(Path(str(log) + '.delivered').read_text(), 'one\n')
+        self.assertNotIn('.delivered', calls.read_text() if calls.exists() else '')
 
     def test_stale_pending_receipt_is_taken_over(self):
         # Review of v083: a sender that crashed after claiming must not hide the report forever.
