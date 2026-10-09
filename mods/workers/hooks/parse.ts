@@ -113,13 +113,17 @@ export const outcome = (run: Pick<RunRecord, 'status' | 'rc'>): 'done' | 'failed
   isPaused(run) ? 'paused' : (run.rc !== undefined && run.rc !== 0) || isFailure(run.status) ? 'failed' : 'done'
 
 // A finished run whose report no session received: its lead closed, or ran an older mod.
-// The grace lets a live lead deliver first. Runs without a lead, mq repair workers
-// (NAME-mqN, NAME-mqNr: the queue reads them) and paused runs are not reports to adopt.
+// The grace lets a live lead deliver first. Runs without a lead, queue repairs (owner=mq, or
+// the NAME-mqN / NAME-mqNr names of older records: the queue reads them) and paused runs are not
+// reports to adopt.
 export const UNCLAIMED_GRACE = 120
 export const ADOPT_LIMIT = 20
-export const unclaimed = (runs: RunRecord[], mine: string, now: number): RunRecord[] =>
-  runs.filter(run => run.rc !== undefined && !run.delivered && !!run.session && run.session !== mine &&
-    !isPaused(run) && !/-mq[0-9]+r?$/.test(run.name) && (run.ended ?? run.started) <= now - UNCLAIMED_GRACE)
+// This session's own report also counts when its history says sent but no session confirmed it
+// (it crashed between saving the history and queueing the prompt).
+export const unclaimed = (runs: RunRecord[], mine: string, now: number, sent: ReadonlySet<string> = new Set()): RunRecord[] =>
+  runs.filter(run => run.rc !== undefined && !run.delivered && !!run.session &&
+    (run.session !== mine || sent.has(eventKey(run) ?? '')) &&
+    !isPaused(run) && run.owner !== 'mq' && !/-mq[0-9]+r?$/.test(run.name) && (run.ended ?? run.started) <= now - UNCLAIMED_GRACE)
 
 export const AUTOMATIC = '[workers mod, automatic] Your workers changed state:'
 export const ADOPTED = '[workers mod, adopted with /workers adopt] Reports no session received:'

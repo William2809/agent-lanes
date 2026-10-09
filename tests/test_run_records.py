@@ -65,13 +65,14 @@ class RunRecordTests(unittest.TestCase):
         self.assertRegex(self.finish('r1'), r'^rc=0 ended=\d+\n$')
         record = self.record('r1')
         self.assertEqual(set(record), {'run_id', 'started', 'preset', 'harness', 'route', 'model',
-                                      'effort', 'sandbox', 'dir', 'tool_rev', 'resume_of', 'lead_session', 'worker_pid', 'worker_birth',
+                                      'effort', 'sandbox', 'dir', 'tool_rev', 'resume_of', 'lead_session', 'owner', 'worker_pid', 'worker_birth',
                                       'supervisor_pid', 'supervisor_birth'})
         self.assertEqual(record['harness'], 'codex')
         self.assertEqual(record['preset'], 'build')
         self.assertEqual(record['dir'], str(self.f.lanes['a']))
         self.assertEqual(record['resume_of'], '')
         self.assertEqual(record['lead_session'], 'lead-123')
+        self.assertEqual(record['owner'], '')
         self.assertNotIn('tokens used', self.log('r1').read_text())
         self.assertRegex(self.status().stdout, r'r1 +done')
         report = self.f.run('sh', str(SCRIPTS / 'report.sh'), str(self.log('r1'))).stdout

@@ -4,6 +4,17 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-10-09
+
+### Fixed
+
+- `mq` guard: any change to check config or baselines (`.remote-ci.conf`, `.wt-dev.conf`, test runner configs, `conftest.py`, baselines) now parks the repair, additions included; before, an appended line could override the check command. A change to `package.json` `scripts` parks too (`land` runs `check:remote`, which can call any script). Test files keep the looser rule: adding is fine. `MQ_GUARD_CONFIG` replaces the config pattern; `MQ_GUARD_PATHS` now covers test files only. The rules moved to `bin/mq-guard.py`.
+- `mq` guard: after a normal rebase, a rebased copy of a lane commit from before the bounce (same changed lines) no longer counts as part of the repair. A merge commit in the repair parks when a test, check-config or `package.json` file changed on both of its sides or in its resolution, so a merge cannot silently keep the lane's weaker version over main's. Before, a test change made before the bounce parked a source-only repair.
+- `mq` guard: if it cannot read the bounce baseline or any Git step fails, the repair is parked (`(guard check failed)`) instead of requeued. A ref (`refs/mq/bounce/WT`) keeps the baseline from being pruned while the repair is pending.
+- workers mod (0.2.1): a session claims a report's receipt (`<log>.delivered`) under the record lock before it sends it (`skills/agent-workers/scripts/deliver.sh`), confirms it once the prompt is queued, and releases it if not. A claim left by a session that crashed or timed out is taken over after 5 minutes (`DELIVER_STALE`), so a report can be late but is never lost (a crash between queueing and confirming can make it arrive twice). A report this session saved as sent but never confirmed shows as unclaimed here too. Before, a report adopted in one session while its lead was polling could reach both, and a relaunch during the receipt write could put the receipt on the wrong attempt.
+- workers mod: merge queue repairs record `owner=mq` in `.run` and are never counted as unclaimed, also when `mq` resumes a worker under its own name.
+- `wait-workers.sh` waits for the attempt that was current when the wait began; a same-name replacement ends the wait. Before, it kept waiting for the replacement. It says so when an attempt ended without an exit record.
+
 ## [0.8.2] - 2026-10-09
 
 ### Added
@@ -159,7 +170,8 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 - First public release: `wk`, `mq` with `land`, `ao-model` presets, `ctrash`, and the skills `agent-workers`, `model-presets`, `remote-ci`, `session-stats`, `ui-audit`, `ui-shots`, `wt-compare` and `wt-dev`.
 - README example setup with a laptop and a second Mac as the check runner.
 
-[Unreleased]: ../../compare/v0.8.2...HEAD
+[Unreleased]: ../../compare/v0.8.3...HEAD
+[0.8.3]: ../../compare/v0.8.2...v0.8.3
 [0.8.2]: ../../compare/v0.8.1...v0.8.2
 [0.8.1]: ../../compare/v0.8.0...v0.8.1
 [0.8.0]: ../../compare/v0.7.0...v0.8.0

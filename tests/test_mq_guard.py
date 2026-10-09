@@ -67,6 +67,86 @@ class RepairGuardTests(unittest.TestCase):
         out = self.repair('tests/test_new.py', 'assert new() == 1\n').stdout
         self.assertIn('requeued b', out)
 
+    def test_appended_check_override_is_parked(self):
+        # Review of v0.8.2, finding 1: one added line replaced the effective check command.
+        self.f.commit(self.f.lanes['b'], '.remote-ci.conf', "REMOTE_CI_CHECK='exit 7'\n")
+        self.f.commit(self.f.repo, 'main.txt', 'main\n')  # keep main moving
+        (self.f.state / 'bounce-head.b').write_text(self.f.git('rev-parse', 'HEAD', cwd=self.f.lanes['b']) + '\n')
+        out = self.repair('.remote-ci.conf', "REMOTE_CI_CHECK='exit 7'\nREMOTE_CI_CHECK='true'\n").stdout
+        self.assertIn('PARKED b: repair changed existing tests or check config (.remote-ci.conf)', out)
+
+    def test_changed_package_scripts_are_parked(self):
+        # land runs scripts["check:remote"], which can call any other script.
+        self.f.commit(self.f.lanes['b'], 'package.json', '{"scripts": {"check:remote": "pnpm test"}}\n')
+        (self.f.state / 'bounce-head.b').write_text(self.f.git('rev-parse', 'HEAD', cwd=self.f.lanes['b']) + '\n')
+        out = self.repair('package.json', '{"scripts": {"check:remote": "true"}}\n').stdout
+        self.assertIn('package.json (scripts)', out)
+        self.assertIn('PARKED b', out)
+
+    def test_rebased_copy_of_a_pre_bounce_test_change_is_not_the_repair(self):
+        # Review of v0.8.2, finding 4: the lane changed a test before it bounced, then rebased.
+        self.f.commit(self.f.lanes['b'], 'tests/test_a.py', 'assert total() == 4\n', 'lane test change')
+        (self.f.state / 'bounce-head.b').write_text(self.f.git('rev-parse', 'HEAD', cwd=self.f.lanes['b']) + '\n')
+        self.f.commit(self.f.repo, 'main.txt', 'main\n')
+        self.f.git('rebase', '-q', 'main', cwd=self.f.lanes['b'])
+        out = self.repair('src.txt', 'source fix\n').stdout
+        self.assertIn('requeued b', out)
+
+    def test_rebase_over_nearby_main_change_keeps_pre_bounce_commits_out(self):
+        # Review of v0.8.3 branch: main edits lines near the lane's test change, so the rebased
+        # commit has new context lines (and a new full patch ID).
+        body = ''.join(f'assert f({i}) == {i}\n' for i in range(6))
+        self.f.commit(self.f.repo, 'tests/test_near.py', body)
+        self.f.git('merge', '-q', '--no-edit', 'main', cwd=self.f.lanes['b'])
+        self.f.commit(self.f.lanes['b'], 'tests/test_near.py', body.replace('f(1) == 1', 'f(1) == 10'), 'lane test change')
+        (self.f.state / 'bounce-head.b').write_text(self.f.git('rev-parse', 'HEAD', cwd=self.f.lanes['b']) + '\n')
+        self.f.commit(self.f.repo, 'tests/test_near.py', body.replace('f(3) == 3', 'f(3) == 30'))
+        self.f.git('rebase', '-q', 'main', cwd=self.f.lanes['b'])
+        self.assertIn('requeued b', self.repair('src.txt', 'source fix\n').stdout)
+
+    def test_check_change_inside_a_merge_resolution_is_parked(self):
+        self.f.commit(self.f.repo, 'main.txt', 'main\n')
+        lane = self.f.lanes['b']
+        self.f.git('merge', '-q', '--no-commit', 'main', cwd=lane)
+        (lane / '.remote-ci.conf').write_text("REMOTE_CI_CHECK='true'\n")
+        self.f.git('add', '.remote-ci.conf', cwd=lane)
+        self.f.git('commit', '-q', '--no-edit', cwd=lane)
+        out = self.repair('src.txt', 'source fix\n').stdout
+        self.assertIn('.remote-ci.conf (merge resolution)', out)
+
+    def test_merge_that_keeps_the_lane_side_of_a_check_is_parked(self):
+        # Review of v083: -X ours drops main's stricter check; the merge result equals a parent.
+        lane = self.f.lanes['b']
+        self.f.commit(self.f.repo, '.remote-ci.conf', "REMOTE_CI_CHECK='pnpm test'\n")
+        self.f.git('merge', '-q', '--no-edit', 'main', cwd=lane)
+        self.f.commit(lane, '.remote-ci.conf', "REMOTE_CI_CHECK='pnpm test --fast'\n")
+        (self.f.state / 'bounce-head.b').write_text(self.f.git('rev-parse', 'HEAD', cwd=lane) + '\n')
+        self.f.commit(self.f.repo, '.remote-ci.conf', "REMOTE_CI_CHECK='pnpm test --strict'\n")
+        self.f.git('merge', '-q', '--no-edit', '-X', 'ours', 'main', cwd=lane)
+        out = self.repair('src.txt', 'source fix\n').stdout
+        self.assertIn('.remote-ci.conf', out)
+        self.assertIn('PARKED b', out)
+
+    def test_unreadable_bounce_baseline_parks(self):
+        # Review of v0.8.2, finding 7: a pruned baseline let a test-weakening repair through.
+        (self.f.state / 'bounce-head.b').write_text('0' * 40 + '\n')
+        out = self.repair('tests/test_a.py', 'assert total() == 4\n').stdout
+        self.assertIn('PARKED b: repair changed existing tests or check config ((guard check failed))', out)
+
+    def test_bounce_baseline_is_kept_by_a_ref(self):
+        # Lane a's first land fails in the fixture, so it bounces to its worker.
+        self.f.mq('claim', 'a', 'a.txt')
+        self.f.commit(self.f.lanes['a'], 'a.txt', 'a\n')
+        self.f.worker('writer', 'a', 'danger-full-access')
+        self.f.mq('add', 'a')
+        self.assertIn('BOUNCED a', self.f.mq('run').stdout)
+        head = (self.f.state / 'bounce-head.a').read_text().strip()
+        self.assertEqual(self.f.git('rev-parse', 'refs/mq/bounce/a'), head)
+        # The resumed worker keeps its name; its record says the queue owns its report (finding 6).
+        self.f.wait_worker('writer')
+        run = (self.f.home / '.claude/state/logs/demo/writer.log.run').read_text()
+        self.assertIn('\nowner=mq\n', run)
+
     def test_custom_guard_paths_replace_the_default(self):
         self.f.commit(self.f.lanes['b'], 'b.txt', 'b\nrepair\n')
         self.f.commit(self.f.lanes['b'], 'tests/test_a.py', 'assert total() == 4\n')

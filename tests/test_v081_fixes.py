@@ -178,6 +178,27 @@ exec /bin/mkdir "$@"
                               env=self.f.env, capture_output=True, text=True, timeout=20)
         self.assertEqual(done.stdout.strip(), 'all workers finished')
 
+    def test_wait_workers_ends_when_its_attempt_is_replaced(self):
+        # Review of v0.8.2, finding 5: the wait moved on to a later attempt with the same name.
+        self.f.wk('r1', '-d', 'a', '-t', 'fixture:new', env={'FAKE_WORKER_MODE': 'hold'})
+        self.wait_for(self.side('r1', '.pid'))
+        child = int(self.wait_for(self.f.root / 'codex-child.pid').strip())
+        waiter = subprocess.Popen(['sh', str(SCRIPTS / 'wait-workers.sh'), str(self.log('r1'))],
+                                  env={**self.f.env, 'WAIT_WORKERS_POLL': '3'}, stdout=subprocess.PIPE, text=True)
+        try:
+            time.sleep(0.5)
+            os.kill(child, signal.SIGTERM)
+            self.wait_for(self.side('r1', '.exit'))
+            (self.f.root / 'codex-child.pid').unlink()
+            self.f.wk('r1', '-d', 'a', '-t', 'fixture:new', env={'FAKE_WORKER_MODE': 'hold'})
+            out, _ = waiter.communicate(timeout=10)
+            self.assertEqual(out.strip(), 'all workers finished')
+        finally:
+            if waiter.poll() is None:
+                waiter.kill()
+            os.kill(int(self.wait_for(self.f.root / 'codex-child.pid').strip()), signal.SIGTERM)
+            self.wait_for(self.side('r1', '.exit'))
+
 
 if __name__ == '__main__':
     unittest.main()

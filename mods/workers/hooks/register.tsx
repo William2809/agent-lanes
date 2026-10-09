@@ -53,7 +53,7 @@ for folder in sorted(root.iterdir()) if root.exists() else []:
             log = str(folder / (name + '.log'))
             record = dict(log=log, recordLog=physical, runId=run_id, repo=folder.name,
                           name=name, dir=values.get('dir', ''), started=started,
-                          session=values.get('lead_session', ''), status='unknown')
+                          session=values.get('lead_session', ''), owner=values.get('owner', ''), status='unknown')
             exit_path = pathlib.Path(physical + '.exit')
             if exit_path.exists():
                 terminal = re.fullmatch(r'rc=(-?[0-9]+) ended=([0-9]+)\s*', exit_path.read_text())
@@ -112,40 +112,23 @@ for path, raw in metadata.values():
 print(json.dumps(dict(batches=batches, runs=records)))
 `
 
-// Mark received reports: one process per batch, a replace per file. Pairs: record log, run ID.
-// A resume may have archived the record since the poll: mark the record that holds the run ID.
-// Exit 1 if any run has no record left to mark.
-export const MARK = String.raw`
-import glob, os, sys
-def run_of(log):
-    try:
-        return dict(l.split('=', 1) for l in open(log + '.run').read().splitlines() if '=' in l).get('run_id')
-    except OSError:
-        return None
-missing = 0
-for log, run_id in zip(sys.argv[1::2], sys.argv[2::2]):
-    stem = log[:-4] if log.endswith('.log') else log
-    found = [p for p in [log] + glob.glob(glob.escape(stem) + '.*.log') if run_of(p) == run_id]
-    if not found:
-        missing += 1
-        continue
-    with open(found[0] + '.delivered.new', 'w') as f:
-        f.write(run_id + '\n')
-    os.replace(found[0] + '.delivered.new', found[0] + '.delivered')
-sys.exit(1 if missing else 0)
-`
-
-// Best effort: without its marker, a received report can show as unclaimed elsewhere (never lost).
-// Returns false when a marker was not written.
-async function markDelivered($: EngineInterface, runs: RunRecord[]): Promise<boolean> {
-  const done = runs.filter(run => run.rc !== undefined && !run.delivered)
-  if (!done.length) return true
+// Receipts (<record>.delivered) change only under the record lock, in deliver.sh. A session
+// claims a report (a pending receipt) before it sends it, confirms it once the prompt is queued,
+// and releases it if not. Two sessions never both send one; a sender that crashed leaves a pending
+// receipt that another session takes over after 5 minutes, so no report is lost.
+// Returns run ID -> 'claimed' | 'taken' | 'busy'; a run missing from the map could not be read.
+async function receipts($: EngineInterface, home: string, mode: 'claim' | 'confirm' | 'release', runs: RunRecord[]) {
+  const found = new Map<string, string>()
+  if (!runs.length) return found
   try {
-    const ran = await $.process.run(['python3', '-c', MARK, ...done.flatMap(run => [run.recordLog ?? run.log, run.runId])], { timeoutMs: 5_000 })
-    return ran.exitCode === 0
-  } catch {
-    return false
-  }
+    const ran = await $.process.run(['sh', `${home}/.claude/skills/agent-workers/scripts/deliver.sh`, mode, await $.session.id(),
+      ...runs.flatMap(run => [run.log, run.runId])], { timeoutMs: 40_000 })
+    for (const line of ran.stdout.split('\n')) {
+      const [state, runId] = line.split(' ')
+      if (runId && (state === 'claimed' || state === 'taken' || state === 'busy')) found.set(runId, state)
+    }
+  } catch {}
+  return found
 }
 
 async function collect($: EngineInterface, home: string, cutoff: number): Promise<Collection> {
@@ -164,28 +147,36 @@ async function poll($: EngineInterface, notify = true) {
     const checkedAt = await $.clock.now()
     const cutoff = checkedAt / 1000 - DAY
     const data = await collect($, home, cutoff)
-    const next = await withOrigins($, home, data, checkedAt)
     const mine = await $.session.id()
     const deliveryKey = `${DELIVERED}:${mine}`
     const saved = await $.store.get(deliveryKey)
     const delivered: Delivery[] = Array.isArray(saved) ? saved : []
+    const next = await withOrigins($, home, data, checkedAt, new Set(delivered.map(d => d.key)))
     const fresh = events(data.runs, delivered, mine)
-    const text = notices(fresh)
-    if (text && notify) {
-      // Save before enqueueing. A failed enqueue restores history so it can retry.
-      await $.store.set(deliveryKey, remember(delivered, fresh, cutoff))
-      try {
-        const sent = await $.prompt.submit({ text })
-        if (sent.drop !== undefined) throw new Error('worker prompt was not queued')
-      } catch (error) {
-        await $.store.set(deliveryKey, delivered)
-        throw error
+    if (fresh.length && notify) {
+      const claims = await receipts($, home, 'claim', fresh.filter(run => run.rc !== undefined))
+      // Live problems need no receipt; an exit goes out only with this session's claim. Busy or
+      // unreadable receipts are retried on the next poll.
+      const settled = fresh.filter(run => run.rc === undefined || ['claimed', 'taken'].includes(claims.get(run.runId) ?? ''))
+      const send = settled.filter(run => run.rc === undefined || claims.get(run.runId) === 'claimed')
+      const text = notices(send)
+      // Save before enqueueing. A failed enqueue restores history and receipts so it can retry.
+      await $.store.set(deliveryKey, remember(delivered, settled, cutoff))
+      if (text) {
+        try {
+          const sent = await $.prompt.submit({ text })
+          if (sent.drop !== undefined) throw new Error('worker prompt was not queued')
+        } catch (error) {
+          await $.store.set(deliveryKey, delivered)
+          await receipts($, home, 'release', send.filter(run => run.rc !== undefined))
+          throw error
+        }
+        announce($, send)
+        await receipts($, home, 'confirm', send.filter(run => run.rc !== undefined))
       }
-      announce($, fresh)
-      await markDelivered($, fresh)
     }
     if (adopting && notify) {
-      const taken = await adopt($, data.runs)
+      const taken = await adopt($, home, data.runs)
       next.unclaimed = next.unclaimed?.filter(run => !taken.has(identity(run)))
     }
     await update($, summary, () => next)
@@ -200,20 +191,26 @@ async function poll($: EngineInterface, notify = true) {
   }
 }
 
-// One prompt with the chosen reports that are still unclaimed; markers only after it is queued.
-async function adopt($: EngineInterface, runs: RunRecord[]): Promise<Set<string>> {
+// One prompt with the chosen reports this session could claim; a rejected prompt releases them.
+async function adopt($: EngineInterface, home: string, runs: RunRecord[]): Promise<Set<string>> {
   const chosen = new Set(adopting)
-  const pick = runs.filter(run => chosen.has(identity(run)) && run.rc !== undefined && !run.delivered)
+  const open = runs.filter(run => chosen.has(identity(run)) && run.rc !== undefined && !run.delivered)
+  const claims = await receipts($, home, 'claim', open)
+  const pick = open.filter(run => claims.get(run.runId) === 'claimed')
   const text = notices(pick, ADOPTED)
   if (text) {
-    const sent = await $.prompt.submit({ text })
-    if (sent.drop !== undefined) throw new Error('adopted reports were not queued')
-    // This session never offers them again, even if a marker write failed.
+    try {
+      const sent = await $.prompt.submit({ text })
+      if (sent.drop !== undefined) throw new Error('adopted reports were not queued')
+    } catch (error) {
+      await receipts($, home, 'release', pick)
+      throw error
+    }
     for (const run of pick) adopted.add(identity(run))
-    if (!(await markDelivered($, pick))) $.ui.toast('Adopted reports sent; some delivered markers were not written')
+    await receipts($, home, 'confirm', pick)
   }
   const gone = chosen.size - pick.length
-  if (gone > 0) $.ui.toast(`${gone} chosen report${gone > 1 ? 's were' : ' was'} already received or past 24 h; not sent`)
+  if (gone > 0) $.ui.toast(`${gone} chosen report${gone > 1 ? 's were' : ' was'} not sent: already received, past 24 h, or unreadable`)
   adopting = null
   return new Set(pick.map(identity))
 }
@@ -231,7 +228,7 @@ async function titleOf($: EngineInterface, home: string, session: { id: string; 
 
 // Scoped batches rows match only current logs in that repo. Run ID comes from
 // the fenced metadata scan; archived exits still reach events even with no row.
-async function withOrigins($: EngineInterface, home: string, data: Collection, checkedAt: number): Promise<Summary> {
+async function withOrigins($: EngineInterface, home: string, data: Collection, checkedAt: number, sent: Set<string>): Promise<Summary> {
   const known = origins(data.runs)
   const mine = await $.session.id()
   const workers: Summary['workers'] = []
@@ -249,7 +246,7 @@ async function withOrigins($: EngineInterface, home: string, data: Collection, c
     }
   }
   const lost: RunRecord[] = []
-  for (const run of unclaimed(data.runs, mine, checkedAt / 1000).filter(r => !adopted.has(identity(r)))) {
+  for (const run of unclaimed(data.runs, mine, checkedAt / 1000, sent).filter(r => !adopted.has(identity(r)))) {
     const origin = known.get(identity(run))
     if (origin?.session?.slug) await titleOf($, home, origin.session)
     lost.push({ ...run, origin: originLabel(origin, mine, titles) })

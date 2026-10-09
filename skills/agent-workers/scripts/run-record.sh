@@ -46,9 +46,12 @@ ops_run_record_locked() {
     [ ! -e "$1$_run_suffix" ] || ctrash "$1$_run_suffix" >/dev/null || return 1
   done
   # lead_session: the Claude Code session that ran wk (the workers mod wakes it when the run ends).
-  printf 'run_id=%s-%s\nstarted=%s\npreset=%s\nharness=%s\nroute=%s\nmodel=%s\neffort=%s\nsandbox=%s\ndir=%s\ntool_rev=%s\nresume_of=%s\nlead_session=%s\n' \
-    "$_run_started" "$$" "$_run_started" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$tool_rev" "$9" "${CLAUDE_CODE_SESSION_ID:-}" >"$1.run.new" &&
+  # owner: the tool that reads the report itself (WK_OWNER=mq for queue repairs); the worker's
+  # own launches do not inherit it.
+  printf 'run_id=%s-%s\nstarted=%s\npreset=%s\nharness=%s\nroute=%s\nmodel=%s\neffort=%s\nsandbox=%s\ndir=%s\ntool_rev=%s\nresume_of=%s\nlead_session=%s\nowner=%s\n' \
+    "$_run_started" "$$" "$_run_started" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$tool_rev" "$9" "${CLAUDE_CODE_SESSION_ID:-}" "${WK_OWNER:-}" >"$1.run.new" &&
     mv "$1.run.new" "$1.run" || return 1
+  unset WK_OWNER
   : >"$1.last"
   run_id=$_run_started-$$
   # Accepted: this log's pause rows go; same-named workers of other repos keep theirs.
