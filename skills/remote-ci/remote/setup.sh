@@ -1,16 +1,29 @@
 #!/bin/bash
 # ABOUTME: Idempotent runner setup for one remote-ci project; rebuilds whatever is missing.
 # ABOUTME: Shared: Node per version, Postgres cluster per major (localhost only). Per project: repo, env.
+# Usage: setup.sh <project> [<seconds left>]   (a check passes its remaining total wait)
 set -euo pipefail
-. "$(dirname "$0")/lib.sh"
-load_project "$1"
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib.sh"
+# A run's snapshot (runs/<id>/bin) carries its own config, like run.sh; the shared copy uses the project's.
+if [ -f "$here/../conf" ]; then load_project "$1" "$here/../conf"; else load_project "$1"; fi
+deadline=""
+case "${2:-}" in "") ;; *[!0-9-]*) echo "setup: bad wait budget $2" >&2; exit 2 ;; *) deadline=$(( $(date +%s) + $2 )) ;; esac
 mkdir -p "$ci"/{node,pg} "$dir"/{logs,results}
 # Setup changes shared toolchains/cluster auth, so exclude active slot runners.
-until ! lock_live "$ci/lock" && /usr/bin/shlock -f "$ci/lock" -p $$; do sleep 1; done
-trap 'rm -f "$ci/lock"' EXIT
+past_deadline() {
+  if [ -n "$deadline" ] && [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "lost-run: setup waited for the runner past the total deadline"; exit 74
+  fi
+}
+setup_lock() {
+  until ! lock_live "$ci/lock" && /usr/bin/shlock -f "$ci/lock" -p $$; do past_deadline; sleep 1; done
+}
+setup_lock
+trap '[ "$(cat "$ci/lock" 2>/dev/null)" != $$ ] || rm -f "$ci/lock"' EXIT
 while slots_active; do
-  rm -f "$ci/lock"; sleep 1
-  until ! lock_live "$ci/lock" && /usr/bin/shlock -f "$ci/lock" -p $$; do sleep 1; done
+  rm -f "$ci/lock"; past_deadline; sleep 1
+  setup_lock
 done
 
 if [ -n "${REMOTE_CI_NODE:-}" ] && [ ! -x "$ci/node/$REMOTE_CI_NODE/bin/node" ]; then

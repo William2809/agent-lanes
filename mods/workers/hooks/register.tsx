@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Collection, Context, Delivery, RunRecord, Summary } from '../types'
-import { events, identity, isProblem, lastTitle, notices, originLabel, origins, parse, remember, repoOf } from './parse'
+import { events, identity, isProblem, lastTitle, notices, originLabel, origins, outcome, parse, remember, repoOf } from './parse'
 import { short, sparkline, weather } from './weather'
 
 const PANE = 'workers'
@@ -56,6 +56,13 @@ for folder in sorted(root.iterdir()) if root.exists() else []:
                 terminal = re.fullmatch(r'rc=(-?[0-9]+) ended=([0-9]+)\s*', exit_path.read_text())
                 if terminal and int(terminal[2]) >= started:
                     record['rc'] = int(terminal[1])
+                    record['ended'] = int(terminal[2])
+                    # The same outcome rules as batches, so archived attempts need no batches row.
+                    report = pathlib.Path(physical + '.last')
+                    if record['rc'] != 0 and values.get('paused_at'):
+                        record['status'] = 'paused'
+                    elif record['rc'] == 0 and not (report.exists() and report.stat().st_size):
+                        record['status'] = 'DIED'
             if path.read_text() != raw:
                 raise RuntimeError('run changed during scan')
             metadata[physical] = (path, raw)
@@ -179,7 +186,7 @@ async function withOrigins($: EngineInterface, home: string, data: Collection, c
 }
 
 function announce($: EngineInterface, fresh: RunRecord[]) {
-  for (const run of fresh) $.ui.toast(`Worker ${run.repo}/${run.name} ${run.rc === 0 && !isProblem(run.status) ? 'done' : 'failed'} (${run.runId})`)
+  for (const run of fresh) $.ui.toast(`Worker ${run.repo}/${run.name} ${outcome(run)} (${run.runId})`)
 }
 
 async function measure($: EngineInterface) {

@@ -80,8 +80,9 @@ command -v migcheck >/dev/null && { migcheck "$wt" || fail "migration journal (r
 # only: a lane's own copy is candidate code and must not choose what runs here.
 LAND_BASELINE_CMD="" LAND_BASELINE_FILES=""
 if [ -f "$main/.wt-dev.conf" ]; then
-  LAND_BASELINE_CMD=$(. "$main/.wt-dev.conf" >/dev/null 2>&1; printf '%s' "${LAND_BASELINE_CMD:-}")
-  LAND_BASELINE_FILES=$(. "$main/.wt-dev.conf" >/dev/null 2>&1; printf '%s' "${LAND_BASELINE_FILES:-}")
+  conf=$(python3 "$(dirname "$(readlink -f "$0")")/wtdev_db.py" conf "$main/.wt-dev.conf") || fail "main checkout .wt-dev.conf $(at)"
+  LAND_BASELINE_CMD=$(eval "$conf"; printf '%s' "${LAND_BASELINE_CMD:-}")
+  LAND_BASELINE_FILES=$(eval "$conf"; printf '%s' "${LAND_BASELINE_FILES:-}")
 fi
 if [ -n "${LAND_BASELINE_CMD:-}" ]; then
   [ -n "${LAND_BASELINE_FILES:-}" ] || fail "baseline needs LAND_BASELINE_FILES $(at)"

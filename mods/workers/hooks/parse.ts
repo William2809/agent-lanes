@@ -88,21 +88,34 @@ export const commands = (run: RunRecord): { report: string; resume: string } => 
 export const eventKey = (run: RunRecord): string | undefined =>
   run.rc !== undefined ? `${identity(run)}:end` : isFailure(run.status) ? `${identity(run)}:problem` : undefined
 
+// An evicted delivery must not come back as new: events at or before the floor count as sent.
+// An exit's time is when it ended, so a long run that started before the floor still reports.
+export const FLOOR = '#floor'
+const eventAt = (run: RunRecord): number => (run.rc !== undefined ? run.ended ?? run.started : run.started)
+const floorOf = (delivered: Delivery[]): number => delivered.find(d => d.key === FLOOR)?.at ?? -Infinity
+
 export const events = (runs: RunRecord[], delivered: Delivery[], mine: string): RunRecord[] => {
   const sent = new Set(delivered.map(d => d.key))
+  const floor = floorOf(delivered)
   const fresh = new Map<string, RunRecord>()
   for (const run of runs) {
     const key = eventKey(run)
-    if (run.session === mine && key && !sent.has(key)) fresh.set(key, run)
+    if (run.session === mine && key && !sent.has(key) && eventAt(run) > floor) fresh.set(key, run)
   }
   return [...fresh.values()]
 }
 
+// `batches pause` was the owner's choice: say so, and never ask the lead to resume it.
+export const isPaused = (run: Pick<RunRecord, 'status'>): boolean => run.status === 'paused'
+export const outcome = (run: Pick<RunRecord, 'status' | 'rc'>): 'done' | 'failed' | 'paused' =>
+  isPaused(run) ? 'paused' : (run.rc !== undefined && run.rc !== 0) || isFailure(run.status) ? 'failed' : 'done'
+
 // One prompt holds every new event. Disappearance is never a completion signal.
 export const notices = (runs: RunRecord[]): string | undefined => {
   const lines = runs.map(run => {
-    const failed = (run.rc !== undefined && run.rc !== 0) || isFailure(run.status)
     const command = commands(run)
+    if (isPaused(run)) return `- ${run.repo}/${run.name} (${run.runId}) paused by \`batches pause\`: leave it; the owner resumes it.`
+    const failed = outcome(run) === 'failed'
     return `- ${run.repo}/${run.name} (${run.runId}) ${failed ? 'failed' : 'done'}${run.rc !== undefined ? ` rc=${run.rc}` : ` ${run.status}`}: read \`${command.report}\`, verify, continue.${failed ? ` Check the cause; resume with \`${command.resume}\` or relaunch.` : ''}`
   })
   return lines.length ? `[workers mod, automatic] Your workers changed state:\n${lines.join('\n')}` : undefined
@@ -110,11 +123,18 @@ export const notices = (runs: RunRecord[]): string | undefined => {
 
 export const DELIVERY_LIMIT = 4096
 export const remember = (delivered: Delivery[], runs: RunRecord[], cutoff: number): Delivery[] => {
-  const kept = new Map(delivered.filter(d => d.started >= cutoff).map(d => [d.key, d]))
+  const kept = new Map(delivered.filter(d => d.key !== FLOOR && d.started >= cutoff)
+    .map(d => [d.key, { ...d, at: d.at ?? d.started }]))
   for (const run of runs) {
     const key = eventKey(run)
-    if (key) kept.set(key, { key, started: run.started })
+    if (key) kept.set(key, { key, started: run.started, at: eventAt(run) })
   }
-  // Entries leave with the 24 h scan window; past the cap the oldest go first (never block new notices).
-  return [...kept.values()].sort((a, b) => a.started - b.started).slice(-DELIVERY_LIMIT)
+  // Entries leave with the 24 h scan window; past the cap the oldest go first (never block new
+  // notices), and the floor remembers how far eviction reached.
+  const sorted = [...kept.values()].sort((a, b) => a.at - b.at)
+  const evicted = sorted.slice(0, Math.max(0, sorted.length - DELIVERY_LIMIT))
+  const floor = Math.max(floorOf(delivered), ...evicted.map(d => d.at))
+  const out: Delivery[] = sorted.slice(evicted.length)
+  if (Number.isFinite(floor) && floor >= cutoff) out.push({ key: FLOOR, started: floor, at: floor })
+  return out
 }

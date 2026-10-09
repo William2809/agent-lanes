@@ -408,6 +408,22 @@ class WtDev(unittest.TestCase):
         r = self.land('lanebaseline')
         self.assertFalse(os.path.exists(canary), r.stdout + r.stderr)
 
+    def test_lane_config_is_data_never_run(self):
+        # Review of PR #9, finding 2: reading a lane's .wt-dev.conf must execute nothing.
+        self.write('baseline', 'old\n'); self.commit()
+        self.new('canary'); lane = self.path('canary')
+        canary = os.path.join(self.tmp.name, 'canary')
+        open(os.path.join(lane, '.wt-dev.conf'), 'w').write(
+            f'LAND_BASELINE_CMD=$(printf ran >> {canary})\nLAND_BASELINE_FILES=baseline\n')
+        self.git('-C', lane, 'add', '.wt-dev.conf'); self.git('-C', lane, 'commit', '-qm', 'lane config')
+        self.assertEqual(self.wt('path', 'canary').stdout.strip(), lane)
+        r = self.wt('install', 'canary', check=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('not KEY=literal', r.stderr)
+        r = self.land('canary')
+        self.assertIn('FAILED', r.stdout)
+        self.assertFalse(os.path.exists(canary), r.stdout + r.stderr)
+
     def test_land_skips_unconfigured_project_specific_baseline(self):
         self.write('tools/check-file-size.mjs', 'throw new Error("must not run")\n')
         self.commit(); self.new('skipbaseline'); lane = self.path('skipbaseline')

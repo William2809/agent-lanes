@@ -178,7 +178,7 @@ Lanes, claims, the merge queue and the check runner work with any git repository
 
 `LAND_BASELINE_CMD` in the main checkout's `.wt-dev.conf` (a lane's copy is ignored) opts into a command that `land` runs in the lane on the stack tip. `LAND_BASELINE_FILES` lists space-separated paths to commit with `chore(tooling): update baseline`. Changes to other tracked files fail. An unset command skips the step; these settings alone leave framework detection active.
 
-`.wt-dev.conf` (like `.remote-ci.conf`) is committed shell code that unattended `mq` and `land` run, so it needs the same trust as the repo code.
+`.wt-dev.conf` is data: `WT_DEV_*`/`LAND_*` keys with literal values, and reading it runs nothing (a line with `$`, backticks, `;` or another key is refused). Its command values still run, and `land` runs lane code on your machine by design: the install (with the project's own install scripts), your `tools/land-preflight.sh` in the lane, `LAND_BASELINE_CMD` there, and the lane's `check:remote` script. So a lane needs the same trust as the repo code; agent-lanes does not sandbox `land`. `.remote-ci.conf` is shell code that runs on the runner.
 
 **Installs** follow the lockfiles at the root: pnpm, npm, yarn, bun, uv, poetry, bundler, composer and mix (or `WT_DEV_INSTALL`). `land` reinstalls only when a lockfile changed.
 

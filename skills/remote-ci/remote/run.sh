@@ -85,6 +85,12 @@ SQL
   fi
   echo "== timing cleanup $(( $(date +%s) - cleanup_start ))s"
   echo "== timing total $(( $(date +%s) - submitted ))s (including queue)"
+  if [ "$cache_result" = 1 ]; then
+    if [ "$rc" = 0 ]; then echo "$sha" >"$dir/results/tree-$tree.pass"
+    else rm -f "$dir/results/tree-$tree.pass"; fi
+  fi
+  # The log is final before the result exists: callers run fail/blame as soon as they see it.
+  echo "== finished rc=$rc $(date '+%F %T')"
   # Publish completion atomically after resource cleanup. Keep the claim guard
   # until publication and ownership-checked release have both completed.
   if echo "$rc" >"$dir/results/$run.exit.new" &&
@@ -92,14 +98,10 @@ SQL
     published=1
   else
     echo "lost-run: run $run terminal result could not be published (log $log)"
+    echo "== finished rc=74 $(date '+%F %T')"
     rc=74
     [ "$cache_result" = 1 ] && rm -f "$dir/results/tree-$tree.pass"
   fi
-  if [ "$cache_result" = 1 ]; then
-    if [ "$rc" = 0 ]; then echo "$sha" >"$dir/results/tree-$tree.pass"
-    else rm -f "$dir/results/tree-$tree.pass"; fi
-  fi
-  echo "== finished rc=$rc $(date '+%F %T')"
   if [ "$claim_guard_owned" = 1 ]; then
     read -r claim_pid claim_run 2>/dev/null <"$claim.run" || true
     if [ "$published" = 1 ] && [ "$claim_pid" = "$$" ] && [ "$claim_run" = "$run" ]; then
@@ -111,14 +113,17 @@ SQL
   exit "$rc"
 }
 trap 'finish 1' HUP INT TERM
-# 0: runner, 1: dead/invalid PID, 2: positively another program, 3: unobservable.
+# run_live PID [RUN]: 0 runner (of RUN, when given), 1 dead/invalid PID,
+# 2 positively another program or another run's runner (a reused PID), 3 unobservable.
 run_live() {
   local owner_command
   case "$1" in *[!0-9]* | "" | 0) return 1 ;; esac
   kill -0 "$1" 2>/dev/null || return 1
   owner_command=$(ps -p "$1" -o command= 2>/dev/null) || return 3
   [ -n "$owner_command" ] || return 3
-  case "$owner_command" in *run.sh*) return 0 ;; *) return 2 ;; esac
+  case "$owner_command" in *run.sh*) ;; *) return 2 ;; esac
+  [ -n "${2:-}" ] || return 0
+  case "$owner_command " in *" $2 "*) return 0 ;; *) return 2 ;; esac
 }
 busy_claim() { echo "busy: $*"; finish 75; }
 # shlock publishes the PID atomically. The sidecar binds that PID to a run ID;
@@ -129,7 +134,8 @@ if [ -z "$command" ] && [ "$force" = 0 ]; then
     owner_pid="" followed=""
     read -r owner_pid followed 2>/dev/null <"$claim.run" || true
     owner=$(cat "$claim" 2>/dev/null)
-    run_live "$owner"; owner_state=$?
+    # Metadata binds the claim PID to a run ID; until it does, any runner may be the new owner.
+    if [ "$owner" = "$owner_pid" ]; then run_live "$owner" "$followed"; else run_live "$owner"; fi; owner_state=$?
     if [ "$owner_state" = 3 ]; then
       release_claim_guard
       busy_claim "cannot inspect owner pid $owner; keeping tree claim"
@@ -139,7 +145,7 @@ if [ -z "$command" ] && [ "$force" = 0 ]; then
       busy_claim "run $followed still has a live slot child (log $dir/logs/$followed.log)"
     fi
     if [ "$owner_state" = 2 ]; then
-      echo "== stale tree claim (pid $owner is not run.sh); replacing it"
+      echo "== stale tree claim (pid $owner is not its run.sh); replacing it"
       rm -f "$claim" "$claim.run"
     fi
     if /usr/bin/shlock -f "$claim" -p $$; then
@@ -162,7 +168,7 @@ if [ -z "$command" ] && [ "$force" = 0 ]; then
       while [ ! -f "$dir/results/$followed.exit" ]; do
         [ "$(date +%s)" -lt "$wait_deadline" ] ||
           busy_claim "followed run $followed total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds (log $dir/logs/$followed.log)"
-        run_live "$owner"; owner_state=$?
+        run_live "$owner" "$followed"; owner_state=$?
         if [ "$owner_state" = 1 ] || [ "$owner_state" = 2 ]; then
           # Recheck publication after death: finish writes the exit before releasing its claim.
           [ -f "$dir/results/$followed.exit" ] && break

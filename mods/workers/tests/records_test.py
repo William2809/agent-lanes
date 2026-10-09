@@ -118,6 +118,18 @@ class Records(unittest.TestCase):
         self.assertEqual(record['recordLog'], str(physical))
         self.assertEqual(record['name'], 'review')
 
+    def test_archived_outcome_follows_batches_rules(self):
+        died = self.record('a', name='review.1007-123456.1', run_id='died', rc=0, register=False)
+        done = self.record('b', name='review.1007-123456.2', run_id='done', rc=0, register=False)
+        Path(str(done) + '.last').write_text('Changed: report\n')
+        paused = self.record('c', name='review.1007-123456.3', run_id='paused', rc=143, register=False)
+        with Path(str(paused) + '.run').open('a') as stream:
+            stream.write('paused_at=1\n')
+        self.record('d', name='review.1007-123456.4', run_id='failed', rc=7, register=False)
+        status = {r['runId']: (r['rc'], r['status']) for r in self.data()['runs']}
+        self.assertEqual(status, {'died': (0, 'DIED'), 'done': (0, 'unknown'),
+                                  'paused': (143, 'paused'), 'failed': (7, 'unknown')})
+
     def test_replacement_during_batches_fails_the_poll(self):
         self.record('a', status='replace')
         self.assertNotEqual(self.poll().returncode, 0)

@@ -31,7 +31,7 @@ if [ "$harness" != codex ]; then
   [ -d "$dir" ] || { echo "repo dir not found: $dir" >&2; exit 1; }
   [ -s "$prompt" ] || { echo "prompt file empty or missing: $prompt" >&2; exit 1; }
   mkdir -p "$(dirname "$log")"
-  run_id=$(ops_run_record "$log" "${WK_PRESET:-}" "$harness" "$preset_route" "$model" "$effort" "$sandbox" "$dir" "")
+  ops_run_record "$log" "${WK_PRESET:-}" "$harness" "$preset_route" "$model" "$effort" "$sandbox" "$dir" "" || exit 1
   WK_ROUTE=$preset_route ops_launch "$log" "$dir" "$sandbox" "${WK_PRESET:-}" "$run_id" python3 "$_run_scripts/harness_run.py" run "$harness" "$model" "$effort" "$sandbox" "$dir" "$prompt"
   echo "$log"; exit 0
 fi
@@ -50,7 +50,7 @@ codex=${CODEX_BIN:-$(command -v codex || true)}
 [ -s "$prompt" ] || { echo "prompt file empty or missing: $prompt" >&2; exit 1; }
 mkdir -p "$(dirname "$log")"
 record_route=$preset_route; [ $lead -eq 0 ] || record_route=$AGENT_LANES_LEAD_PROFILE
-run_id=$(ops_run_record "$log" "${WK_PRESET:-}" codex "$record_route" "$model" "$effort" "$sandbox" "$dir" "")
+ops_run_record "$log" "${WK_PRESET:-}" codex "$record_route" "$model" "$effort" "$sandbox" "$dir" "" || exit 1
 # shellcheck disable=SC2086  # $route is intentionally split into flag + value
 ops_launch "$log" "$dir" "$sandbox" "${WK_PRESET:-}" "$run_id" "$codex" exec $route --color never -o "$log.$run_id.last" --model "$model" \
   -c "model_reasoning_effort=\"$effort\"" -s "$sandbox" --skip-git-repo-check \

@@ -240,7 +240,8 @@ case "$nonce" in *[!0-9a-f]* | "") echo "remote-ci: invalid random run ID" >&2; 
 [ "${#nonce}" = 24 ] || { echo "remote-ci: invalid random run ID" >&2; exit 1; }
 run=$(date +%Y%m%d-%H%M%S)-${sha:0:8}-$$-$nonce
 sync_kit "$run" || exit 1
-remote "test -f $p/.ready" || remote "bash ~/ci/bin/setup.sh $REMOTE_CI_NAME" || exit 1
+# First-time setup runs this run's own scripts and config (the ones its pass key hashes), within the total wait.
+remote "test -f $p/.ready" || wait_remote "bash $p/runs/$run/bin/setup.sh $REMOTE_CI_NAME \$((deadline - \$(date +%s)))" || { rc=$?; [ "$rc" = 74 ] && exit 74; exit 1; }
 # One ref per run, so parallel callers never overwrite each other's commit while queued.
 GIT_SSH_COMMAND="$git_ssh" git push -q --force "$git_url" "$sha:refs/heads/run/$run" || exit 1
 echo "remote-ci: $REMOTE_CI_NAME ${sha:0:8} on the runner via $route (log $p/logs/$run.log)"

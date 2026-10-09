@@ -65,7 +65,8 @@ class RunRecordTests(unittest.TestCase):
         self.assertRegex(self.finish('r1'), r'^rc=0 ended=\d+\n$')
         record = self.record('r1')
         self.assertEqual(set(record), {'run_id', 'started', 'preset', 'harness', 'route', 'model',
-                                      'effort', 'sandbox', 'dir', 'tool_rev', 'resume_of', 'lead_session', 'worker_pid', 'worker_birth'})
+                                      'effort', 'sandbox', 'dir', 'tool_rev', 'resume_of', 'lead_session', 'worker_pid', 'worker_birth',
+                                      'supervisor_pid', 'supervisor_birth'})
         self.assertEqual(record['harness'], 'codex')
         self.assertEqual(record['preset'], 'build')
         self.assertEqual(record['dir'], str(self.f.lanes['a']))
@@ -527,7 +528,7 @@ class RunRecordTests(unittest.TestCase):
     def test_pause_marker_belongs_to_registered_attempt(self):
         self.pause_worker()
         row = self.paused_file().read_text().strip().split('\t')
-        self.assertEqual(row, ['r1', str(self.f.lanes['a']), self.record('r1')['run_id']])
+        self.assertEqual(row, ['r1', str(self.f.lanes['a']), self.record('r1')['run_id'], str(self.log('r1'))])
 
     def test_status_ignores_pause_marker_for_another_attempt(self):
         self.start()
