@@ -264,6 +264,48 @@ class RunRecordTests(unittest.TestCase):
             proc.terminate()
             proc.wait(timeout=5)
 
+    def test_killed_releaser_leaves_no_mover_for_a_successor_lock(self):
+        # Review of v0.8.3 (round 2), finding 3: a lock-cleanup child outlived its killed releaser
+        # and later moved the successor's live lock.
+        lock = self.f.state / 'record.lock'
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        slow = self.f.root / 'slow-mv'
+        slow.mkdir()
+        (slow / 'mv').write_text('#!/bin/sh\nsleep 1.5\nexec /bin/mv "$@"\n')
+        (slow / 'mv').chmod(0o755)
+        locked = '. "$1/state.sh"; ops_lock "$2" || exit 1; '
+        releaser = subprocess.Popen(['sh', '-c', locked + 'ops_unlock "$2"', 'sh', str(SCRIPTS), str(lock)],
+                                    env={**self.f.env, 'PATH': f'{slow}:{self.f.env["PATH"]}'})
+        until = time.monotonic() + 10
+        while not (lock / 'pid').exists() and time.monotonic() < until:
+            time.sleep(0.02)
+        time.sleep(0.4)
+        releaser.kill()  # the releaser only: its cleanup child lives on
+        releaser.wait()
+        successor = self.f.run('sh', '-c', locked + 'cat "$2/pid"; sleep 3; cat "$2/pid"',
+                               'sh', str(SCRIPTS), str(lock), check=False)
+        first, *rest = successor.stdout.split()
+        self.assertEqual(rest, [first])
+        self.assertEqual((lock / 'pid').read_text().strip(), first)
+
+    def test_second_unlock_from_a_trap_keeps_the_first_mover(self):
+        # Astra review of v0.8.3 round 2: an exit trap during ops_unlock released the lock again and
+        # replaced the registered mover, so two movers could act.
+        lock = self.f.state / 'record.lock'
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        slow = self.f.root / 'slow-mv'
+        slow.mkdir()
+        calls = self.f.root / 'mv-calls'
+        (slow / 'mv').write_text(f'#!/bin/sh\necho x >>"{calls}"\nsleep 1\nexec /bin/mv "$@"\n')
+        (slow / 'mv').chmod(0o755)
+        script = ('. "$1/state.sh"; ops_lock "$2" || exit 1; trap \'ops_unlock "$2"; exit 0\' USR1; '
+                  '(sleep 0.3; kill -USR1 $$) & ops_unlock "$2"; sleep 2')
+        self.f.run('sh', '-c', script, 'sh', str(SCRIPTS), str(lock),
+                   env={'PATH': f'{slow}:{self.f.env["PATH"]}'}, check=False)
+        time.sleep(1.5)
+        self.assertEqual(calls.read_text(), 'x\n')
+        self.assertFalse(lock.exists())
+
     def test_replaced_attempt_cannot_publish_old_exit(self):
         for replacement_exit in ('', 'rc=0 ended=1\n'):
             with self.subTest(replacement_exit=replacement_exit):
