@@ -100,6 +100,8 @@ export const events = (runs: RunRecord[], delivered: Delivery[], mine: string): 
   const fresh = new Map<string, RunRecord>()
   for (const run of runs) {
     const key = eventKey(run)
+    // A report another session adopted is not announced again.
+    if (run.rc !== undefined && run.delivered) continue
     if (run.session === mine && key && !sent.has(key) && eventAt(run) > floor) fresh.set(key, run)
   }
   return [...fresh.values()]
@@ -110,15 +112,27 @@ export const isPaused = (run: Pick<RunRecord, 'status'>): boolean => run.status 
 export const outcome = (run: Pick<RunRecord, 'status' | 'rc'>): 'done' | 'failed' | 'paused' =>
   isPaused(run) ? 'paused' : (run.rc !== undefined && run.rc !== 0) || isFailure(run.status) ? 'failed' : 'done'
 
+// A finished run whose report no session received: its lead closed, or ran an older mod.
+// The grace lets a live lead deliver first. Runs without a lead, mq repair workers
+// (NAME-mqN, NAME-mqNr: the queue reads them) and paused runs are not reports to adopt.
+export const UNCLAIMED_GRACE = 120
+export const ADOPT_LIMIT = 20
+export const unclaimed = (runs: RunRecord[], mine: string, now: number): RunRecord[] =>
+  runs.filter(run => run.rc !== undefined && !run.delivered && !!run.session && run.session !== mine &&
+    !isPaused(run) && !/-mq[0-9]+r?$/.test(run.name) && (run.ended ?? run.started) <= now - UNCLAIMED_GRACE)
+
+export const AUTOMATIC = '[workers mod, automatic] Your workers changed state:'
+export const ADOPTED = '[workers mod, adopted with /workers adopt] Reports no session received:'
+
 // One prompt holds every new event. Disappearance is never a completion signal.
-export const notices = (runs: RunRecord[]): string | undefined => {
+export const notices = (runs: RunRecord[], header = AUTOMATIC): string | undefined => {
   const lines = runs.map(run => {
     const command = commands(run)
     if (isPaused(run)) return `- ${run.repo}/${run.name} (${run.runId}) paused by \`batches pause\`: leave it; the owner resumes it.`
     const failed = outcome(run) === 'failed'
     return `- ${run.repo}/${run.name} (${run.runId}) ${failed ? 'failed' : 'done'}${run.rc !== undefined ? ` rc=${run.rc}` : ` ${run.status}`}: read \`${command.report}\`, verify, continue.${failed ? ` Check the cause; resume with \`${command.resume}\` or relaunch.` : ''}`
   })
-  return lines.length ? `[workers mod, automatic] Your workers changed state:\n${lines.join('\n')}` : undefined
+  return lines.length ? `${header}\n${lines.join('\n')}` : undefined
 }
 
 export const DELIVERY_LIMIT = 4096

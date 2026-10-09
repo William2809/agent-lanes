@@ -11,6 +11,7 @@ import unittest
 
 SOURCE = (Path(__file__).parent.parent / 'hooks/register.tsx').read_text()
 COLLECT = re.search(r'export const COLLECT = String.raw`(.*?)`', SOURCE, re.S)[1]
+MARK = re.search(r'export const MARK = String.raw`(.*?)`', SOURCE, re.S)[1]
 
 STUB = """#!/usr/bin/env python3
 import os
@@ -110,6 +111,29 @@ class Records(unittest.TestCase):
         data = self.data()
         self.assertEqual(data['batches'][0]['text'], '')
         self.assertEqual(data['runs'][0]['rc'], 0)
+
+    def test_delivered_marker_names_its_run(self):
+        # v0.8.2: a session that received a report marks it; a same-name replacement is not covered.
+        log = self.record('a', rc=0, register=False)
+        self.assertFalse(self.data()['runs'][0]['delivered'])
+        subprocess.run([sys.executable, '-c', MARK, str(log), 'one'], check=True, timeout=10)
+        self.assertEqual(Path(str(log) + '.delivered').read_text(), 'one\n')
+        self.assertTrue(self.data()['runs'][0]['delivered'])
+        self.record('a', run_id='replacement', rc=1, register=False)
+        self.assertFalse(self.data()['runs'][0]['delivered'])
+
+    def test_marker_follows_a_record_archived_after_the_poll(self):
+        log = self.record('a', rc=0, register=False)
+        archived = log.parent / 'review.1009-120000.77.log'
+        for suffix in ('', '.run', '.exit'):
+            Path(str(log) + suffix).rename(str(archived) + suffix)
+        self.record('a', run_id='next', register=False)
+        done = subprocess.run([sys.executable, '-c', MARK, str(log), 'one'], timeout=10)
+        self.assertEqual(done.returncode, 0)
+        self.assertFalse(Path(str(log) + '.delivered').exists())
+        self.assertEqual(Path(str(archived) + '.delivered').read_text(), 'one\n')
+        gone = subprocess.run([sys.executable, '-c', MARK, str(log), 'nowhere'], timeout=10)
+        self.assertEqual(gone.returncode, 1)
 
     def test_archived_run_keeps_launch_identity(self):
         physical = self.record('a', name='review.1007-123456.123', rc=0, register=False)

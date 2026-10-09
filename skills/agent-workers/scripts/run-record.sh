@@ -22,7 +22,7 @@ ops_archive() {
 }
 ops_archive_locked() {
   ! ops_running "$1" || return 1
-  for _run_suffix in '' .pid .run .last .exit; do
+  for _run_suffix in '' .pid .run .last .exit .delivered; do
     [ ! -f "$1$_run_suffix" ] || mv "$1$_run_suffix" "$2$_run_suffix" || return 1
   done
 }
@@ -42,7 +42,7 @@ ops_run_record_locked() {
       { echo "wk: launch cancelled: the launching wk no longer holds the launch lock" >&2; return 1; }
   fi
   _run_started=$(date +%s)
-  for _run_suffix in .pid .exit; do
+  for _run_suffix in .pid .exit .delivered; do
     [ ! -e "$1$_run_suffix" ] || ctrash "$1$_run_suffix" >/dev/null || return 1
   done
   # lead_session: the Claude Code session that ran wk (the workers mod wakes it when the run ends).

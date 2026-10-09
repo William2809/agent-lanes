@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Collection, Context, Delivery, RunRecord, Summary } from '../types'
-import { events, identity, isProblem, lastTitle, notices, originLabel, origins, outcome, parse, remember, repoOf } from './parse'
+import { ADOPT_LIMIT, ADOPTED, events, identity, isProblem, lastTitle, notices, originLabel, origins, outcome, parse, remember, repoOf, unclaimed } from './parse'
 import { short, sparkline, weather } from './weather'
 
 const PANE = 'workers'
@@ -16,6 +16,9 @@ const isCollapsed = atom({ plugin: 'workers', key: 'isCollapsed' } as const, fal
 const isNudged = atom({ plugin: 'workers', key: 'isNudged' } as const, false)
 
 let isPolling = false
+// Identities `/workers adopt` chose; the next poll outside the command's turn sends them.
+let adopting: string[] | null = null
+const adopted = new Set<string>()
 
 const DAY = 86_400
 const DELIVERED = 'delivered-runs-v1'
@@ -59,6 +62,10 @@ for folder in sorted(root.iterdir()) if root.exists() else []:
                     record['ended'] = int(terminal[2])
                     # The same outcome rules as batches, so archived attempts need no batches row.
                     report = pathlib.Path(physical + '.last')
+                    try:
+                        record['delivered'] = pathlib.Path(physical + '.delivered').read_text().strip() == run_id
+                    except FileNotFoundError:
+                        record['delivered'] = False
                     if record['rc'] != 0 and values.get('paused_at'):
                         record['status'] = 'paused'
                     elif record['rc'] == 0 and not (report.exists() and report.stat().st_size):
@@ -105,6 +112,42 @@ for path, raw in metadata.values():
 print(json.dumps(dict(batches=batches, runs=records)))
 `
 
+// Mark received reports: one process per batch, a replace per file. Pairs: record log, run ID.
+// A resume may have archived the record since the poll: mark the record that holds the run ID.
+// Exit 1 if any run has no record left to mark.
+export const MARK = String.raw`
+import glob, os, sys
+def run_of(log):
+    try:
+        return dict(l.split('=', 1) for l in open(log + '.run').read().splitlines() if '=' in l).get('run_id')
+    except OSError:
+        return None
+missing = 0
+for log, run_id in zip(sys.argv[1::2], sys.argv[2::2]):
+    stem = log[:-4] if log.endswith('.log') else log
+    found = [p for p in [log] + glob.glob(glob.escape(stem) + '.*.log') if run_of(p) == run_id]
+    if not found:
+        missing += 1
+        continue
+    with open(found[0] + '.delivered.new', 'w') as f:
+        f.write(run_id + '\n')
+    os.replace(found[0] + '.delivered.new', found[0] + '.delivered')
+sys.exit(1 if missing else 0)
+`
+
+// Best effort: without its marker, a received report can show as unclaimed elsewhere (never lost).
+// Returns false when a marker was not written.
+async function markDelivered($: EngineInterface, runs: RunRecord[]): Promise<boolean> {
+  const done = runs.filter(run => run.rc !== undefined && !run.delivered)
+  if (!done.length) return true
+  try {
+    const ran = await $.process.run(['python3', '-c', MARK, ...done.flatMap(run => [run.recordLog ?? run.log, run.runId])], { timeoutMs: 5_000 })
+    return ran.exitCode === 0
+  } catch {
+    return false
+  }
+}
+
 async function collect($: EngineInterface, home: string, cutoff: number): Promise<Collection> {
   const ran = await $.process.run(['python3', '-c', COLLECT, home, String(cutoff)], { cwd: home, timeoutMs: 15_000 })
   if (ran.exitCode !== 0) throw new Error('worker records poll failed')
@@ -139,6 +182,11 @@ async function poll($: EngineInterface, notify = true) {
         throw error
       }
       announce($, fresh)
+      await markDelivered($, fresh)
+    }
+    if (adopting && notify) {
+      const taken = await adopt($, data.runs)
+      next.unclaimed = next.unclaimed?.filter(run => !taken.has(identity(run)))
     }
     await update($, summary, () => next)
   } catch {
@@ -150,6 +198,24 @@ async function poll($: EngineInterface, notify = true) {
   } finally {
     isPolling = false
   }
+}
+
+// One prompt with the chosen reports that are still unclaimed; markers only after it is queued.
+async function adopt($: EngineInterface, runs: RunRecord[]): Promise<Set<string>> {
+  const chosen = new Set(adopting)
+  const pick = runs.filter(run => chosen.has(identity(run)) && run.rc !== undefined && !run.delivered)
+  const text = notices(pick, ADOPTED)
+  if (text) {
+    const sent = await $.prompt.submit({ text })
+    if (sent.drop !== undefined) throw new Error('adopted reports were not queued')
+    // This session never offers them again, even if a marker write failed.
+    for (const run of pick) adopted.add(identity(run))
+    if (!(await markDelivered($, pick))) $.ui.toast('Adopted reports sent; some delivered markers were not written')
+  }
+  const gone = chosen.size - pick.length
+  if (gone > 0) $.ui.toast(`${gone} chosen report${gone > 1 ? 's were' : ' was'} already received or past 24 h; not sent`)
+  adopting = null
+  return new Set(pick.map(identity))
 }
 
 // Session titles do not change often; look each one up once per load.
@@ -182,7 +248,13 @@ async function withOrigins($: EngineInterface, home: string, data: Collection, c
       workers.push({ ...w, log: run.log, runId: run.runId, repo: run.repo, session: run.session, origin: originLabel(origin, mine, titles) })
     }
   }
-  return { workers, finished, checkedAt }
+  const lost: RunRecord[] = []
+  for (const run of unclaimed(data.runs, mine, checkedAt / 1000).filter(r => !adopted.has(identity(r)))) {
+    const origin = known.get(identity(run))
+    if (origin?.session?.slug) await titleOf($, home, origin.session)
+    lost.push({ ...run, origin: originLabel(origin, mine, titles) })
+  }
+  return { workers, finished, checkedAt, unclaimed: lost }
 }
 
 function announce($: EngineInterface, fresh: RunRecord[]) {
@@ -211,7 +283,7 @@ async function measure($: EngineInterface) {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'workers', description: 'Show all workers and worktrees in a side pane' })
+    await $.command.register({ name: 'workers', description: 'Show all workers and worktrees in a side pane; /workers adopt takes unclaimed reports' })
     void poll($)
     void measure($)
     $.clock.every(POLL_MS, () => poll($))
@@ -221,11 +293,19 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     void measure($)
+    if (adopting) void poll($)
     return done
   })
 
   // Full list, worktrees included: the slow run, so only on request.
-  on('command.run', { command: 'workers' }, async $ => {
+  on('command.run', { command: 'workers' }, async ($, e) => {
+    if ((e.args ?? '').trim() === 'adopt') {
+      // The host forbids prompt submission while command.run holds the turn: the next poll sends it.
+      const lost = ((await read($, summary))?.unclaimed ?? []).slice(0, ADOPT_LIMIT)
+      if (!lost.length) return { text: 'No unclaimed worker reports.' }
+      adopting = lost.map(identity)
+      return { text: `Adopting ${lost.length} unclaimed worker report${lost.length > 1 ? 's' : ''}: one prompt follows this turn.` }
+    }
     await update($, detail, () => 'Loading…')
     await $.ui.open({ id: PANE, title: 'Workers' })
     // The host forbids prompt submission while command.run holds the turn.
@@ -238,7 +318,9 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const text = (await read($, detail)) ?? 'Run /workers to load.'
-    const workers = (await read($, summary))?.workers ?? []
+    const now = await read($, summary)
+    const workers = now?.workers ?? []
+    const lost = now?.unclaimed ?? []
     return (
       <Box flexDirection="column">
         {text.split('\n').map(line => {
@@ -251,6 +333,13 @@ export const register: Register = on => {
             </Box>
           )
         })}
+        {lost.length > 0 && <Text color="warning">Unclaimed reports ({lost.length}): no session received them. /workers adopt takes them here.</Text>}
+        {lost.map(run => (
+          <Box gap={1}>
+            <Text wrap="truncate-end">  {run.repo}/{run.name} ({run.runId}) {outcome(run)} rc={run.rc}</Text>
+            <Text color="warning">[{run.origin}]</Text>
+          </Box>
+        ))}
       </Box>
     )
   })
@@ -311,6 +400,7 @@ export const register: Register = on => {
                 ⚙ <Text bold>{running}</Text> running{repos.length > 0 && <Text dimColor> ({repos.join(', ')})</Text>}
               </Text>
             )}
+            {(now.unclaimed?.length ?? 0) > 0 && <Text color="warning">· {now.unclaimed!.length} unclaimed</Text>}
             {[...problems.values()].map(p => (
               <Text color={p.origin.startsWith('this session') ? 'error' : 'warning'}>
                 · {p.count} {p.status.toLowerCase()} <Text dimColor>({p.origin})</Text>
