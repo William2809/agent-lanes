@@ -1,6 +1,6 @@
 {
   "name": "workers",
-  "version": "0.1.1",
-  "description": "Live worker count above the prompt, toasts when workers finish or fail, /workers pane",
+  "version": "0.2.0",
+  "description": "Live worker count above the prompt, toasts when workers finish or fail, /workers pane, unclaimed reports (/workers adopt)",
   "types": "./types/index.d.ts"
 }

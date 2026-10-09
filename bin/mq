@@ -9,6 +9,8 @@
 #   mq drop WT              remove WT from the queue
 #   mq waiting              ready lanes blocked by uncommitted main-checkout edits (silent when none)
 # A claim is live while its worktree exists, so land's `wt-dev rm` releases it. Output: one line per event.
+# A repair that changes or removes existing test lines, baselines or check config (MQ_GUARD_PATHS) is parked
+# for review instead of requeued; adding tests is fine. A manual `mq add` after review lands it.
 set -u
 # Run from a private copy: sh parses as it runs, so in-place edits can break a live runner.
 if [ -z "${MQ_COPY:-}" ]; then
@@ -45,7 +47,7 @@ _setq() { _qt=$(mktemp "$st/queue.XXXXXX") || return 1
 setq() { mutate _setq "$@"; }
 _delq() { _qt=$(mktemp "$st/queue.XXXXXX") || return 1
   awk -F'\t' -v w="$1" '$1!=w' "$q" >"$_qt" && mv "$_qt" "$q" || return 1
-  ctrash "$st/bounce-head.$1" "$st/deferred.$1" >/dev/null; }
+  ctrash "$st/bounce-head.$1" "$st/deferred.$1" "$st/guarded.$1" >/dev/null; }
 delq() { mutate _delq "$@"; }
 field() { awk -F'\t' -v w="$1" -v f="$2" '$1==w{print $f}' "$q"; }
 # Prefix overlap in either direction.
@@ -96,13 +98,42 @@ repair_moved() {
   _after=$(git -C "$(wt-dev path "$1")" rev-parse HEAD 2>/dev/null) || return 1
   [ -n "$_before" ] && [ "$_before" != "$_after" ]
 }
+# Tests, baselines and check config: a repair may add to them, but changing or removing an existing
+# line (or adding a skip) needs review. MQ_GUARD_PATHS (an ERE over repo paths) replaces the default.
+guard_paths=${MQ_GUARD_PATHS:-'(^|/)(tests?|__tests__|specs?|e2e|playwright)/|\.(test|spec)\.[^/]+$|(^|/)test_[^/]+\.py$|_test\.(py|go)$|(^|/)(vitest|jest|playwright|cypress)\.config\.|(^|/)(pytest\.ini|conftest\.py|\.wt-dev\.conf|\.remote-ci\.conf|\.remote-ci\.conf)$|baseline[^/]*$'}
+# repair_weakens WT: guarded files the repair's own commits (no merges, none already on main: a
+# rebase or merge brings in others' edits) weakened: deleted, renamed away, retyped, mode-changed,
+# changed or removed existing lines, or added a skip. A skip outside guarded files is not seen.
+repair_weakens() {
+  # Unreadable state parks (fails closed).
+  _rw_p=$(wt-dev path "$1" 2>/dev/null) && _rw_base=$(cat "$st/bounce-head.$1" 2>/dev/null) &&
+    _rw_main=$(git -C "$main" rev-parse HEAD 2>/dev/null) || { echo "(guard check failed)"; return 0; }
+  for _rw_c in $(git -C "$_rw_p" rev-list --no-merges HEAD --not "$_rw_base" "$_rw_main" 2>/dev/null); do
+    git -C "$_rw_p" diff-tree -r -z --no-commit-id --no-renames --raw "$_rw_c" | tr '\0' '\n' |
+      awk -v re="$guard_paths" 'NR%2 {split($0, m, " "); next}
+        $0 ~ re && (m[5]=="D" || m[5]=="T" || (m[5]=="M" && substr(m[1], 2)!=m[2])) {print}'
+    git -C "$_rw_p" diff-tree -r -z --no-commit-id --no-renames --numstat --diff-filter=M "$_rw_c" | tr '\0' '\n' |
+      awk -F'\t' -v re="$guard_paths" '{p=$0; sub(/^[^\t]*\t[^\t]*\t/, "", p)} $2!="0" && p ~ re {print p}'
+    git -C "$_rw_p" diff-tree -p -U0 --no-commit-id --no-renames "$_rw_c" | awk -v re="$guard_paths" '
+      /^\+\+\+ b\// {f=substr($0,7); next}
+      /^\+/ && f ~ re && /(\.skip\(|\.only\(|(^|[^a-z])xit\(|(^|[^a-z])xdescribe\(|@skip|mark\.skip|skipTest|test\.fixme|t\.Skip\()/ {print f}'
+  done | sort -u
+}
 _ready_again() {
   repair_moved "$1" || return $?
+  _rw=$(repair_weakens "$1")
+  if [ -n "$_rw" ]; then printf '%s\n' "$_rw" >"$st/guarded.$1"; return 3; fi
   date +%s >"$st/requeue.$1"
   : >"$st/parked.$1"
   _setq "$1" ready "$2" "$3"
 }
 ready_again() { mutate _ready_again "$@"; }
+# A repair that changed existing tests waits for a person: review the diff, then `mq add WT` lands it.
+park_guarded() {
+  _pg=$(head -3 "$st/guarded.$1" 2>/dev/null | tr '\n' ' ')
+  park "$1" "$2" "$3" "repair changed tests: ${_pg% }"
+  echo "PARKED $1: repair changed existing tests or check config (${_pg% }); review, then mq add $1"
+}
 _park() { _setq "$1" parked "$2" "$3" || return 1; echo "$4" >"$st/parked.$1"; ev "$1" parked "$4"; }
 park() { mutate _park "$@"; }
 _fixer_state() {
@@ -509,6 +540,7 @@ while :; do
       ready_again "$w" "$b" "$k"; repair_status=$?
       if [ "$repair_status" != 0 ]; then
         [ "$repair_status" != 2 ] || continue
+        if [ "$repair_status" = 3 ]; then park_guarded "$w" "$b" "$k"; continue; fi
         park "$w" "$b" "$k" "no new commit"; echo "PARKED $w: worker $k produced no new commit"; continue
       fi
       ev "$w" requeued "$k"; echo "requeued $w (worker $k done)"
@@ -534,6 +566,7 @@ while :; do
       ready_again "$w" "$(field "$w" 3)" "$k"; repair_status=$?
       if [ "$repair_status" != 0 ]; then
         [ "$repair_status" != 2 ] || continue
+        if [ "$repair_status" = 3 ]; then park_guarded "$w" "$(field "$w" 3)" "$k"; continue; fi
         park "$w" "$(field "$w" 3)" "$k" "no new commit"; echo "PARKED $w: repair produced no new commit"; continue
       fi
       ev "$w" requeued "$k"; echo "requeued $w (committed)"

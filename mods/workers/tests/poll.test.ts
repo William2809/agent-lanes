@@ -20,9 +20,11 @@ function world(on: On) {
   const memory = new Map<string, unknown>()
   const store = new Map<string, unknown>()
   const prompts: string[] = []
+  const marks: string[][] = []
   let data = collection([])
   let failed = false
   let rejectPrompt = false
+  let markFails = false
   let version = 0
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
@@ -40,20 +42,27 @@ function world(on: On) {
     store.set(e.key, JSON.parse(JSON.stringify(e.value)))
     return { value: undefined }
   })
-  on('process.run', (_$, e) => ({ value: {
+  on('process.run', (_$, e) => {
+    if (e.argv[2]?.includes('os.replace')) {
+      marks.push(e.argv.slice(3))
+      return { value: { exitCode: markFails ? 1 : 0, stdout: '', stderr: '' } }
+    }
+    return { value: {
     exitCode: e.argv[0] === 'python3' && failed ? 1 : 0,
     stdout: e.argv[0] === 'python3' ? JSON.stringify(data) : '', stderr: '',
-  } }))
+  } }
+  })
   on('prompt.submit', (_$, e) => {
     if (rejectPrompt) throw new Error('queue unavailable')
     prompts.push(e.text)
     return { text: e.text }
   })
   return {
-    memory, store, prompts, clock,
+    memory, store, prompts, clock, marks,
     data: (next: Collection) => { data = next },
     fail: (next: boolean) => { failed = next },
     rejectPrompt: (next: boolean) => { rejectPrompt = next },
+    markFails: (next: boolean) => { markFails = next },
   }
 }
 
@@ -134,4 +143,102 @@ test('a rejected prompt can retry without losing the event', async ($, on) => {
   expect(w.prompts.length).toBe(1)
   await w.clock.advance(30_000)
   expect(w.prompts.length).toBe(1)
+})
+
+// Unclaimed reports (v0.8.2): a finished run whose lead never received it, shown, adopted on request.
+const finished = (runId: string, session: string, extra: Partial<RunRecord> = {}): RunRecord =>
+  ({ ...run('a', runId, 'done', session), started: -500, rc: 0, ended: -100, ...extra })
+
+test('a delivered report gets its marker once, after its prompt is queued', async ($, on) => {
+  const w = world(on)
+  const mine = finished('one', 'S')
+  w.data(collection([mine]))
+  await $.session.start(start)
+  await w.clock.settle()
+  expect(w.prompts.length).toBe(1)
+  expect(w.marks).toEqual([[mine.log, 'one']])
+  // Collected as delivered: no more writes, no repeat.
+  w.data(collection([{ ...mine, delivered: true }]))
+  await w.clock.advance(30_000)
+  expect(w.marks.length).toBe(1)
+  expect(w.prompts.length).toBe(1)
+})
+
+test('another session\'s undelivered report is unclaimed; the band never prompts for it', async ($, on) => {
+  const w = world(on)
+  w.data(collection([
+    finished('lost', 'GONE'),
+    finished('taken', 'GONE', { delivered: true }),
+    finished('fixer', 'GONE', { name: 'review-mq1r' }),
+    finished('paused', 'GONE', { rc: 143, status: 'paused' }),
+    finished('nolead', ''),
+    finished('fresh', 'GONE', { ended: 90 }),
+  ]))
+  await $.session.start(start)
+  await w.clock.settle()
+  const summary = w.memory.get('summary') as Summary
+  expect(summary.unclaimed?.map(r => r.runId)).toEqual(['lost'])
+  expect(w.prompts.length).toBe(0)
+  expect(w.marks.length).toBe(0)
+})
+
+test('/workers adopt sends one prompt, then marks; a second adopt has nothing', async ($, on) => {
+  const w = world(on)
+  const lost = [finished('lost1', 'GONE'), finished('lost2', 'GONE', { rc: 1, status: 'unknown' })]
+  w.data(collection(lost))
+  await $.session.start(start)
+  await w.clock.settle()
+  const reply = await $.command.run({ command: 'workers', args: 'adopt' } as never)
+  expect(JSON.stringify(reply)).toContain('Adopting 2 unclaimed worker reports')
+  expect(w.prompts.length).toBe(0)
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(1)
+  expect(w.prompts[0]).toContain('adopted with /workers adopt')
+  expect(w.prompts[0]).toContain('a/review (lost1) done rc=0')
+  expect(w.prompts[0]).toContain('a/review (lost2) failed rc=1')
+  expect(w.marks).toEqual([[lost[0]!.log, 'lost1', lost[1]!.log, 'lost2']])
+  expect((w.memory.get('summary') as Summary).unclaimed).toEqual([])
+  w.data(collection(lost.map(r => ({ ...r, delivered: true }))))
+  await w.clock.advance(30_000)
+  expect(JSON.stringify(await $.command.run({ command: 'workers', args: 'adopt' } as never))).toContain('No unclaimed')
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(1)
+})
+
+test('a report another session adopted is not announced to its lead again', async ($, on) => {
+  const w = world(on)
+  w.data(collection([finished('one', 'S', { delivered: true })]))
+  await $.session.start(start)
+  await w.clock.settle()
+  expect(w.prompts.length).toBe(0)
+})
+
+test('an adopted report is not offered again when its marker could not be written', async ($, on) => {
+  const w = world(on)
+  w.data(collection([finished('lost', 'GONE')]))
+  w.markFails(true)
+  await $.session.start(start)
+  await w.clock.settle()
+  await $.command.run({ command: 'workers', args: 'adopt' } as never)
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(1)
+  await w.clock.advance(30_000)
+  expect((w.memory.get('summary') as Summary).unclaimed).toEqual([])
+  expect(JSON.stringify(await $.command.run({ command: 'workers', args: 'adopt' } as never))).toContain('No unclaimed')
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(1)
+})
+
+test('a chosen report that left the 24 h window is not sent, and adoption ends', async ($, on) => {
+  const w = world(on)
+  w.data(collection([finished('lost', 'GONE')]))
+  await $.session.start(start)
+  await w.clock.settle()
+  await $.command.run({ command: 'workers', args: 'adopt' } as never)
+  w.data(collection([]))
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(0)
+  w.data(collection([finished('lost', 'GONE')]))
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(0)
 })

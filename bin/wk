@@ -162,6 +162,9 @@ elif [ -f "$HOME/.claude/state/headers/$repo.md" ]; then hdr=$(sed -e "s#{{DIR}}
 else hdr="Working directory: $dir$url. English. Never print secrets. $git."; fi
 case "$hdr" in *"Report style"*) ;; *) hdr="$hdr
 Report style: about 80% ASD-STE100 (short sentences, one fact each, active voice, plain words). Final report fields: Changed: · Verified live: (command → result) · Verified by stub or reasoning only: · Not done / risks:. A claim without a live check never goes under Verified live." ;; esac
+# Writers get the test rule unless the repo header has its own: a test's expected result must not come from the code.
+case "$sb:$hdr" in read-only:*|*"Test rule"*) ;; *) hdr="$hdr
+Test rule: add or change a test only for a named requirement (a behavior card line or the brief) or a reproduced defect. Never take the expected value from the code under test. A bug-fix test must fail on the old code first. Never weaken, skip or delete an existing assertion to get green; report it instead. Per test, report: requirement, boundary tested, gaps." ;; esac
 printf '%s\n%s\n' "$hdr" "$body" >"$p"
 [ -z "${WK_LAUNCH_INTENT:-}" ] || [ -d "$WK_LAUNCH_INTENT" ] || { echo "wk: repair launch cancelled" >&2; exit 1; }
 launch_lock=$launch_lock WK_PRESET=$m WK_ROUTE=$route WK_HARNESS=$harness sh "$skills/agent-workers/scripts/run-worker.sh" "$model" "$eff" "$sb" "$dir" "$p" "$log" >/dev/null || { echo "wk: launch of $name FAILED (run-worker refused; see above)" >&2; exit 1; }

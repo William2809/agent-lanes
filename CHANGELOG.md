@@ -4,6 +4,15 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-10-09
+
+### Added
+
+- workers mod (0.2.0): unclaimed reports. The session that receives a worker's report writes `<log>.delivered` (the run ID; it moves with the record when an attempt is archived). A finished run whose lead session never received it (the session was closed, or ran an older mod) counts as unclaimed after 2 minutes. The band shows "N unclaimed", the `/workers` pane lists them with the session that launched them, and `/workers adopt` sends them to the current session as one prompt (up to 20, one line each). Nothing is sent to other sessions automatically. Runs without a lead session, `mq` repair workers and paused runs are not counted. A report another session adopted is not announced to its lead again. Markers are written only after the prompt is queued, so a crash can show a received report as unclaimed but never hides one.
+- `wk`: writing workers get a standing test rule in their header: add or change a test only for a named requirement or a reproduced defect, never take the expected value from the code under test, show a bug-fix test failing on the old code first, and never weaken, skip or delete an existing assertion to get green. Headers that already have a "Test rule" keep theirs.
+- `mq`: a bounce repair that changes or removes existing lines in tests, deletes, renames away or changes the mode of a test file, adds a skip, or edits baselines or check config is parked for review ("repair changed tests: FILES") instead of requeued. Adding tests is fine. Only the repair's own commits count: changes merged or rebased in from main do not. A skip added outside test files is not detected. `MQ_GUARD_PATHS` (an extended regex over repo paths) replaces the default file pattern. After review, `mq add WT` lands it.
+- The merge queue test suites (`tests/test_workflow.py`, `tests/test_bounce_train.py`, `tests/test_mq_guard.py`) ship with the public tree.
+
 ## [0.8.1] - 2026-10-09
 
 ### Changed
@@ -150,7 +159,8 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 - First public release: `wk`, `mq` with `land`, `ao-model` presets, `ctrash`, and the skills `agent-workers`, `model-presets`, `remote-ci`, `session-stats`, `ui-audit`, `ui-shots`, `wt-compare` and `wt-dev`.
 - README example setup with a laptop and a second Mac as the check runner.
 
-[Unreleased]: ../../compare/v0.8.1...HEAD
+[Unreleased]: ../../compare/v0.8.2...HEAD
+[0.8.2]: ../../compare/v0.8.1...v0.8.2
 [0.8.1]: ../../compare/v0.8.0...v0.8.1
 [0.8.0]: ../../compare/v0.7.0...v0.8.0
 [0.7.0]: ../../compare/v0.6.0...v0.7.0

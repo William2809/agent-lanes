@@ -176,11 +176,15 @@ class RunRecordTests(unittest.TestCase):
         self.start()
         self.finish('r1')
         old_id = self.record('r1')['run_id']
+        # The workers mod's delivered marker travels with its record (v0.8.2).
+        self.side('r1', '.delivered').write_text(old_id + '\n')
         self.start(FAKE_WORKER_MODE='hold')
         self.assertFalse(self.side('r1', '.exit').exists())
+        self.assertFalse(self.side('r1', '.delivered').exists())
         old = next(self.log('r1').parent.glob('r1.*.log'))
         self.assertEqual(self.record_file(old)['run_id'], old_id)
         self.assertTrue(Path(str(old) + '.exit').exists())
+        self.assertEqual(Path(str(old) + '.delivered').read_text(), old_id + '\n')
         os.kill(int(self.side('r1', '.pid').read_text()), signal.SIGTERM)
         self.finish('r1')
 
