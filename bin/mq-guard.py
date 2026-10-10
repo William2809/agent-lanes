@@ -24,13 +24,20 @@ class Unknown(Exception):
     pass
 
 
+def run(args, env, stdin=''):
+    """ARGS' exit code and stdout, decoded byte for byte: text=True would turn a CR inside a
+    path or a patch line into a line break."""
+    done = subprocess.run(args, input=stdin.encode('utf-8', 'surrogateescape'), capture_output=True,
+                          timeout=60, env={**os.environ, **env})
+    return done.returncode, done.stdout.decode('utf-8', 'surrogateescape')
+
+
 def git(lane, *args, ok=(0,), status=False):
     # Paths after -- are literal file names, never patterns.
-    done = subprocess.run(['git', '-C', lane, *args], capture_output=True, text=True, timeout=60,
-                          env={**os.environ, 'GIT_LITERAL_PATHSPECS': '1'})
-    if done.returncode not in ok:
+    rc, out = run(['git', '-C', lane, *args], {'GIT_LITERAL_PATHSPECS': '1'})
+    if rc not in ok:
         raise Unknown('git ' + ' '.join(args[:2]))
-    return (done.returncode, done.stdout) if status else done.stdout
+    return (rc, out) if status else out
 
 
 def replay_conflicts(out):
@@ -69,12 +76,11 @@ def matching(pattern, paths):
     """The paths the ERE matches. A path awk cannot see as one line counts as matched."""
     name, regex = pattern
     lines = [p for p in paths if '\n' not in p]
-    done = subprocess.run(['awk', 'BEGIN { re = ENVIRON["MQ_GUARD_RE"]; "" ~ re } $0 ~ re'],
-                          input=''.join(p + '\n' for p in lines), capture_output=True, text=True,
-                          timeout=60, env={**os.environ, 'MQ_GUARD_RE': regex})
-    if done.returncode:
+    rc, out = run(['awk', 'BEGIN { re = ENVIRON["MQ_GUARD_RE"]; "" ~ re } $0 ~ re'], {'MQ_GUARD_RE': regex},
+                  ''.join(p + '\n' for p in lines))
+    if rc:
         raise Unknown(f'{name} is not a valid ERE')
-    return set(done.stdout.split('\n')[:-1]) | {p for p in paths if '\n' in p}
+    return set(out.split('\n')[:-1]) | {p for p in paths if '\n' in p}
 
 
 def scripts(lane, tree, path, exists):
@@ -151,11 +157,12 @@ def main():
         # A guarded file both sides changed was resolved by hand or by Git; either way someone must
         # check that main's stricter version survived.
         for merge in git(lane, 'rev-list', '--merges', 'HEAD', '--not', base, main_head).split():
-            paths = set(git(lane, 'diff-tree', '--cc', '-r', '--name-only', '--no-commit-id', merge).splitlines())
+            # -z: plain output quotes a name with a control character, so no pattern would match it.
+            paths = {p for p in git(lane, 'diff-tree', '--cc', '-r', '-z', '--name-only', '--no-commit-id', merge).split('\0') if p}
             parents = git(lane, 'rev-list', '--parents', '-n', '1', merge).split()[1:]
             if len(parents) == 2:
                 fork = git(lane, 'merge-base', *parents).strip()
-                sides = [set(git(lane, 'diff', '--name-only', '--no-renames', fork, p).splitlines()) for p in parents]
+                sides = [{q for q in git(lane, 'diff', '-z', '--name-only', '--no-renames', fork, p).split('\0') if q} for p in parents]
                 paths |= sides[0] & sides[1]
             guarded = matching(TESTS, paths) | matching(CONFIG, paths) | matching(PACKAGE, paths)
             found |= {path + ' (merge resolution)' for path in guarded}

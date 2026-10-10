@@ -114,6 +114,18 @@ class RepairGuardTests(unittest.TestCase):
         out = self.repair('src.txt', 'source fix\n').stdout
         self.assertIn('.remote-ci.conf (merge resolution)', out)
 
+    def test_merge_resolution_on_a_test_named_with_a_carriage_return_is_parked(self):
+        # Plain --name-only output quotes such a name ("tests/test_a\rb.py"), which no pattern matched.
+        name = 'tests/test_a\rb.py'
+        self.f.commit(self.f.repo, name, 'assert total() == 3\n')
+        lane = self.f.lanes['b']
+        self.f.git('merge', '-q', '--no-commit', 'main', cwd=lane)
+        (lane / name).write_text('assert total() == 0\n')
+        self.f.git('add', '-A', cwd=lane)
+        self.f.git('commit', '-q', '--no-edit', cwd=lane)
+        self.repair('src.txt', 'source fix\n')
+        self.assertIn(name.encode() + b' (merge resolution)', (self.f.state / 'guarded.b').read_bytes())
+
     def test_merge_that_keeps_the_lane_side_of_a_check_is_parked(self):
         # Review of v083: -X ours drops main's stricter check; the merge result equals a parent.
         lane = self.f.lanes['b']
@@ -293,6 +305,25 @@ class RepairGuardTests(unittest.TestCase):
                           '        x = 1\x0cself.skipTest("later")\n        pass\n').stdout
         self.assertIn('PARKED b', out)
 
+
+    def test_added_skip_after_a_carriage_return_parks(self):
+        # Review of v0.8.3 round 5: text=True turned the CR into a line break before added() ran.
+        lane = self.f.lanes['b']
+        self.f.commit(lane, 'tests/total.test.mjs', "let skipped = 0\ntest('total', (t) => {\n  assert.equal(0, 3)\n})\n")
+        self.bounce_here()
+        out = self.repair('tests/total.test.mjs', "let skipped = 0\ntest('total', (t) => {\n"
+                          'skipped++;\rt.skip("temporarily disabled"); return;\n  assert.equal(0, 3)\n})\n').stdout
+        self.assertIn('PARKED b', out)
+
+    def test_test_named_with_a_carriage_return_parks_under_its_own_name(self):
+        # Git output went through text=True: the CR came back as a line break, so the park (fail
+        # closed) named a path that does not exist.
+        lane = self.f.lanes['b']
+        self.f.commit(lane, 'tests/test_a\rb.py', 'assert total() == 3\n')
+        self.bounce_here()
+        out = self.repair('tests/test_a\rb.py', 'assert total() == 0\n').stdout
+        self.assertIn('PARKED b', out)
+        self.assertEqual((self.f.state / 'guarded.b').read_bytes(), b'tests/test_a\rb.py\n')
 
 class ReplayConflictParseTests(unittest.TestCase):
     """`git merge-tree -z --name-only` output; Git documents conflicts with no conflicted-file entry."""
