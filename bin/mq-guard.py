@@ -107,10 +107,22 @@ def weakened(lane, old, new):
     # Each test file's own patch: no header parsing, so a quoted file name keeps its skips.
     for (_, _, _, _, status), path in rows:
         if path in tests and status in 'AM' and any(
-                line.startswith('+') and not line.startswith('+++') and SKIP.search(line)
-                for line in git(lane, 'diff-tree', '-p', '-U0', '--no-renames', old, new, '--', path).splitlines()):
+                SKIP.search(line) for line in added(git(lane, 'diff-tree', '-p', '-U0', '--no-renames', old, new, '--', path))):
             found.add(path)
     return found
+
+
+def added(patch):
+    """The added lines of PATCH, found inside hunks: an added line may itself start with "++"."""
+    lines, hunk = [], False
+    for line in patch.split('\n'):  # not splitlines(): a form feed inside a line is not a line break
+        if line.startswith('diff --git '):
+            hunk = False
+        elif line.startswith('@@'):
+            hunk = True
+        elif hunk and line.startswith('+'):
+            lines.append(line[1:])
+    return lines
 
 
 def main():

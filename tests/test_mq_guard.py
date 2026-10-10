@@ -276,6 +276,23 @@ class RepairGuardTests(unittest.TestCase):
                           '    @unittest.skip("later")\n    def test_a(self): pass\n').stdout
         self.assertIn('PARKED b', out)
 
+    def test_added_skip_on_a_line_starting_with_plus_plus_parks(self):
+        # Review of v0.8.3 round 4, finding 3: "+++skipped; t.skip(...)" read as a file header.
+        lane = self.f.lanes['b']
+        self.f.commit(lane, 'tests/total.test.js', 'let skipped = 0\ntest("total", t => {\n  assert(total() === 3)\n})\n')
+        self.bounce_here()
+        out = self.repair('tests/total.test.js', 'let skipped = 0\ntest("total", t => {\n'
+                          '++skipped; t.skip("temporarily disabled"); return;\n  assert(total() === 3)\n})\n').stdout
+        self.assertIn('PARKED b', out)
+
+    def test_added_skip_after_a_form_feed_parks(self):
+        lane = self.f.lanes['b']
+        self.f.commit(lane, 'tests/test_ff.py', 'import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        pass\n')
+        self.bounce_here()
+        out = self.repair('tests/test_ff.py', 'import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n'
+                          '        x = 1\x0cself.skipTest("later")\n        pass\n').stdout
+        self.assertIn('PARKED b', out)
+
 
 class ReplayConflictParseTests(unittest.TestCase):
     """`git merge-tree -z --name-only` output; Git documents conflicts with no conflicted-file entry."""

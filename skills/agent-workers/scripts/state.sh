@@ -91,14 +91,20 @@ ops_move_lock() {
   ! ops_pid_live "$(cat "$2/mover" 2>/dev/null)" || return 0
   _ops_to="$HOME/.claude-trash/$(date +%F)"; mkdir -p "$_ops_to" || return 1
   # A failed move gets a second mover, as ctrash retried a failed mv. A mover that is not
-  # registered within 5 seconds (wall clock) exits without moving anything.
+  # registered within 5 seconds (wall clock) exits without moving anything. Each mover is waited
+  # for even when its registration write failed (a cut-off write can still register it), and the
+  # retry runs only while LOCK is the same lock with the same owner, so it never moves a successor's.
+  _ops_id=$(ops_stat '%d:%i' '%d:%i' "$1" || true); _ops_owner=$(cat "$1/pid" 2>/dev/null || true)
   for _ops_try in 1 2; do
     [ -d "$1" ] || return 0
+    [ "$_ops_try" = 1 ] || { [ "$(ops_stat '%d:%i' '%d:%i' "$1" || true)" = "$_ops_id" ] &&
+      [ "$(cat "$1/pid" 2>/dev/null || true)" = "$_ops_owner" ]; } || return 1
     sh -c 'end=$(($(date +%s) + 5)); until [ "$(cat "$1/mover" 2>/dev/null)" = "$$" ]; do
         [ "$(date +%s)" -lt "$end" ] || exit 1; sleep 0.01; done
       exec mv "$2" "$3.$$"' sh "$2" "$1" "$_ops_to/$(basename "$1").$(date +%H%M%S)" &
     _ops_mover=$!
-    echo "$_ops_mover" >"$2/mover" && wait "$_ops_mover" && return 0
+    echo "$_ops_mover" >"$2/mover"
+    wait "$_ops_mover" && return 0
   done
   return 1
 }
