@@ -306,6 +306,43 @@ class RunRecordTests(unittest.TestCase):
         self.assertEqual(calls.read_text(), 'x\n')
         self.assertFalse(lock.exists())
 
+    def test_failed_lock_move_is_retried(self):
+        # Review of v0.8.3 round 3, finding 1: ctrash retried a failed mv; the mover must too.
+        lock = self.f.state / 'record.lock'
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        shims = self.f.root / 'flaky-mv'
+        shims.mkdir()
+        count = self.f.root / 'mv-count'
+        (shims / 'mv').write_text(f'#!/bin/sh\nn=$(cat "{count}" 2>/dev/null || echo 0); echo $((n + 1)) >"{count}"\n'
+                                  '[ "$n" -gt 0 ] || exit 1\nexec /bin/mv "$@"\n')
+        (shims / 'mv').chmod(0o755)
+        done = self.f.run('sh', '-c', '. "$1/state.sh"; ops_lock "$2" && ops_unlock "$2"', 'sh', str(SCRIPTS), str(lock),
+                          env={'PATH': f'{shims}:{self.f.env["PATH"]}'}, check=False)
+        self.assertEqual(done.returncode, 0)
+        self.assertFalse(lock.exists())
+        self.assertEqual(count.read_text(), '2\n')
+
+    def test_supervisor_whose_release_failed_still_publishes(self):
+        # Review of v0.8.3 round 3, finding 1: the supervisor waited on its own record lock and
+        # exited before .last and .exit, so a finished worker showed as DIED.
+        shims = self.f.root / 'stuck-mv'
+        shims.mkdir()
+        count = self.f.root / 'mv-count'
+        (shims / 'mv').write_text(f'''#!/bin/sh
+case "$1" in *.record.lock)
+  if ps -o command= -p "$(cat "$1/pid" 2>/dev/null)" 2>/dev/null | grep -q supervise-worker; then
+    n=$(cat "{count}" 2>/dev/null || echo 0)
+    [ "$n" -ge 2 ] || {{ echo $((n + 1)) >"{count}"; exit 1; }}
+  fi ;;
+esac
+exec /bin/mv "$@"
+''')
+        (shims / 'mv').chmod(0o755)
+        self.start(PATH=f'{shims}:{self.f.env["PATH"]}')
+        self.assertRegex(self.finish('r1'), r'^rc=0 ended=\d+\n$')
+        self.assertEqual(self.side('r1', '.last').read_text(), 'Changed: sidecar report\n')
+        self.assertEqual((self.f.root / 'mv-count').read_text(), '2\n')
+
     def test_replaced_attempt_cannot_publish_old_exit(self):
         for replacement_exit in ('', 'rc=0 ended=1\n'):
             with self.subTest(replacement_exit=replacement_exit):

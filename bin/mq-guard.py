@@ -25,7 +25,9 @@ class Unknown(Exception):
 
 
 def git(lane, *args, ok=(0,), status=False):
-    done = subprocess.run(['git', '-C', lane, *args], capture_output=True, text=True, timeout=60)
+    # Paths after -- are literal file names, never patterns.
+    done = subprocess.run(['git', '-C', lane, *args], capture_output=True, text=True, timeout=60,
+                          env={**os.environ, 'GIT_LITERAL_PATHSPECS': '1'})
     if done.returncode not in ok:
         raise Unknown('git ' + ' '.join(args[:2]))
     return (done.returncode, done.stdout) if status else done.stdout
@@ -44,6 +46,16 @@ def replay_conflicts(out):
             paths |= set(named)
         at += count + 3
     return paths
+
+
+def under(lane, paths, trees):
+    """The files at or below PATHS in any of TREES: a directory conflict covers the files it holds,
+    also when the directory exists only before the rename."""
+    found = set(paths)
+    for tree in trees:
+        for path in paths:
+            found |= {p for p in git(lane, 'ls-tree', '-r', '-z', '--name-only', tree, '--', path).split('\0') if p}
+    return found
 
 
 def guarded_conflicts(paths):
@@ -92,11 +104,11 @@ def weakened(lane, old, new):
         parts = row.split('\t', 2)
         if len(parts) == 3 and parts[1] != '0' and parts[2] in tests:
             found.add(parts[2])
-    path = None
-    for line in git(lane, 'diff-tree', '-p', '-U0', '--no-renames', old, new).splitlines():
-        if line.startswith('+++ '):
-            path = line[6:] if line.startswith('+++ b/') else None
-        elif line.startswith('+') and path in tests and SKIP.search(line):
+    # Each test file's own patch: no header parsing, so a quoted file name keeps its skips.
+    for (_, _, _, _, status), path in rows:
+        if path in tests and status in 'AM' and any(
+                line.startswith('+') and not line.startswith('+++') and SKIP.search(line)
+                for line in git(lane, 'diff-tree', '-p', '-U0', '--no-renames', old, new, '--', path).splitlines()):
             found.add(path)
     return found
 
@@ -119,7 +131,7 @@ def main():
         found = weakened(lane, expected, 'HEAD^{tree}')
         if rc == 1:
             conflicts = replay_conflicts(replay)
-            found |= guarded_conflicts(conflicts)
+            found |= guarded_conflicts(under(lane, conflicts, (expected, 'HEAD', base, on)))
             if not conflicts:
                 found.add('(replay conflict that names no file)')
         # A merge's own changes (conflict resolutions, edits no parent had) need review when they
