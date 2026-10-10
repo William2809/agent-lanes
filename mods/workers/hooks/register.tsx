@@ -65,7 +65,7 @@ for folder in sorted(root.iterdir()) if root.exists() else []:
                     # The same outcome rules as batches, so archived attempts need no batches row.
                     report = pathlib.Path(physical + '.last')
                     try:
-                        record['delivered'] = pathlib.Path(physical + '.delivered').read_text().strip() == run_id
+                        record['delivered'] = pathlib.Path(physical + '.delivered').read_text() == run_id + '\n'
                     except FileNotFoundError:
                         record['delivered'] = False
                     if record['rc'] != 0 and values.get('paused_at'):

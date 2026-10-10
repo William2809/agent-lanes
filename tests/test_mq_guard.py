@@ -243,6 +243,40 @@ class RepairGuardTests(unittest.TestCase):
         out = self.repair('tests/test_\vtotal.py', 'assert total() >= 0\n').stdout
         self.assertIn('PARKED b', out)
 
+    def test_directory_split_conflict_over_a_test_below_an_ordinary_directory_parks(self):
+        # Review of v0.8.3 round 3, finding 2: Git names only "src"; the test below it was missed.
+        lane = self.f.lanes['b']
+        for name in ('one', 'two', 'three', 'four'):
+            self.f.commit(self.f.repo, f'src/{name}.py', f'{name} = 1\n')
+        self.f.git('merge', '-q', '--no-edit', 'main', cwd=lane)
+        self.f.commit(lane, 'src/test_total.py', 'assert total() == 3\n')
+        self.bounce_here()
+        for name, side in (('one', 'left'), ('two', 'left'), ('three', 'right'), ('four', 'right')):
+            (self.f.repo / side).mkdir(exist_ok=True)
+            self.f.git('mv', f'src/{name}.py', f'{side}/{name}.py', cwd=self.f.repo)
+        self.f.git('commit', '-qm', 'split src', cwd=self.f.repo)
+        step = self.f.run('git', 'rebase', '-q', 'main', cwd=lane, check=False)
+        for _ in range(3):  # keep the test where the lane put it
+            if not step.returncode:
+                break
+            self.f.git('add', '-A', cwd=lane)
+            step = self.f.run('git', '-c', 'core.editor=true', 'rebase', '--continue', cwd=lane, check=False)
+        self.assertEqual(step.returncode, 0)
+        self.assertTrue((lane / 'src/test_total.py').exists())
+        out = self.repair('app.py', 'def total(): return 3\n').stdout
+        self.assertIn('PARKED b', out)
+        self.assertIn('src/test_total.py', (self.f.state / 'guarded.b').read_text())
+
+    def test_added_skip_in_a_test_with_a_quoted_name_parks(self):
+        # Review of v0.8.3 round 3, finding 3: Git quotes "b/tests/test_\303\251.py" in patch headers.
+        lane = self.f.lanes['b']
+        self.f.commit(lane, 'tests/test_\u00e9.py', 'import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass\n')
+        self.bounce_here()
+        out = self.repair('tests/test_\u00e9.py', 'import unittest\nclass T(unittest.TestCase):\n'
+                          '    @unittest.skip("later")\n    def test_a(self): pass\n').stdout
+        self.assertIn('PARKED b', out)
+
+
 class ReplayConflictParseTests(unittest.TestCase):
     """`git merge-tree -z --name-only` output; Git documents conflicts with no conflicted-file entry."""
 

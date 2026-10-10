@@ -146,7 +146,7 @@ class Records(unittest.TestCase):
         self.record('a', run_id='next', register=False)
         self.assertEqual(deliver('claim', log, 'one').stdout, 'claimed one\n')
         self.assertFalse(Path(str(log) + '.delivered').exists())
-        self.assertTrue(Path(str(archived) + '.delivered').read_text().startswith('pending one S '))
+        self.assertTrue(Path(str(archived) + '.delivered').read_text().startswith('one pending S '))
         gone = deliver('claim', log, 'nowhere')
         self.assertEqual((gone.returncode, gone.stdout), (1, ''))
         deliver('release', log, 'one', by='T')  # not T's claim: kept
@@ -180,14 +180,14 @@ class Records(unittest.TestCase):
         cut = subprocess.run(['sh', DELIVER, 'claim', 'S', str(log), run], capture_output=True, text=True,
                              timeout=40, preexec_fn=short_writes)
         self.assertNotEqual(cut.stdout, f'claimed {run}\n')
-        self.assertNotEqual(Path(str(log) + '.delivered').read_text().strip(), run)
+        self.assertNotEqual(Path(str(log) + '.delivered').read_text(), run + '\n')
         self.assertFalse(self.data()['runs'][0]['delivered'])
         self.assertEqual(deliver('claim', log, run, by='T').stdout, f'claimed {run}\n')
 
     def test_pending_receipt_from_an_older_helper_is_still_busy(self):
-        # Astra review: a claim written as "RUN pending SESSION EPOCH" before the update stays in force.
+        # A claim in the form a 0.8.3 pre-release helper wrote ("pending RUN SESSION EPOCH") stays in force.
         log = self.record('a', rc=0, register=False)
-        Path(str(log) + '.delivered').write_text(f'one pending OTHER {int(time.time())}\n')
+        Path(str(log) + '.delivered').write_text(f'pending one OTHER {int(time.time())}\n')
         self.assertEqual(deliver('claim', log, 'one').stdout, 'busy one\n')
         deliver('release', log, 'one', by='OTHER')
         self.assertEqual(deliver('claim', log, 'one').stdout, 'claimed one\n')
@@ -211,18 +211,29 @@ class Records(unittest.TestCase):
         self.assertEqual(data['live'], ['OLD'])
         self.assertEqual(data['receiptSessions'], ['NEW'])
 
+    def test_only_run_id_and_newline_is_a_final_receipt(self):
+        # Review of v0.8.3 round 3, finding 4: pending receipts keep the form older helpers parse, so
+        # a cut-off "RUN" (no newline) must not read as sent, here or in the collector.
+        log = self.record('a', rc=0, register=False)
+        Path(str(log) + '.delivered').write_text('one')
+        self.assertFalse(self.data()['runs'][0]['delivered'])
+        self.assertEqual(deliver('claim', log, 'one').stdout, 'claimed one\n')
+        Path(str(log) + '.delivered').write_text('one\n')
+        self.assertTrue(self.data()['runs'][0]['delivered'])
+        self.assertEqual(deliver('claim', log, 'one').stdout, 'taken one\n')
+
     def test_stale_pending_receipt_is_taken_over(self):
         # Review of v083: a sender that crashed after claiming must not hide the report forever.
         log = self.record('a', rc=0, register=False)
         deliver('claim', log, 'one', by='CRASHED')
         self.assertEqual(deliver('claim', log, 'one', by='T', stale=0).stdout, 'claimed one\n')
-        self.assertIn('pending one T ', Path(str(log) + '.delivered').read_text())
+        self.assertIn('one pending T ', Path(str(log) + '.delivered').read_text())
 
     def test_malformed_or_future_pending_receipt_counts_as_stale(self):
         log = self.record('a', rc=0, register=False)
         for stamp in ('08', '9999999999', 'x'):
             with self.subTest(stamp=stamp):
-                Path(str(log) + '.delivered').write_text(f'pending one OTHER {stamp}\n')
+                Path(str(log) + '.delivered').write_text(f'one pending OTHER {stamp}\n')
                 self.assertEqual(deliver('claim', log, 'one', by='T').stdout, 'claimed one\n')
 
     def test_claim_waits_for_the_record_lock(self):
@@ -248,7 +259,7 @@ class Records(unittest.TestCase):
             if claim.poll() is None:
                 claim.kill()
         self.assertEqual(out, 'claimed one\n')
-        self.assertTrue(Path(str(archived) + '.delivered').read_text().startswith('pending one S '))
+        self.assertTrue(Path(str(archived) + '.delivered').read_text().startswith('one pending S '))
         self.assertEqual(Path(str(log) + '.delivered').read_text(), 'two\n')
 
     def test_archived_run_keeps_launch_identity(self):

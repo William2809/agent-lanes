@@ -3,7 +3,7 @@ export type Worker = { name: string; status: string; origin?: string; session?: 
 // log is the stable launch path; recordLog is the archived transcript path, if any.
 export type RunRecord = Worker & {
   log: string; runId: string; repo: string; dir: string; started: number; rc?: number; ended?: number; recordLog?: string
-  // <recordLog>.delivered names this run ID: a session received the report.
+  // <recordLog>.delivered is exactly this run ID and a newline: a session received the report.
   delivered?: boolean
   // owner=mq: the merge queue launched it and reads its report.
   owner?: string
