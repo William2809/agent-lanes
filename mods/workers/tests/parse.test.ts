@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import type { RunRecord } from '../types'
 
-import { commands, DELIVERY_LIMIT, FLOOR, outcome, events, identity, remember, isProblem, lastTitle, notices, originLabel, origins, parse, repoOf } from '../hooks/parse'
+import { commands, DELIVERY_LIMIT, FLOOR, outcome, events, identity, remember, isProblem, lastTitle, notices, originLabel, origins, parse, repoOf, unclaimed } from '../hooks/parse'
 
 const SAMPLE = `reports                    ERRORED (high demand) -> wk reports -r  @reports
 guide-w1                 running 17m  @guide-w1
@@ -142,4 +142,12 @@ test('report and resume paths quote shell characters', async () => {
   const unusual = { ...run("a'$(echo bad)", "id'quoted"), dir: "/u/code/a'$(echo bad)" }
   expect(commands(unusual).resume).toContain("a'\\''$(echo bad)'")
   expect(commands(unusual).report).toContain("a'\\''$(echo bad)/review.log'")
+})
+
+test('a report whose lead is open but names no receipt-writing mod stays unclaimed, marked leadOpen', () => {
+  // Review of v0.8.3 round 4, finding 2: that lead may run no workers mod and never have received it.
+  const base = { name: 'w', repo: 'a', log: '/l', dir: '/d', started: 0, ended: 0, rc: 0, status: 'done' }
+  const runs: RunRecord[] = [{ ...base, runId: 'open', session: 'OPEN' }, { ...base, runId: 'gone', session: 'GONE' }]
+  expect(unclaimed(runs, 'ME', 1_000, new Set(), new Set(['OPEN'])).map(r => [r.runId, !!r.leadOpen]))
+    .toEqual([['open', true], ['gone', false]])
 })

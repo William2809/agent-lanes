@@ -18,6 +18,8 @@ const isNudged = atom({ plugin: 'workers', key: 'isNudged' } as const, false)
 let isPolling = false
 // Identities `/workers adopt` chose; the next poll outside the command's turn sends them.
 let adopting: string[] | null = null
+// /workers adopt open: also reports whose lead is open (delivery unknown).
+let adoptOpen = false
 const adopted = new Set<string>()
 
 const DAY = 86_400
@@ -111,7 +113,7 @@ with tempfile.TemporaryDirectory(prefix='workers-poll-') as tmp:
 for path, raw in metadata.values():
     if path.read_text() != raw:
         raise RuntimeError('run changed during poll')
-# A live lead whose workers mod writes no receipts (an older mod) received its reports in memory.
+# A live lead that names no receipt-writing mod may have its reports (an older mod) or not (no mod).
 # Live: the current session of a Claude client (~/.claude/sessions/PID.json) whose PID runs claude.
 sessions = {}
 for path in (home / '.claude/sessions').glob('*.json'):
@@ -212,7 +214,9 @@ async function poll($: EngineInterface, notify = true) {
       }
     }
     if (adopting && notify) {
-      const taken = await adopt($, home, data.runs)
+      // Recheck at send time: a lead that reopened since the command makes its report delivery-unknown.
+      const allowed = new Set((next.unclaimed ?? []).filter(run => adoptOpen || !run.leadOpen).map(identity))
+      const taken = await adopt($, home, data.runs.filter(run => allowed.has(identity(run))))
       next.unclaimed = next.unclaimed?.filter(run => !taken.has(identity(run)))
     }
     await update($, summary, () => next)
@@ -246,7 +250,7 @@ async function adopt($: EngineInterface, home: string, runs: RunRecord[]): Promi
     await receipts($, home, 'confirm', pick)
   }
   const gone = chosen.size - pick.length
-  if (gone > 0) $.ui.toast(`${gone} chosen report${gone > 1 ? 's were' : ' was'} not sent: already received, past 24 h, or unreadable`)
+  if (gone > 0) $.ui.toast(`${gone} chosen report${gone > 1 ? 's were' : ' was'} not sent: already received, its session reopened, past 24 h, or unreadable`)
   adopting = null
   return new Set(pick.map(identity))
 }
@@ -283,8 +287,8 @@ async function withOrigins($: EngineInterface, home: string, data: Collection, c
   }
   const lost: RunRecord[] = []
   const writers = new Set(data.receiptSessions ?? [])
-  const oldLeads = new Set((data.live ?? []).filter(session => !writers.has(session) && session !== mine))
-  for (const run of unclaimed(data.runs, mine, checkedAt / 1000, sent, oldLeads).filter(r => !adopted.has(identity(r)))) {
+  const openLeads = new Set((data.live ?? []).filter(session => !writers.has(session) && session !== mine))
+  for (const run of unclaimed(data.runs, mine, checkedAt / 1000, sent, openLeads).filter(r => !adopted.has(identity(r)))) {
     const origin = known.get(identity(run))
     if (origin?.session?.slug) await titleOf($, home, origin.session)
     lost.push({ ...run, origin: originLabel(origin, mine, titles) })
@@ -318,7 +322,7 @@ async function measure($: EngineInterface) {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'workers', description: 'Show all workers and worktrees in a side pane; /workers adopt takes unclaimed reports' })
+    await $.command.register({ name: 'workers', description: 'Show all workers and worktrees in a side pane; /workers adopt takes unclaimed reports (adopt open: also those of open sessions)' })
     void poll($)
     void measure($)
     $.clock.every(POLL_MS, () => poll($))
@@ -334,12 +338,17 @@ export const register: Register = on => {
 
   // Full list, worktrees included: the slow run, so only on request.
   on('command.run', { command: 'workers' }, async ($, e) => {
-    if ((e.args ?? '').trim() === 'adopt') {
+    const args = (e.args ?? '').trim()
+    if (args === 'adopt' || args === 'adopt open') {
       // The host forbids prompt submission while command.run holds the turn: the next poll sends it.
-      const lost = ((await read($, summary))?.unclaimed ?? []).slice(0, ADOPT_LIMIT)
-      if (!lost.length) return { text: 'No unclaimed worker reports.' }
+      const all = (await read($, summary))?.unclaimed ?? []
+      const lost = all.filter(run => args === 'adopt open' || !run.leadOpen).slice(0, ADOPT_LIMIT)
+      const open = all.filter(run => run.leadOpen).length
+      const more = open && args === 'adopt' ? ` ${open} report${open > 1 ? 's' : ''} of open sessions may not have been received (no workers mod there): /workers adopt open takes them too.` : ''
+      if (!lost.length) return { text: `No unclaimed worker reports.${more}` }
       adopting = lost.map(identity)
-      return { text: `Adopting ${lost.length} unclaimed worker report${lost.length > 1 ? 's' : ''}: one prompt follows this turn.` }
+      adoptOpen = args === 'adopt open'
+      return { text: `Adopting ${lost.length} unclaimed worker report${lost.length > 1 ? 's' : ''}: one prompt follows this turn.${more}` }
     }
     await update($, detail, () => 'Loading…')
     await $.ui.open({ id: PANE, title: 'Workers' })
@@ -356,6 +365,7 @@ export const register: Register = on => {
     const now = await read($, summary)
     const workers = now?.workers ?? []
     const lost = now?.unclaimed ?? []
+    const sure = lost.filter(run => !run.leadOpen).length
     return (
       <Box flexDirection="column">
         {text.split('\n').map(line => {
@@ -368,7 +378,8 @@ export const register: Register = on => {
             </Box>
           )
         })}
-        {lost.length > 0 && <Text color="warning">Unclaimed reports ({lost.length}): no session received them. /workers adopt takes them here.</Text>}
+        {sure > 0 && <Text color="warning">Unclaimed reports ({sure}): no session received them. /workers adopt takes them here.</Text>}
+        {lost.length > sure && <Text dimColor>Reports of open sessions ({lost.length - sure}): delivery unknown (no workers mod there, or an older one). /workers adopt open takes them.</Text>}
         {lost.map(run => (
           <Box gap={1}>
             <Text wrap="truncate-end">  {run.repo}/{run.name} ({run.runId}) {outcome(run)} rc={run.rc}</Text>
@@ -400,6 +411,8 @@ export const register: Register = on => {
     }
 
     const running = now?.workers.filter(w => w.status === 'running').length ?? 0
+    // Reports of open sessions (delivery unknown) are listed in /workers, not counted here.
+    const lostCount = now?.unclaimed?.filter(run => !run.leadOpen).length ?? 0
     const repos = [...new Set(now?.workers.filter(w => w.status === 'running' && w.origin).map(w => repoOf(w.origin!)) ?? [])]
     // "2 errored · session 16607be9 · my-app": red only when it is this session's.
     const problems = new Map<string, { status: string; origin: string; count: number }>()
@@ -435,7 +448,7 @@ export const register: Register = on => {
                 ⚙ <Text bold>{running}</Text> running{repos.length > 0 && <Text dimColor> ({repos.join(', ')})</Text>}
               </Text>
             )}
-            {(now.unclaimed?.length ?? 0) > 0 && <Text color="warning">· {now.unclaimed!.length} unclaimed</Text>}
+            {lostCount > 0 && <Text color="warning">· {lostCount} unclaimed</Text>}
             {[...problems.values()].map(p => (
               <Text color={p.origin.startsWith('this session') ? 'error' : 'warning'}>
                 · {p.count} {p.status.toLowerCase()} <Text dimColor>({p.origin})</Text>

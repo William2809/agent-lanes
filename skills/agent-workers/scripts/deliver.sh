@@ -52,7 +52,9 @@ EOF
       elif [ "$r_run" = "$run" ] && [ "$r_state" = pending ] && [ "$ours" = 0 ] &&
         [ "$((now - r_at))" -lt "$stale" ]; then echo "busy $run"
       elif write "$rec" "$run pending $by $now"; then echo "claimed $run"
-      else rc=1
+      # A cut-off claim could leave a bare RUN_ID that an older collector (it strips the newline)
+      # reads as sent: empty it. Emptying needs no space, so it works when the disk is full.
+      else : >"$rec.delivered"; rc=1
       fi ;;
     confirm) [ "$ours" = 0 ] || write "$rec" "$run" || rc=1 ;;
     release) [ "$ours" = 0 ] || : >"$rec.delivered" || rc=1 ;;

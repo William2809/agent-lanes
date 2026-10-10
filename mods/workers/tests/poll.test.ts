@@ -236,8 +236,9 @@ test('another session\'s undelivered report is unclaimed; the band never prompts
   expect(w.calls.length).toBe(0)
 })
 
-test('a live lead on an older mod received its reports; a cleared or receipt-writing lead did not', async ($, on) => {
-  // Clients started before 0.2.1 deliver in memory and write no receipt; they were counted as lost.
+test('a live lead without a receipt marker may not have its reports: listed, not counted, adoptable with adopt open', async ($, on) => {
+  // 0.2.2 hid them (an older mod delivers in memory), but a session with no workers mod has the
+  // same look and never received them. Review of v0.8.3 round 4, finding 2.
   const w = world(on)
   w.data({
     ...collection([finished('old', 'OLD'), finished('gone', 'GONE'), finished('new', 'NEW')]),
@@ -245,7 +246,31 @@ test('a live lead on an older mod received its reports; a cleared or receipt-wri
   })
   await $.session.start(start)
   await w.clock.settle()
-  expect((w.memory.get('summary') as Summary).unclaimed?.map(r => r.runId)).toEqual(['gone', 'new'])
+  const lost = (w.memory.get('summary') as Summary).unclaimed ?? []
+  expect(lost.map(r => [r.runId, !!r.leadOpen])).toEqual([['old', true], ['gone', false], ['new', false]])
+  const reply = JSON.stringify(await $.command.run({ command: 'workers', args: 'adopt' } as never))
+  expect(reply).toContain('Adopting 2 unclaimed worker reports')
+  expect(reply).toContain('/workers adopt open')
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(1)
+  expect(w.prompts[0]).not.toContain('(old)')
+  expect(JSON.stringify(await $.command.run({ command: 'workers', args: 'adopt open' } as never))).toContain('Adopting 1 unclaimed worker report')
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(2)
+  expect(w.prompts[1]).toContain('a/review (old) done rc=0')
+})
+
+test('plain adopt does not send a report whose lead reopened before the poll', async ($, on) => {
+  // Astra review of round 4: the chosen IDs were sent without rechecking leadOpen.
+  const w = world(on)
+  w.data(collection([finished('back', 'BACK')]))
+  await $.session.start(start)
+  await w.clock.settle()
+  expect(JSON.stringify(await $.command.run({ command: 'workers', args: 'adopt' } as never))).toContain('Adopting 1 unclaimed worker report')
+  w.data({ ...collection([finished('back', 'BACK')]), live: ['BACK'], receiptSessions: ['S'] })
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(0)
+  expect(w.calls.length).toBe(0)
 })
 
 test('/workers adopt claims, sends one prompt; a second adopt has nothing', async ($, on) => {

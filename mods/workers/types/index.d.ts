@@ -5,6 +5,8 @@ export type RunRecord = Worker & {
   log: string; runId: string; repo: string; dir: string; started: number; rc?: number; ended?: number; recordLog?: string
   // <recordLog>.delivered is exactly this run ID and a newline: a session received the report.
   delivered?: boolean
+  // Unclaimed only: its lead is open but names no receipt-writing mod, so it may have the report.
+  leadOpen?: boolean
   // owner=mq: the merge queue launched it and reads its report.
   owner?: string
 }

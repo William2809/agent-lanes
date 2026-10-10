@@ -181,8 +181,23 @@ class Records(unittest.TestCase):
                              timeout=40, preexec_fn=short_writes)
         self.assertNotEqual(cut.stdout, f'claimed {run}\n')
         self.assertNotEqual(Path(str(log) + '.delivered').read_text(), run + '\n')
+        # Review of v0.8.3 round 4, finding 4: a mod 0.2.2 collector strips the receipt, so a bare
+        # RUN_ID would read as sent there. The failed claim leaves it empty.
+        self.assertEqual(Path(str(log) + '.delivered').read_text(), '')
         self.assertFalse(self.data()['runs'][0]['delivered'])
         self.assertEqual(deliver('claim', log, run, by='T').stdout, f'claimed {run}\n')
+
+    def test_failed_claim_leaves_no_bare_run_id(self):
+        # Review of v0.8.3 round 4, finding 4: a claim write that stops after the run ID (as Linux
+        # does at a file size limit) must not leave "RUN_ID", which a 0.2.2 collector reads as sent.
+        log = self.record('a', rc=0, register=False)
+        cut = ('printf() { case $2 in *" pending "*) command printf %s "${2%% *}"; return 1 ;; esac; command printf "$@"; }\n'
+               '. "$0"')
+        done = subprocess.run(['sh', '-c', cut, DELIVER, 'claim', 'S', str(log), 'one'], capture_output=True, text=True,
+                              env=dict(os.environ, HOME=str(self.home)), timeout=40)
+        self.assertEqual((done.returncode, done.stdout), (1, ''))
+        self.assertEqual(Path(str(log) + '.delivered').read_text(), '')
+        self.assertEqual(deliver('claim', log, 'one').stdout, 'claimed one\n')
 
     def test_pending_receipt_from_an_older_helper_is_still_busy(self):
         # A claim in the form a 0.8.3 pre-release helper wrote ("pending RUN SESSION EPOCH") stays in force.

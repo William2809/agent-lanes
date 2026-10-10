@@ -322,6 +322,26 @@ class RunRecordTests(unittest.TestCase):
         self.assertFalse(lock.exists())
         self.assertEqual(count.read_text(), '2\n')
 
+    def test_mover_whose_registration_write_failed_is_waited_for(self):
+        # Review of v0.8.3 round 4, finding 1: the PID landed but the write failed (its newline was cut
+        # off), the mover took it, and the releaser started a second mover without waiting, which could
+        # move a successor's lock. Here every write of a bare number writes it and then fails.
+        lock = self.f.state / 'record.lock'
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        count = self.f.root / 'mv-count'
+        shims = self.f.root / 'count-mv'
+        shims.mkdir()
+        (shims / 'mv').write_text(f'#!/bin/sh\nn=$(cat "{count}" 2>/dev/null || echo 0); echo $((n + 1)) >"{count}"\n'
+                                  'exec /bin/mv "$@"\n')
+        (shims / 'mv').chmod(0o755)
+        script = ('echo() { command echo "$@"; case $* in *[!0-9]*) ;; ?*) return 1 ;; esac; }\n'
+                  '. "$1/state.sh"; ops_lock "$2" && ops_unlock "$2"')
+        done = self.f.run('sh', '-c', script, 'sh', str(SCRIPTS), str(lock),
+                          env={'PATH': f'{shims}:{self.f.env["PATH"]}'}, check=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(lock.exists())
+        self.assertEqual(count.read_text(), '1\n')
+
     def test_supervisor_whose_release_failed_still_publishes(self):
         # Review of v0.8.3 round 3, finding 1: the supervisor waited on its own record lock and
         # exited before .last and .exit, so a finished worker showed as DIED.
