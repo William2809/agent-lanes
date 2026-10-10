@@ -90,11 +90,17 @@ ops_move_lock() {
   # A second release (an exit trap during the first) leaves a live registered mover alone.
   ! ops_pid_live "$(cat "$2/mover" 2>/dev/null)" || return 0
   _ops_to="$HOME/.claude-trash/$(date +%F)"; mkdir -p "$_ops_to" || return 1
-  sh -c 'n=0; until [ "$(cat "$1/mover" 2>/dev/null)" = "$$" ]; do
-      n=$((n + 1)); [ "$n" -lt 500 ] || exit 1; sleep 0.01; done
-    exec mv "$2" "$3.$$"' sh "$2" "$1" "$_ops_to/$(basename "$1").$(date +%H%M%S)" &
-  _ops_mover=$!
-  echo "$_ops_mover" >"$2/mover" && wait "$_ops_mover"
+  # A failed move gets a second mover, as ctrash retried a failed mv. A mover that is not
+  # registered within 5 seconds (wall clock) exits without moving anything.
+  for _ops_try in 1 2; do
+    [ -d "$1" ] || return 0
+    sh -c 'end=$(($(date +%s) + 5)); until [ "$(cat "$1/mover" 2>/dev/null)" = "$$" ]; do
+        [ "$(date +%s)" -lt "$end" ] || exit 1; sleep 0.01; done
+      exec mv "$2" "$3.$$"' sh "$2" "$1" "$_ops_to/$(basename "$1").$(date +%H%M%S)" &
+    _ops_mover=$!
+    echo "$_ops_mover" >"$2/mover" && wait "$_ops_mover" && return 0
+  done
+  return 1
 }
 ops_register() {
   # Role publication precedes the legacy registry: readers need not wait for a Codex header.

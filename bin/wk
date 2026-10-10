@@ -22,7 +22,14 @@ if [ -n "${WK_LAUNCH_INTENT:-}" ]; then
   echo $$ >"$WK_LAUNCH_INTENT/pid"
 fi
 launch_lock=""; pending_slot=""
-trap '[ -z "$pending_slot" ] || ctrash "$pending_slot" >/dev/null; [ -z "$launch_lock" ] || ops_unlock "$launch_lock"' EXIT
+# Our reservation is emptied by this process, never moved: a later launch's slot at the same path
+# cannot be the one cleared, and no child is left to clear one later. An empty slot is free.
+free_slot() {
+  [ -z "$pending_slot" ] || { IFS="$(printf '\t')" read -r _fs_pid _ 2>/dev/null <"$pending_slot" || _fs_pid=""
+    [ "$_fs_pid" != "$$" ] || : >"$pending_slot"; }
+  pending_slot=""
+}
+trap 'free_slot; [ -z "$launch_lock" ] || ops_unlock "$launch_lock"' EXIT
 trap 'exit 1' HUP INT TERM
 name=${1:?usage: wk NAME [-w] -t FEATURE:REASON [-m model] [-f file] | wk NAME -r [msg]}; shift
 if [ "${1:-}" = "-r" ]; then
@@ -172,7 +179,7 @@ where=""; [ "$dir" = "$main" ] && [ "$sb" != "read-only" ] && where=" — MAIN C
 # Tags append the tool revision; the first five fields retain their meaning (workers.tsv stays four).
 if [ -n "$tag" ]; then printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$repo" "$name" "${tag%%:*}" "${tag#*:}" "$tool_rev" >>"$HOME/.claude/state/worker-tags.tsv"
 else echo "wk: no -t FEATURE:REASON tag (loop-stats can't count rework for $name)" >&2; fi
-[ -z "$pending_slot" ] || ctrash "$pending_slot" >/dev/null; pending_slot=""
+free_slot
 ops_unlock "$launch_lock"; launch_lock=""
 hl=""; [ "$harness" = codex ] || hl="$harness "
 echo "started $name: $hl$model $eff${url:+ @$name$url}$where"
