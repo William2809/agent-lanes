@@ -75,6 +75,12 @@ class RepairGuardTests(unittest.TestCase):
         out = self.repair('.remote-ci.conf', "REMOTE_CI_CHECK='exit 7'\nREMOTE_CI_CHECK='true'\n").stdout
         self.assertIn('PARKED b: repair changed existing tests or check config (.remote-ci.conf)', out)
 
+    def test_added_check_config_is_parked(self):
+        # The same override as a new file: the repair adds the config, it changes no existing line.
+        out = self.repair('.remote-ci.conf', "REMOTE_CI_CHECK='true'\n").stdout
+        self.assertIn('PARKED b: repair changed existing tests or check config (.remote-ci.conf)', out)
+        self.assertNotIn('LANDED', out)
+
     def test_changed_package_scripts_are_parked(self):
         # land runs scripts["check:remote"], which can call any other script.
         self.f.commit(self.f.lanes['b'], 'package.json', '{"scripts": {"check:remote": "pnpm test"}}\n')
