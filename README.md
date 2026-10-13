@@ -15,6 +15,10 @@ Getting agents to write code is the easy part. With many parallel workers, the s
 
 ## How it works
 
+https://github.com/user-attachments/assets/d2d37c20-5c63-4178-bfee-073956655d3f
+
+<sub>One batch from brief to merge at real speed: 12 lanes, review by risk, an agent UI check, a red train split, a bounce and a guard park. Also in <a href="https://github.com/user-attachments/assets/e970ed06-9608-4ff4-88a4-24d8a33e9a2b">dark</a>.</sub>
+
 <a href="docs/standalone-light.webp">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/standalone-dark.svg">
