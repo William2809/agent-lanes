@@ -14,6 +14,16 @@ SERVE = textwrap.dedent('''\
 ''')
 
 
+def blind_lsof(tmp):
+    """A dir with an lsof that finds nothing for -sTCP:LISTEN: GitHub's macOS runners list a listening socket as CLOSED."""
+    stubs = os.path.join(tmp, 'blind-lsof'); os.makedirs(stubs)
+    real = shutil.which('lsof') or '/usr/sbin/lsof'
+    with open(os.path.join(stubs, 'lsof'), 'w') as f:
+        f.write('#!/bin/sh\ncase " $* " in *" -sTCP:LISTEN "*) exit 1 ;; esac\nexec ' + real + ' "$@"\n')
+    os.chmod(os.path.join(stubs, 'lsof'), 0o755)
+    return stubs
+
+
 class WtDev(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='wtdev-test-')
@@ -83,13 +93,7 @@ class WtDev(unittest.TestCase):
             return False
 
     def test_ready_when_lsof_hides_the_listen_state(self):
-        # GitHub's macOS runners list the server's socket as CLOSED, so lsof -sTCP:LISTEN finds nothing.
-        stubs = os.path.join(self.tmp.name, 'stubs'); os.makedirs(stubs)
-        real = shutil.which('lsof') or '/usr/sbin/lsof'
-        with open(os.path.join(stubs, 'lsof'), 'w') as f:
-            f.write('#!/bin/sh\ncase " $* " in *" -sTCP:LISTEN "*) exit 1 ;; esac\nexec ' + real + ' "$@"\n')
-        os.chmod(os.path.join(stubs, 'lsof'), 0o755)
-        self.env['PATH'] = stubs + ':' + self.env['PATH']
+        self.env['PATH'] = blind_lsof(self.tmp.name) + ':' + self.env['PATH']
         self.write('.wt-dev.conf', "WT_DEV_CMD='exec python3 serve.py \"$PORT\"'\nWT_DEV_INSTALL=''\n")
         self.commit()
         self.names.append('h1')
@@ -793,6 +797,14 @@ class DevRestart(unittest.TestCase):
         self.assertFalse(self.alive(first), 'the old server still answers on the port')
         listener = subprocess.run(['lsof', '-tiTCP:' + self.port, '-sTCP:LISTEN'], capture_output=True, text=True).stdout.split()
         self.assertEqual(listener, [self.read(rec).splitlines()[0]])
+
+
+class DevRestartBlindLsof(DevRestart):
+    """The same checks where lsof hides the LISTEN state."""
+
+    def setUp(self):
+        super().setUp()
+        self.env['PATH'] = blind_lsof(self.tmp.name) + ':' + self.env['PATH']
 
 
 if __name__ == '__main__':
