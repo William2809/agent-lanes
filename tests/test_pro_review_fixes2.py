@@ -59,7 +59,11 @@ case "$1" in path) echo "{lanes}/$2" ;; install) ;; *) exit 2 ;; esac
             self.assertLess(time.monotonic(), until, out.read_text())
             time.sleep(0.05)
         time.sleep(0.3)
-        os.killpg(p.pid, signal.SIGTERM)
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except PermissionError:
+            # macOS can refuse a group signal (EPERM) while a group member is in some states; land's trap still runs.
+            os.kill(p.pid, signal.SIGTERM)
         p.wait(timeout=30)
         text = out.read_text()
         self.assertEqual(p.returncode, 143, text)

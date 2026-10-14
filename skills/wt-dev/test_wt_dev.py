@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ABOUTME: End-to-end tests for wt-dev's framework presets, installs and database copies, run against
 # ABOUTME: throwaway git repos under a temporary HOME with stub dev servers (no network, no real frameworks).
-import json, os, re, shutil, sqlite3, subprocess, tempfile, textwrap, time, unittest
+import json, os, re, shutil, socket, sqlite3, subprocess, tempfile, textwrap, time, unittest
 
 BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin')
 # install.sh links the repo's bin/ (ctrash, ...) next to wt-dev; mirror that without an install.
@@ -75,7 +75,26 @@ class WtDev(unittest.TestCase):
         return open(os.path.join(self.home, '.cache', 'wt-dev', 'repo', name + '.port')).read().strip()
 
     def listening(self, port):
-        return subprocess.run(['lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN'], capture_output=True).returncode == 0
+        # A real connect: some hosts' lsof shows a listening socket as CLOSED.
+        try:
+            socket.create_connection(('127.0.0.1', int(port)), timeout=15).close()
+            return True
+        except OSError:
+            return False
+
+    def test_ready_when_lsof_hides_the_listen_state(self):
+        # GitHub's macOS runners list the server's socket as CLOSED, so lsof -sTCP:LISTEN finds nothing.
+        stubs = os.path.join(self.tmp.name, 'stubs'); os.makedirs(stubs)
+        real = shutil.which('lsof') or '/usr/sbin/lsof'
+        with open(os.path.join(stubs, 'lsof'), 'w') as f:
+            f.write('#!/bin/sh\ncase " $* " in *" -sTCP:LISTEN "*) exit 1 ;; esac\nexec ' + real + ' "$@"\n')
+        os.chmod(os.path.join(stubs, 'lsof'), 0o755)
+        self.env['PATH'] = stubs + ':' + self.env['PATH']
+        self.write('.wt-dev.conf', "WT_DEV_CMD='exec python3 serve.py \"$PORT\"'\nWT_DEV_INSTALL=''\n")
+        self.commit()
+        self.names.append('h1')
+        self.new('h1')
+        self.assertTrue(self.listening(self.port('h1')))
 
     def test_parallel_new_reserves_distinct_ports_and_releases_them(self):
         self.write('.wt-dev.conf', "WT_DEV_CMD='sleep 2; exec python3 serve.py \"$PORT\"'\nWT_DEV_INSTALL=''\n")

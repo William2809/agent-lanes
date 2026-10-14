@@ -200,7 +200,10 @@ youngest_child() {
 [ -s "$done_n" ] && [ $all -eq 0 ] && echo "($(wc -l <"$done_n" | tr -d ' ') finished workers; --all lists them)"
 
 if git rev-parse --git-dir >/dev/null 2>&1 && command -v wt-dev >/dev/null; then
-  base=$(git rev-parse --abbrev-ref HEAD)
+  # Compare against the main checkout's branch, never this dir's HEAD: inside a detached
+  # worktree "HEAD" made every worktree look empty ("remove?") although it held commits.
+  main_wt=$(git worktree list --porcelain | sed -n '1s/^worktree //p')
+  base=$(git -C "$main_wt" rev-parse --abbrev-ref HEAD)
   # Worktree dirs that still host a live worker are busy, never "remove?".
   busy=$(mktemp); trap 'ctrash "$flag" "$done_n" "$busy" >/dev/null' EXIT
   [ -s "$reg" ] && awk -F'\t' '{last[$3]=$0} END{for (l in last) print last[l]}' "$reg" | while IFS="$(printf '\t')" read -r at pid log dir; do
