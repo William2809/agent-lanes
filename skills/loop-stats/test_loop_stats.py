@@ -9,6 +9,8 @@ import unittest
 from unittest.mock import patch
 from datetime import date, datetime, time, timedelta
 
+# The repo's own ctrash, so the tests need nothing on PATH.
+CTRASH = Path(__file__).resolve().parents[2] / 'bin' / 'ctrash'
 spec = importlib.util.spec_from_file_location('loop_stats', Path(__file__).with_name('loop-stats.py'))
 stats = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(stats)
@@ -17,7 +19,7 @@ spec.loader.exec_module(stats)
 class LoopStatsTests(unittest.TestCase):
     def setUp(self):
         self.home = Path(tempfile.mkdtemp(prefix="loop-stats-test-"))
-        self.addCleanup(lambda: subprocess.run(["ctrash", str(self.home)], check=True, stdout=subprocess.DEVNULL))
+        self.addCleanup(lambda: subprocess.run([str(CTRASH), str(self.home)], check=True, stdout=subprocess.DEVNULL))
         self.env = patch.dict(os.environ, {'HOME': str(self.home)})
         self.env.start()
         self.addCleanup(self.env.stop)

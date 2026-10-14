@@ -6,6 +6,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlin
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { createHash } from "node:crypto"
+// The repo's own ctrash, so the tests need nothing on PATH (install.sh links it next to ui-shots).
+const CTRASH = fileURLToPath(new URL("../../bin/ctrash", import.meta.url))
 import { syncBuiltinESMExports } from "node:module"
 import { fileURLToPath } from "node:url"
 import { cacheDirectory, authenticatedState, authCounts } from "./bin/auth-cache.mjs"
@@ -26,7 +28,7 @@ test("cache rejects checkout paths and symlink aliases before creating files", (
       }
     }
     assert.equal(cacheDirectory(join(realpathSync(dir), "outside", "auth")), join(realpathSync(dir), "outside", "auth"))
-  } finally { execFileSync("ctrash", [dir], { stdio: "ignore" }) }
+  } finally { execFileSync(CTRASH, [dir], { stdio: "ignore" }) }
 })
 
 test("login lease recovers after SIGKILL and twenty waiters validate concurrently", { timeout: 30000 }, async t => {
@@ -94,7 +96,7 @@ try {
   } finally {
     for (const child of children) child.kill("SIGKILL")
     while (children.size) await pause(10)
-    execFileSync("ctrash", [dir], { stdio: "ignore" })
+    execFileSync(CTRASH, [dir], { stdio: "ignore" })
   }
 })
 
@@ -202,6 +204,6 @@ test("unexpected helper exits and missing grants fail without unleased publicati
     }
     for (const child of children) child.kill("SIGKILL")
     while (children.size) await pause(10)
-    execFileSync("ctrash", [dir], { stdio: "ignore" })
+    execFileSync(CTRASH, [dir], { stdio: "ignore" })
   }
 })

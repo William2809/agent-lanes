@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # ABOUTME: End-to-end tests for wt-dev's framework presets, installs and database copies, run against
 # ABOUTME: throwaway git repos under a temporary HOME with stub dev servers (no network, no real frameworks).
-import json, os, shutil, sqlite3, subprocess, tempfile, textwrap, time, unittest
+import json, os, re, shutil, sqlite3, subprocess, tempfile, textwrap, time, unittest
 
 BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin')
+# install.sh links the repo's bin/ (ctrash, ...) next to wt-dev; mirror that without an install.
+REPO_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'bin')
 SERVE = textwrap.dedent('''\
     import http.server, os, sys
     port = int(sys.argv[1])
@@ -18,7 +20,7 @@ class WtDev(unittest.TestCase):
         self.home = os.path.join(self.tmp.name, 'home')
         self.repo = os.path.join(self.tmp.name, 'repo')
         os.makedirs(self.home); os.makedirs(self.repo)
-        self.env = dict(os.environ, HOME=self.home, PATH=BIN + ':' + os.environ['PATH'],
+        self.env = dict(os.environ, HOME=self.home, PATH=BIN + ':' + os.path.normpath(REPO_BIN) + ':' + os.environ['PATH'],
                         STUB_OUT=os.path.join(self.tmp.name, 'stub.out'), WT_DEV_READY_TIMEOUT='20')
         for k in ('WT_DEV_CMD', 'WT_DEV_INSTALL', 'WT_DEV_APP', 'WT_DEV_SHARED_DB', 'WT_DEV_DB_CLONE'):
             self.env.pop(k, None)
@@ -44,10 +46,22 @@ class WtDev(unittest.TestCase):
     def commit(self):
         self.git('add', '-A'); self.git('commit', '-qm', 'x')
 
+    def diagnose(self, err):
+        # On a failed start, show the dev log and the port's listeners (CI has no shell to look).
+        out = ''
+        log = re.search(r'log: (\S+?)\)', err)
+        if log and os.path.exists(log.group(1)):
+            out += '\n--- dev log:\n' + open(log.group(1), errors='replace').read()[-2000:]
+        port = re.search(r'on :(\d+)', err)
+        if port:
+            ls = subprocess.run(['lsof', '-nP', '-iTCP:' + port.group(1)], capture_output=True, text=True)
+            out += '\n--- lsof:\n' + ls.stdout + ls.stderr
+        return out
+
     def wt(self, *a, check=True):
         r = subprocess.run(['wt-dev', *a], cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=120)
         if check and r.returncode:
-            self.fail(f'wt-dev {a} rc={r.returncode}\n{r.stdout}\n{r.stderr}')
+            self.fail(f'wt-dev {a} rc={r.returncode}\n{r.stdout}\n{r.stderr}{self.diagnose(r.stderr)}')
         return r
 
     def new(self, name, *a):

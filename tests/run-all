@@ -12,7 +12,7 @@ run() (
     echo "ok $name $(($(date +%s) - start))s"
   else
     echo "FAIL $name $(($(date +%s) - start))s"
-    tail -20 "$log"
+    tail -"${RUN_ALL_TAIL:-20}" "$log"
     exit 1
   fi
 )
