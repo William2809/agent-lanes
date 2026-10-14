@@ -45,11 +45,29 @@ ops_supervisor_live() {
 ops_stat() {
   case "$(uname -s)" in Darwin) stat -f "$1" "$3" 2>/dev/null ;; *) stat -c "$2" "$3" 2>/dev/null ;; esac
 }
+# Keep pid numeric for old readers; birth distinguishes a reused PID from its owner.
+ops_lock_pid_live() {
+  _ops_owner_pid=$(cat "$1/pid" 2>/dev/null)
+  ops_pid_live "$_ops_owner_pid" || return 1
+  _ops_owner_birth=$(cat "$1/birth" 2>/dev/null)
+  _ops_current_birth=$(ops_birth "$_ops_owner_pid")
+  [ -z "$_ops_owner_birth" ] || [ -z "$_ops_current_birth" ] || [ "$_ops_owner_birth" = "$_ops_current_birth" ]
+}
+ops_lock_owned() { [ "$(cat "$1/pid" 2>/dev/null)" = "$$" ] && ops_lock_pid_live "$1"; }
+ops_lock_write() {
+  ops_birth "$$" >"$1/birth" && echo $$ >"$1/pid"
+  # A write can publish the whole PID and still report failure; inspect its result.
+  ops_lock_owned "$1"
+}
 ops_lock_held() {
   _ops_pid=$(cat "$1/pid" 2>/dev/null || true)
-  ops_pid_live "$_ops_pid" && return 0
-  ops_pid_live "$(cat "$1/handoff" 2>/dev/null)" && return 0
+  ops_lock_pid_live "$1" && return 0
   ops_pid_live "$(cat "$1/mover" 2>/dev/null)" && return 0
+  # A new detached owner's handoff names the same identity as pid, not a second owner.
+  # mq holds a native guard and can take a known dead parent's reservation at the next start.
+  if [ -n "$_ops_pid" ] && { [ -s "$1/birth" ] || [ "${2:-}" = queue ]; } &&
+    [ "$(cat "$1/handoff" 2>/dev/null)" = "$_ops_pid" ]; then return 1; fi
+  ops_pid_live "$(cat "$1/handoff" 2>/dev/null)" && return 0
   [ -d "$1" ] && { [ -z "$_ops_pid" ] || [ -f "$1/handoff" ]; } || return 1
   _ops_age=$1; [ ! -f "$1/handoff" ] || _ops_age=$1/handoff
   _ops_mt=$(ops_stat %m %Y "$_ops_age" || echo 0)
@@ -58,31 +76,32 @@ ops_lock_held() {
 # A function, not a subshell: the PID it writes is the process that reaps and moves, so killing
 # the caller leaves no unregistered subshell acting on the lock.
 ops_try_lock() {
-  if mkdir "$1" 2>/dev/null; then echo $$ >"$1/pid"; return 0; fi
+  if mkdir "$1" 2>/dev/null; then ops_lock_write "$1"; return $?; fi
   # $2: the lock's identity before reaping (the nested reap-lock call reuses the globals).
-  set -- "$1" "$(ops_stat '%d:%i' '%d:%i' "$1" || true)"
-  ops_lock_held "$1" && return 1
+  set -- "$1" "$(ops_stat '%d:%i' '%d:%i' "$1" || true)" "${2:-}"
+  ops_lock_held "$1" "$3" && return 1
   # Serialize stale-lock reclamation so a contender cannot move a newly acquired lock.
   # Reapers use the same recoverable protocol, including their own PID.
   [ -n "$2" ] && ops_try_lock "$1/reap" || return 1
   # Reaping changes the parent mtime; recheck owners/handoffs, not its missing-PID grace.
-  if [ "$2" != "$(ops_stat '%d:%i' '%d:%i' "$1" || true)" ] || ops_pid_live "$(cat "$1/pid" 2>/dev/null)" ||
-    ops_pid_live "$(cat "$1/mover" 2>/dev/null)" || { [ -f "$1/handoff" ] && ops_lock_held "$1"; }; then
+  if [ "$2" != "$(ops_stat '%d:%i' '%d:%i' "$1" || true)" ] || ops_lock_pid_live "$1" ||
+    ops_pid_live "$(cat "$1/mover" 2>/dev/null)" || { [ -f "$1/handoff" ] && ops_lock_held "$1" "$3"; }; then
     ops_unlock "$1/reap"; return 1
   fi
   ops_move_lock "$1" "$1/reap" || { ops_unlock "$1/reap"; return 1; }
   mkdir "$1" 2>/dev/null || return 1
-  echo $$ >"$1/pid"
+  ops_lock_write "$1"
 }
 ops_lock() {
   _ops_wait=0
   until ops_try_lock "$1"; do
     _ops_wait=$((_ops_wait + 1))
-    [ "$_ops_wait" -lt 300 ] || { echo "state: lock busy: $1" >&2; return 1; }
+    # OPS_LOCK_TENTHS: how long to wait, in 0.1 s steps (default 30 s).
+    [ "$_ops_wait" -lt "${OPS_LOCK_TENTHS:-300}" ] || { echo "state: lock busy: $1" >&2; return 1; }
     sleep 0.1
   done
 }
-ops_unlock() { [ "$(cat "$1/pid" 2>/dev/null)" != "$$" ] || ops_move_lock "$1" "$1"; }
+ops_unlock() { ! ops_lock_owned "$1" || ops_move_lock "$1" "$1"; }
 # ops_move_lock LOCK HOLD: move LOCK to the trash. The moving process is named in HOLD/mover before it
 # moves anything and is the mv itself, so HOLD counts as held for as long as it lives: a releaser
 # killed mid-move leaves no unregistered child that could later move a successor's lock.

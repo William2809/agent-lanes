@@ -17,7 +17,9 @@ BUCKETS = ('model/gaps', 'typecheck', 'targeted tests', 'full check (+slot wait)
            'lint/preflight', 'install/build', 'BROWSER AUTOMATION', 'other')
 REASONS = ('new', 'rework', 'bounce', 'review', 'review-fix', 'other')
 EVENTS = ('queued', 'landing', 'landed', 'bounced', 'parked', 'requeued',
-          'dropped', 'outside-claim')
+          'dropped', 'outside-claim', 'land-timing', 'landed-direct')
+LAND_STEPS = ('rebase', 'migcheck', 'baseline', 'install', 'preflight', 'check',
+              'ff-merge', 'refresh', 'cleanup', 'total')
 
 
 def label(value):
@@ -116,7 +118,7 @@ def read_tags(home, repo):
 
 def tag_runs(runs, tags):
     # One nearby tag per launch, including tags written just after wk starts.
-    # Never carry an old reason forward to an untagged resume.
+    # wk supplies inherited resume tags; mq supplies its own bounce tags.
     used = set()
     for run in runs:
         candidates = [(abs(at - run['start']), at, i, feature, reason)
@@ -505,6 +507,19 @@ def queue_stats(events, start, end):
                 has_data=any(start <= row[0] < end for row in events))
 
 
+def land_steps(events, start, end):
+    values = defaultdict(list)
+    for at, _, event, detail in events:
+        if event != 'land-timing' or not start <= at < end:
+            continue
+        fields = dict(re.findall(r'(?:^|\s)([a-z-]+)=(\d+)(?=\s|;|$)', detail))
+        for step in LAND_STEPS:
+            if step in fields:
+                values[step].append(int(fields[step]))
+    return {step: dict(median_seconds=median(values[step]), samples=len(values[step]))
+            for step in LAND_STEPS}
+
+
 def reflog_landings(root):
     if root is None:
         return []
@@ -522,27 +537,57 @@ def reflog_landings(root):
     return sorted(set(rows))
 
 
+def landing_sha(detail):
+    match = re.match(r'([0-9a-f]{7,40})\b', detail)
+    return match[1] if match else ''
+
+
+def landing_occurrence(at, sha, reflog):
+    matches = [key for key in reflog if sha and key[1].startswith(sha)]
+    return min(matches, key=lambda k: abs(k[0] - at)) if matches else (at, sha)
+
+
+def outside_queue(events, reflog, start, end):
+    landings = defaultdict(set)
+    for at, _, event, detail in events:
+        if event in ('landed', 'landed-direct') and landing_sha(detail):
+            # Match one occurrence, across day boundaries; train lanes can share it.
+            landings[event].add(landing_occurrence(at, landing_sha(detail), reflog))
+    direct = other = 0
+    for at, sha in set(reflog):
+        if not start <= at < end or (at, sha) in landings['landed']:
+            continue
+        if (at, sha) in landings['landed-direct']:
+            direct += 1
+        else:
+            other += 1
+    return dict(total=direct+other, direct=direct, other=other)
+
+
 def feature_stats(runs, events, reflog, start, end):
-    # Reflog is authoritative when an event's landing hash matches it.
-    landings = {(at, sha): None for at, sha in reflog if start <= at < end}
+    # Reflog supplies the landing day, even when its event arrived after midnight.
+    landings = {(at, sha): set() for at, sha in reflog if start <= at < end}
     for at, lane, event, detail in events:
-        if event != 'landed' or not start <= at < end:
+        if event not in ('landed', 'landed-direct'):
             continue
-        match = re.match(r'([0-9a-f]{7,40})\b', detail)
-        matches = [key for key in landings if match and key[1].startswith(match[1])]
-        key = min(matches, key=lambda k: abs(k[0] - at)) if matches else (at, '')
-        landings[key] = lane
+        sha = landing_sha(detail)
+        key = landing_occurrence(at, sha, reflog)
+        if start <= key[0] < end:
+            landings.setdefault(key, set()).update(lane.split(',') if event == 'landed-direct' else [lane])
     last, unlinked = {}, 0
-    for (at, sha), lane in landings.items():
-        candidates = [r for r in runs if r.get('status') == 'complete' and r['end'] <= at
-                      and (lane and lane in (r['name'], r['lane']) or
-                           sha and any(sha.startswith(h) for h in r.get('hashes', [])))]
-        run = max(candidates, key=lambda r: r['end']) if candidates else None
-        if run is None or 'feature' not in run:
+    for (at, sha), lanes in landings.items():
+        linked = False
+        for lane in lanes or {None}:
+            candidates = [r for r in runs if r.get('status') == 'complete' and r['end'] <= at
+                          and (lane in (r['name'], r['lane']) if lane else
+                               sha and any(sha.startswith(h) for h in r.get('hashes', [])))]
+            run = max(candidates, key=lambda r: r['end']) if candidates else None
+            if run is not None and 'feature' in run:
+                linked = True
+                feature = run['feature']
+                last[feature] = max(at, last.get(feature, 0))
+        if not linked:
             unlinked += 1
-            continue
-        feature = run['feature']
-        last[feature] = max(at, last.get(feature, 0))
     rows = []
     for feature, at in sorted(last.items()):
         first = min(r['start'] for r in runs if r.get('feature') == feature and r['start'] <= at)
@@ -566,7 +611,9 @@ def daily(runs, events, reflog, start, end, day):
         url_timeouts=sum(r.get('url_timeouts', 0) for r in complete),
         reasons={k: reasons[k] for k in (*REASONS, 'untagged')},
         rebuild_rounds=dict(sorted(rebuilds.items()))), queue=queue_stats(events, start, end),
-        features=features, landings=landed, unlinked_landings=unlinked)
+        land_steps=land_steps(events, start, end),
+        features=features, landings=landed, unlinked_landings=unlinked,
+        outside_queue=outside_queue(events, reflog, start, end))
 
 
 def snapshot_path(home, repo, day):
@@ -585,7 +632,8 @@ def keep_history(home, repo, computed, now):
     except (OSError, ValueError):
         saved = None
     if saved and weight(saved) > weight(computed):
-        return dict(saved, source='snapshot')
+        return dict(saved, land_steps=saved.get('land_steps', computed['land_steps']),
+                    outside_queue=saved.get('outside_queue', computed['outside_queue']), source='snapshot')
     if saved != computed and (computed['workers']['runs'] or computed['landings']):
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix('.tmp')
@@ -616,11 +664,12 @@ def report(home, repo, root, day, days, now=None):
                     intervals='deduplicated item IDs; command intervals override wrappers; union; mixed families share equally (estimate)',
                     gaps='wall minus command/tool union; upper-bound model proxy, includes idle (estimate)',
                     matching='log session IDs + task_started within 180s; equal cwd within 60s fallback (estimate); no mtime',
-                    tags='nearest unused same-repo/name tag within 180s of launch; untagged resumes stay untagged',
+                    tags='nearest unused same-repo/name tag within 180s of launch; wk resumes inherit the latest feature/reason; mq supplies bounce tags; resumes without tag history stay untagged',
                     browser='explicit executable names/inline node browser code and browser/node REPL tools; opaque scripts may be other',
                     timeouts='deduplicated completed browser-command/tool locator and page.waitForURL timeout markers; URL waits include login but are not uniquely attributable to login; lower bound',
                     queue='distinct lanes plus event counts; queue pairs end on landing day, land pairs end on landed day; requeue starts a new wait',
-                    features='first recorded tagged launch to last linked landing (estimate); current-branch merge reflog plus mq landed events',
+                    features='first recorded tagged launch to last linked landing (estimate); current-branch merge reflog plus mq landed and landed-direct events',
+                    outside_queue='current-branch reflog merges; each mq landed or landed-direct event matches the nearest same-SHA merge; unmatched merges are other; reflog day',
                     missing='no evidence is no data; numeric trends use 0 for empty counts/hours, -1 for missing medians',
                     timezone='host local calendar days',
                     history='finished days saved to ~/.claude/state/loop-stats/<repo>/<day>.json; a saved day with more runs/landings than the logs now show is used instead (source=snapshot)'))
@@ -641,8 +690,14 @@ def render(result):
     output.append('Rebuild rounds (rework): ' + (' '.join(f'{k}={v}' for k, v in w['rebuild_rounds'].items()) or 'no data'))
     output.append('Queue lanes: ' + ' '.join(f'{k}={q["lanes"][k]}' for k in ('queued', 'landed', 'bounced', 'parked')) +
                   f"; outside-claim={q['events']['outside-claim']}" if q['has_data'] else 'Queue: no data')
-    output.append(f"Queue median wait={minutes(q['median_queue_wait_seconds'])}; land={minutes(q['median_land_seconds'])}")
+    output[-1] += f"; median wait={minutes(q['median_queue_wait_seconds'])}; land={minutes(q['median_land_seconds'])}"
+    steps = d.get('land_steps', {})
+    output.append('Land step medians: ' + (' '.join(
+        f"{step}={row['median_seconds']:g}s(n={row['samples']})" if row['samples'] else f'{step}=no data'
+        for step, row in steps.items()) if any(row['samples'] for row in steps.values()) else 'no data'))
     output.append(f"Landings: {d['landings']}; without feature link={d['unlinked_landings']}")
+    outside = d['outside_queue']
+    output.append(f"Outside queue: {outside['total']} (direct {outside['direct']}, other {outside['other']})")
     features = ' '.join(f"{r['feature']}={r['launch_to_last_landing_hours']:.2f}h" for r in d['features'])
     output.append('Feature first launch → last landing (estimate): ' + (features or 'no data'))
     output.append(f"Trend {trend[0]['day']}..{trend[-1]['day']} (oldest first; 0=empty, -1=missing median):")

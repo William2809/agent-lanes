@@ -88,6 +88,19 @@ export const commands = (run: RunRecord): { report: string; resume: string } => 
 export const eventKey = (run: RunRecord): string | undefined =>
   run.rc !== undefined ? `${identity(run)}:end` : isFailure(run.status) ? `${identity(run)}:problem` : undefined
 
+// Only recognize a simple report command with literal names and actual report
+// sections. Compound shell commands and failed/empty reports are not evidence.
+export const readReports = (command: string, stdout: string, runs: RunRecord[]): RunRecord[] => {
+  if (!/^batches\s+report(?:\s+(?:[\w.-]+|'[\w.-]+'|"[\w.-]+"))+\s*$/.test(command.trim())) return []
+  const names = new Set(command.trim().split(/\s+/).slice(2).map(name => name.replace(/^['"]|['"]$/g, '')))
+  const logs = new Set(stdout.split(/^=================== /m).slice(1).flatMap(section => {
+    const newline = section.indexOf('\n')
+    const body = section.slice(newline + 1).trim()
+    return newline >= 0 && body && !body.startsWith('NO REPORT') ? [section.slice(0, newline)] : []
+  }))
+  return runs.filter(run => names.has(run.name) && logs.has(run.recordLog ?? run.log))
+}
+
 // An evicted delivery must not come back as new: events at or before the floor count as sent.
 // An exit's time is when it ended, so a long run that started before the floor still reports.
 export const FLOOR = '#floor'
@@ -97,11 +110,16 @@ const floorOf = (delivered: Delivery[]): number => delivered.find(d => d.key ===
 export const events = (runs: RunRecord[], delivered: Delivery[], mine: string): RunRecord[] => {
   const sent = new Set(delivered.map(d => d.key))
   const floor = floorOf(delivered)
+  // A resumed worker reuses its log: an older run of that log is superseded, so its
+  // late "done" would only point the lead at a report it already handled.
+  const newest = new Map<string, number>()
+  for (const run of runs) newest.set(run.log, Math.max(newest.get(run.log) ?? -Infinity, run.started))
   const fresh = new Map<string, RunRecord>()
   for (const run of runs) {
+    if (run.started < newest.get(run.log)!) continue
     const key = eventKey(run)
     // A report another session adopted is not announced again.
-    if (run.rc !== undefined && run.delivered) continue
+    if (run.read || (run.rc !== undefined && run.delivered)) continue
     if (run.session === mine && key && !sent.has(key) && eventAt(run) > floor) fresh.set(key, run)
   }
   return [...fresh.values()]
@@ -124,7 +142,7 @@ export const ADOPT_LIMIT = 20
 // (it crashed between saving the history and queueing the prompt).
 export const unclaimed = (runs: RunRecord[], mine: string, now: number, sent: ReadonlySet<string> = new Set(),
   openLeads: ReadonlySet<string> = new Set()): RunRecord[] =>
-  runs.filter(run => run.rc !== undefined && !run.delivered && !!run.session &&
+  runs.filter(run => run.rc !== undefined && !run.delivered && !run.read && !!run.session &&
     (run.session !== mine || sent.has(eventKey(run) ?? '')) &&
     !isPaused(run) && run.owner !== 'mq' && !/-mq[0-9]+r?$/.test(run.name) && (run.ended ?? run.started) <= now - UNCLAIMED_GRACE)
     .map(run => openLeads.has(run.session!) ? { ...run, leadOpen: true } : run)

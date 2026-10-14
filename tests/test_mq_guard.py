@@ -253,6 +253,13 @@ class RepairGuardTests(unittest.TestCase):
         out = self.repair('src.txt', 'source fix\n').stdout
         self.assertIn('PARKED b: repair changed existing tests or check config (pytest.ini)', out)
 
+    def test_repair_changing_pyproject_parks(self):
+        # v0.8.4 review: first submissions skip pyproject.toml/setup.cfg, but a bounce repair can
+        # weaken test settings there ([tool.pytest.ini_options] addopts), so repairs still park.
+        self.bounce_here()
+        out = self.repair('pyproject.toml', '[tool.pytest.ini_options]\naddopts = "-k not slow"\n').stdout
+        self.assertIn('PARKED b: repair changed existing tests or check config (pyproject.toml)', out)
+
     def test_test_name_with_a_vertical_tab_stays_guarded(self):
         # Review of v0.8.3 (round 2), finding 4: splitlines() split the name awk matched.
         lane = self.f.lanes['b']

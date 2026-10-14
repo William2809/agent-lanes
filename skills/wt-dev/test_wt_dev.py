@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ABOUTME: End-to-end tests for wt-dev's framework presets, installs and database copies, run against
 # ABOUTME: throwaway git repos under a temporary HOME with stub dev servers (no network, no real frameworks).
-import json, os, sqlite3, subprocess, tempfile, textwrap, time, unittest
+import json, os, shutil, sqlite3, subprocess, tempfile, textwrap, time, unittest
 
 BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin')
 SERVE = textwrap.dedent('''\
@@ -181,6 +181,15 @@ class WtDev(unittest.TestCase):
         self.assertEqual(out, ['pnpm install --frozen-lockfile --prefer-offline', 'yarn install --immutable',
                                'uv sync --frozen', 'bundle install --quiet'])
 
+    def test_install_keeps_the_installer_exit_code(self):
+        # Requirement (v0.8.4 typed outcomes): a missing install tool (127) must reach land as 127,
+        # so land reports infra instead of starting a code fixer. Before, every failure became 1.
+        self.write('.wt-dev.conf', 'WT_DEV_INSTALL="no-such-installer-v084"\n')
+        self.commit()
+        self.new('i2', '--no-install')
+        r = self.wt('install', 'i2', check=False)
+        self.assertEqual(r.returncode, 127, r.stderr)
+
     def test_no_framework_means_no_server(self):
         self.write('main.go', 'package main\n'); self.write('go.mod', 'module x\n')
         self.commit()
@@ -215,6 +224,61 @@ class WtDev(unittest.TestCase):
         self.wt('rm', 'a-b'); self.names.remove('a-b')
         self.assertTrue(os.path.exists(os.path.join(os.path.dirname(db), 'app_wt_a_b.db')))
         self.assertTrue(os.path.exists(db))
+
+    def pdf_stub(self, lane, body):
+        """A fake docker: logs every call; BODY is a sh case on "$*" that answers queries."""
+        if not os.path.exists(os.path.join(self.repo, '.wt-dev.conf')):  # a server, so the lane has a port
+            self.write('.wt-dev.conf', "WT_DEV_CMD='exec python3 serve.py \"$PORT\"'\nWT_DEV_INSTALL=''\n")
+            self.commit()
+        self.new(lane)
+        port = open(os.path.join(self.home, '.cache/wt-dev/repo', lane + '.port')).read().strip()
+        body = body.replace('LANEPORT', port)
+        stub = os.path.join(self.tmp.name, 'stubbin'); os.makedirs(stub)
+        log = os.path.join(self.tmp.name, 'docker.calls')
+        with open(os.path.join(stub, 'docker'), 'w') as f:
+            f.write(f'#!/bin/sh\necho "$*" >>"{log}"\ncase "$*" in\n{body}\n  "rm -f "*) ;;\n  *) exit 1;;\nesac\nexit 0\n')
+        os.chmod(os.path.join(stub, 'docker'), 0o755)
+        self.env['PATH'] = stub + ':' + self.env['PATH']
+        return log, port
+
+    def rm_calls(self, log):
+        return [c for c in open(log).read().splitlines() if c.startswith('rm')]
+
+    def test_rm_removes_the_worktree_pdf_renderer(self):
+        """A wt-pdf renderer ran with --restart unless-stopped and outlived its worktree for days."""
+        log, _ = self.pdf_stub('p1', '  "ps -aq --filter label=agent-lanes.wt-pdf=repo/p1") echo abc123;;')
+        out = self.wt('rm', 'p1').stdout; self.names.remove('p1')
+        self.assertIn('removed PDF renderer of p1 (abc123)', out)
+        self.assertEqual(self.rm_calls(log), ['rm -f abc123'])
+
+    def test_rm_never_removes_the_shared_renderer_by_name(self):
+        # Same name as the lane's renderer would get, but compose manages it (config-hash).
+        # The stub also answers a plain name listing, which a name-based removal would act on.
+        log, _ = self.pdf_stub('renderer-1', '  "ps -aq "*) ;;\n'
+                               '  "ps -a --format"*) echo repo-pdf-renderer-1;;\n'
+                               '  "inspect repo-pdf-renderer-1 "*) echo "sharedid c0ffee";;')
+        self.wt('rm', 'renderer-1'); self.names.remove('renderer-1')
+        self.assertEqual(self.rm_calls(log), [])
+
+    def test_rm_removes_an_unlabeled_renderer_only_when_it_serves_this_lane(self):
+        for origin_port, removed in ((None, True), ('1', False)):
+            with self.subTest(origin_port=origin_port):
+                lane = 'old1' if removed else 'old2'
+                log, port = self.pdf_stub(lane, f'  "ps -aq "*) ;;\n'
+                                          f'  "inspect repo-pdf-{lane} "*) echo "legacyid ";;\n'
+                                          f'  "inspect legacyid "*) echo PDF_APPLICATION_ORIGIN=http://host.docker.internal:{origin_port or "LANEPORT"};;')
+                self.wt('rm', lane); self.names.remove(lane)
+                self.assertEqual(self.rm_calls(log), ['rm -f legacyid'] if removed else [])
+                os.remove(log); shutil.rmtree(os.path.join(self.tmp.name, 'stubbin'))
+                self.env['PATH'] = self.env['PATH'].split(':', 1)[1]
+
+    def test_rm_is_not_held_by_a_stuck_docker(self):
+        # Like the real docker CLI, the stub survives SIGALRM, so only a kill deadline frees rm.
+        log, _ = self.pdf_stub('stuck', '  "ps -aq "*) trap "" ALRM; exec sleep 60;;')
+        started = time.monotonic()
+        self.wt('rm', 'stuck'); self.names.remove('stuck')
+        self.assertLess(time.monotonic() - started, 40)
+        self.assertFalse(os.path.isdir(self.path('stuck')))
 
     def test_relative_sqlite_gets_private_env_and_survives_a_refused_rm(self):
         self.commit()
@@ -370,7 +434,8 @@ class WtDev(unittest.TestCase):
         self.assertEqual(sorted(f for f in os.listdir(root) if f.startswith('dropped-')), ['dropped-main'])
 
     def land(self, name):
-        env = dict(self.env, LAND_CHECK='true', GIT_AUTHOR_NAME='t', GIT_COMMITTER_NAME='t',
+        # land refuses outside mq unless the landing is direct and gives a reason (v0.8.4).
+        env = dict(self.env, LAND_CHECK='true', LAND_DIRECT='1', LAND_REASON='test', GIT_AUTHOR_NAME='t', GIT_COMMITTER_NAME='t',
                    GIT_AUTHOR_EMAIL='user@example.invalid', GIT_COMMITTER_EMAIL='user@example.invalid')
         return subprocess.run(['land', name, '--keep'], cwd=self.repo, env=env,
                               capture_output=True, text=True, timeout=120)

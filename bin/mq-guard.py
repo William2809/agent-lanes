@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# ABOUTME: mq's repair guard: lists the test and check-config files a bounce repair weakened.
-# Usage: mq-guard.py LANE_DIR BOUNCE_HEAD MAIN_HEAD. Prints one file per line; exit 2 if it cannot tell.
+# ABOUTME: Lists weakened bounce repairs or first-submission check policy changes for mq review.
+# Usage: mq-guard.py LANE_DIR BOUNCE_HEAD MAIN_HEAD | --policy LANE_DIR TARGET. Exit 2 if it cannot tell.
 import json
 import os
 import re
@@ -12,10 +12,16 @@ import sys
 # Tests: adding is fine; changing or removing an existing line, or adding a skip, needs review.
 TESTS = ('MQ_GUARD_PATHS', os.environ.get('MQ_GUARD_PATHS') or (
     r'(^|/)(tests?|__tests__|specs?|e2e|playwright)/|\.(test|spec)\.[^/]+$|(^|/)test_[^/]+\.py$|_test\.(py|go)$'))
-# Check config and baselines: any change needs review (an added line can override an earlier one).
-CONFIG = ('MQ_GUARD_CONFIG', os.environ.get('MQ_GUARD_CONFIG') or (
-    r'(^|/)(vitest|jest|playwright|cypress)\.config\.|(^|/)(pytest\.ini|conftest\.py|\.wt-dev\.conf|'
-    r'\.remote-ci\.conf|\.remote-ci\.conf)$|baseline[^/]*$'))
+# Check config always needs review; baselines and tests are guarded only on bounce repairs.
+CHECK_CONFIG = (r'(^|/)(vitest|jest|playwright|cypress|eslint|biome)\.config\.|'
+    r'(^|/)(pytest\.ini|conftest\.py|tox\.ini|\.eslintrc(\.[a-z]+)?|biome\.jsonc?|\.wt-dev\.conf|'
+    r'\.remote-ci\.conf|\.remote-ci\.conf|\.gitlab-ci\.yml|Jenkinsfile|azure-pipelines\.yml)$|'
+    r'(^|/)(\.github/workflows|\.circleci|\.buildkite)/|(^|/)tools/land-preflight\.sh$')
+POLICY = ('MQ_GUARD_CONFIG', os.environ.get('MQ_GUARD_CONFIG') or CHECK_CONFIG)
+# Bounce repairs also guard Python files that can hold test settings ([tool.pytest] etc.);
+# first submissions skip them because dependency edits live there too.
+CONFIG = ('MQ_GUARD_CONFIG', os.environ.get('MQ_GUARD_CONFIG') or
+          CHECK_CONFIG + r'|(^|/)(setup\.cfg|pyproject\.toml)$|baseline[^/]*$')
 PACKAGE = ('package.json', r'(^|/)package\.json$')
 SKIP = re.compile(r'\.skip\(|\.only\(|(^|[^a-z])xit\(|(^|[^a-z])xdescribe\(|@skip|mark\.skip|skipTest|test\.fixme|t\.Skip\(')
 
@@ -92,13 +98,14 @@ def scripts(lane, tree, path, exists):
         return 'unparsable'
 
 
-def weakened(lane, old, new):
+def weakened(lane, old, new, policy=False):
     """Guarded files whose change from tree OLD to tree NEW needs review."""
     found = set()
     raw = git(lane, 'diff-tree', '-r', '-z', '--no-renames', '--raw', old, new).split('\0')
     rows = [(meta.lstrip(':').split(' '), path) for meta, path in zip(raw[0::2], raw[1::2])]
     paths = {path for _, path in rows}
-    tests, config, package = matching(TESTS, paths), matching(CONFIG, paths), matching(PACKAGE, paths)
+    tests = set() if policy else matching(TESTS, paths)
+    config, package = matching(POLICY if policy else CONFIG, paths), matching(PACKAGE, paths)
     for (old_mode, new_mode, _, _, status), path in rows:
         if path in config:
             found.add(path)
@@ -106,6 +113,8 @@ def weakened(lane, old, new):
             found.add(path)
         elif path in package and scripts(lane, old, path, status != 'A') != scripts(lane, new, path, status != 'D'):
             found.add(path + ' (scripts)')  # land runs check:remote, which may call any other script
+    if policy:
+        return found
     for row in git(lane, 'diff-tree', '-r', '-z', '--no-renames', '--numstat', '--diff-filter=M', old, new).split('\0'):
         parts = row.split('\t', 2)
         if len(parts) == 3 and parts[1] != '0' and parts[2] in tests:
@@ -132,6 +141,17 @@ def added(patch):
 
 
 def main():
+    policy = sys.argv[1] == '--policy'
+    if policy:
+        lane, main_head = sys.argv[2:4]
+        try:
+            base = git(lane, 'merge-base', 'HEAD', main_head).strip()
+            for path in sorted(weakened(lane, base, 'HEAD^{tree}', policy=True)):
+                print(path)
+        except (Unknown, subprocess.TimeoutExpired, ValueError) as error:
+            print(f'mq-guard: cannot inspect check policy ({error})', file=sys.stderr)
+            sys.exit(2)
+        return
     lane, base, main_head = sys.argv[1:4]
     try:
         for ref in (base, main_head):

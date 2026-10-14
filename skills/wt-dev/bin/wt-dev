@@ -192,9 +192,11 @@ reserve_port() {
   python3 "$helper" reserve-port "$state/ports" "$1" "$$" || return 1
   port_lock=$1; port=$1
 }
+port_listens() { nc -z -G 1 127.0.0.1 "$1" >/dev/null 2>&1 || nc -z -G 1 ::1 "$1" >/dev/null 2>&1; }
 free_port() {
   local p=3001
-  while lsof -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 || ! reserve_port "$p"; do p=$((p + 1)); done
+  # nc is ~ms; lsof took ~8 s per port on a busy Mac and stalled launches for minutes.
+  while port_listens "$p" || ! reserve_port "$p"; do p=$((p + 1)); done
 }
 # Per-worktree database helpers. URLs are never printed (they hold passwords).
 main_url() { grep -E "^(export )?$dbvar=" "$repo/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"; }
@@ -411,6 +413,32 @@ stop() {
 clear_state() {
   rm -f "$state/$name".*  # small state files this tool wrote
 }
+dk() {  # dk SECONDS ARGS...: docker with a kill deadline, so a stuck daemon cannot hang rm
+  local t=$1 p w r; shift
+  docker "$@" & p=$!
+  # The watchdog's own sleep dies with it, so a quick call leaves nothing behind.
+  ( trap 'kill "$sp" 2>/dev/null; exit 0' TERM; sleep "$t" & sp=$!; wait "$sp" && kill -9 "$p" ) >/dev/null 2>&1 & w=$!
+  wait "$p"; r=$?; kill "$w" 2>/dev/null; wait "$w" 2>/dev/null; return "$r"
+}
+drop_pdf() {  # the worktree's own PDF renderer (wt-pdf up) dies with the worktree
+  command -v docker >/dev/null 2>&1 || return 0
+  # Only containers owned by this lane, removed by ID, never by a name match alone (a lane
+  # called renderer-1 would otherwise hit the shared renderer). Owned = wt-pdf's label for
+  # this lane, or (containers from before the label) the exact wt-pdf name, not managed by
+  # compose (no config-hash), and loading pages from this lane's own dev port.
+  local ids id meta port
+  ids=$(dk 10 ps -aq --filter "label=agent-lanes.wt-pdf=$ns/$name" 2>/dev/null) || return 0
+  port=$(cat "$state/$name.port" 2>/dev/null || true)
+  if [ -n "$port" ] && meta=$(dk 10 inspect "$ns-pdf-$name" --format \
+      '{{.Id}} {{index .Config.Labels "com.docker.compose.config-hash"}}{{index .Config.Labels "agent-lanes.wt-pdf"}}' 2>/dev/null); then
+    id=${meta%% *}
+    if [ "$meta" = "$id " ] && dk 10 inspect "$id" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null |
+        grep -qxF "PDF_APPLICATION_ORIGIN=http://host.docker.internal:$port"; then ids="$ids $id"; fi
+  fi
+  for id in $ids; do
+    dk 20 rm -f "$id" >/dev/null && echo "removed PDF renderer of $name (${id:0:12})"
+  done
+}
 server_tree() {
   ps -axo pid=,ppid= | awk -v root="$1" '
     { parent[$1]=$2 } END {
@@ -469,7 +497,7 @@ install_deps() {
   if [ "$if_changed" = 1 ] && [ "$(cat "$stamp" 2>/dev/null)" = "$sum" ] && deps_present; then return 0; fi
   : >"$log"
   while IFS= read -r c; do
-    (cd "$wt" && sh -c "$c") >>"$log" 2>&1 || { tail -5 "$log" >&2; echo "wt-dev: install failed: $c (log: $log)" >&2; return 1; }
+    (cd "$wt" && sh -c "$c") >>"$log" 2>&1 || { rc=$?; tail -5 "$log" >&2; echo "wt-dev: install failed: $c (log: $log)" >&2; return "$rc"; }
   done <<<"$cmds"
   echo "$sum" >"$stamp"
   echo "installed deps ($(printf '%s\n' "$cmds" | awk '{print $1}' | paste -sd, -))"
@@ -532,7 +560,7 @@ case "$cmd" in
   rm)
     stop
     if [ ! -d "$wt" ]; then  # already gone: clean leftovers, say so plainly
-      git -C "$repo" worktree prune; drop_db || true; clear_state; die "no worktree $name (not found; leftover state cleaned)"; fi
+      git -C "$repo" worktree prune; drop_db || true; drop_pdf || true; clear_state; die "no worktree $name (not found; leftover state cleaned)"; fi
     # An SQLite file copied into the worktree is held aside (it would block the removal if git
     # tracks its folder) and put back if git refuses; it is deleted only after a successful removal.
     hold=""; dbrel=""
@@ -563,6 +591,7 @@ case "$cmd" in
     fi
     if [ -n "$hold" ]; then ctrash "$hold" >/dev/null || die "cannot trash held database at $hold"; echo "dropped sqlite copy $(basename "$dbrel")"; ctrash "$state/$name.db" >/dev/null; fi
     drop_db || true
+    drop_pdf || true
     clear_state; echo "removed $wt";;
   sleep-idle) sleep_idle;;
   drop-caches)  # build caches of every stopped/sleeping worktree in this repo

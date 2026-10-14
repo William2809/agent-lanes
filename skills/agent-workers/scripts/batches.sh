@@ -103,15 +103,27 @@ case "${1:-}" in
   overlap)
     command -v wt-dev >/dev/null && git rev-parse --git-dir >/dev/null 2>&1 || exit 0
     base=$(git rev-parse --abbrev-ref HEAD); tmp=$(mktemp -d); trap 'ctrash "$tmp" >/dev/null' EXIT
+    skip() { grep -v -e '^\.reviews/' -e '^tools/file-size-baseline\.json$'; }
     wt-dev ls 2>/dev/null | while read -r name _; do
       path=$(wt-dev path "$name" 2>/dev/null) || continue
       { git -C "$path" diff --name-only "$base...HEAD" 2>/dev/null
         git -C "$path" status --porcelain=v1 -uall 2>/dev/null | cut -c4- | sed 's/.* -> //'
-      } | grep -v -e '^\.reviews/' -e '^tools/file-size-baseline\.json$' | sort -u >"$tmp/$name"
+      } | skip | sort -u >"$tmp/$name"
+      printf '%s\n' "$path" >"$tmp/.path.$name"
     done
     set -- "$tmp"/*; [ -e "$1" ] || exit 0
+    # Changes of worktree $1 since commit $2 (committed + uncommitted).
+    since() { { git -C "$1" diff --name-only "$2" HEAD 2>/dev/null
+      git -C "$1" status --porcelain=v1 -uall 2>/dev/null | cut -c4- | sed 's/.* -> //'; } | skip | sort -u; }
     for a in "$@"; do for b in "$@"; do [ "$a" \< "$b" ] || continue
       common=$(comm -12 "$a" "$b"); [ -n "$common" ] || continue
+      # A worktree stacked on another shares its commits: compare only what each changed after their fork point.
+      pa=$(cat "$tmp/.path.${a##*/}"); pb=$(cat "$tmp/.path.${b##*/}")
+      mb=$(git -C "$pa" merge-base HEAD "$(git -C "$pb" rev-parse HEAD)" 2>/dev/null)
+      if [ -n "$mb" ] && [ "$mb" != "$(git -C "$pa" merge-base HEAD "$base" 2>/dev/null)" ]; then
+        since "$pa" "$mb" >"$tmp/.a"; since "$pb" "$mb" >"$tmp/.b"
+        common=$(comm -12 "$tmp/.a" "$tmp/.b"); [ -n "$common" ] || continue
+      fi
       n=$(printf '%s\n' "$common" | wc -l | tr -d ' ')
       echo "OVERLAP ${a##*/} <-> ${b##*/}: $n file(s): $(printf '%s\n' "$common" | head -3 | tr '\n' ' ')"
     done; done
@@ -130,6 +142,17 @@ cause() { m=$(tail -200 "$1" 2>/dev/null | grep -E "${2:-ERROR|[Ee]rror:|panic|K
   sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? *//; s/^ +//' | tr -s ' ' | cut -c1-80)
   echo "${c:-error line withheld (looks like a secret)}"; }
 
+# Seconds since the youngest descendant of PID started (empty when none), so a
+# worker whose log is quiet while its test run works is not called STALLED.
+youngest_child() {
+  ps -A -o pid=,ppid=,etime= | awk -v root="$1" '
+    function secs(t,  d,n,a) { d=0; if (index(t,"-")) { split(t,a,"-"); d=a[1]; t=a[2] }
+      n=split(t,a,":"); return d*86400 + (n==3 ? a[1]*3600+a[2]*60+a[3] : a[1]*60+a[2]) }
+    { parent[$1]=$2; age[$1]=secs($3) }
+    END { best=""; for (p in parent) { q=p; while (q in parent && q!=root && q>1) q=parent[q]
+      if (q==root && p!=root && (best=="" || age[p]<best)) best=age[p] } print best }'
+}
+
 [ -s "$reg" ] && awk -F'\t' -v n="$now" 'n-$1<=86400 {last[$3]=$0} END {for (k in last) print last[k]}' "$reg" |
   sort -n | while IFS="$(printf '\t')" read -r start pid log dir; do
     name=$(basename "$log" .log)
@@ -144,7 +167,10 @@ cause() { m=$(tail -200 "$1" 2>/dev/null | grep -E "${2:-ERROR|[Ee]rror:|panic|K
         st="ERRORED ($(tail -5 "$log" | cause /dev/stdin '^ERROR:' | sed 's/^ERROR: //')) -> wk $name -r"; echo 1 >"$flag"
       else st="DIED (rc=${rc:-unknown}$([ -s "$log.last" ] || printf ', no report')): $(cause "$log")"; echo 1 >"$flag"; fi
     elif alive "$pid" "$log"; then
-      if [ $((now - mt)) -gt $((stall * 60)) ]; then
+      busy=""; [ $((now - mt)) -gt $((stall * 60)) ] && busy=$(youngest_child "$pid")
+      if [ -n "$busy" ] && [ "$busy" -le $((stall * 60)) ]; then
+        st="running $(age "$start"), log quiet $(age "$mt") (child busy)"
+      elif [ $((now - mt)) -gt $((stall * 60)) ]; then
         is_acked "$name" && [ $all -eq 0 ] && continue
         st="STALLED log quiet $(age "$mt")"; is_acked "$name" || echo 1 >"$flag"
       else st="running $(age "$start")"; fi

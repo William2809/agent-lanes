@@ -4,6 +4,45 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-10-14
+
+### Upgrade
+
+- Drain the queue before you upgrade from 0.8.3 or earlier. Stop adding lanes, then wait until every queue run has ended: `mq ls` shows no active runner and `pgrep -fl 'bin/mq|bin/land'` prints nothing. Older versions start helper processes that `mq ls` does not list, and one of them could land at the same time as a new runner. After the upgrade, `mq run` (or `mq add WT`) picks up the queued work.
+- A new runner waits while an older one still holds the queue. If an older lock stays after its process has ended (its PID was reused), `mq ls` names the lock and prints the `mv` command that clears it.
+
+### Added
+
+- README: a demo video under How it works.
+- `mq-wait NAME`: blocks until the latest merge-queue attempt for worktree NAME ends (solo or in a train) and prints its result lines; exit 0 = landed.
+- `land` prints one `timing STEP=SECONDS ... total=SECONDS` line before its final `LANDED`/`FAILED` line; `mq` records it as a `land-timing` event, and `loop-stats` reports the median seconds per landing step (`land_steps` in `--json`).
+- `tests/run-all`: one command runs the syntax checks and every public suite (one line per suite); GitHub Actions runs it on pull requests and pushes to `main` (macOS), and the export uses it.
+- `land`: `LAND_PUSH_BRANCHES` in the main checkout's `.wt-dev.conf` pushes listed branches to their remote after a green land (plain push, fast-forward only). A refused push is reported (also in the `mq` run log) and the land stays.
+
+### Changed
+
+- `land` runs from the merge queue: called without `mq` it refuses and names `mq add WT`. A direct landing needs `LAND_DIRECT=1 LAND_REASON="why"` and is recorded as a `landed-direct` event; `loop-stats` counts landings outside the queue (direct, and other merges such as a hand `git merge`). Integration branches are lanes too: `mq add`, never `git merge`.
+
+### Fixed
+
+- `remote-ci` prune: cached test template databases no longer pile up. The daily prune keeps the 5 newest and any used in the last 3 days; a cache hit marks the template as used.
+- `wt-dev rm` removes only the PDF renderer container that belongs to that worktree (by owner label, or for older containers by name, no compose management and the worktree's own port), and a stuck Docker daemon cannot hang it.
+- `mq` claims: shared ratchet files (`*baseline*.json`, `eslint-suppressions.json`) never count toward a lane's claimed paths; `land` regenerates them.
+- `mq`: archive installs inside unrelated Git repos use `unknown`; Git verification requires the tool root to be the top-level and all bundle files to be tracked at HEAD.
+- `mq`: Git tool bundles now match every copied file to its revision blob; a raced or partial upgrade retries up to three times. Non-Git installs check source hashes and modes.
+- `mq`: each land and transient retry checks the runner PID, start time, and lock directory identity; lost ownership stops the run and keeps its lanes queued.
+- `mq`: new starts wait for live older owners and reservations, including birth-less movers and reap locks; after the owner exits, the next add or run takes over. `mq ls` shows unknown start times and the exact command to clear a confirmed reused PID.
+- `mq`: runner locks record process start times, so a reused live PID cannot block a retry. The PID file stays readable by older tools.
+- `mq`: forced adds, delayed starts, and stale handoff tokens now share one kernel runner lock per repo; a landing supervisor keeps the slot after its runner dies, while background services cannot inherit it.
+- workers mod (0.2.5): a resumed worker reuses its log, so a late "done" notice from the older run of that log is no longer announced.
+- workers mod (0.2.6): bare `/workers` prints the short status (also `/workers status`; `/workers pane` opens the full list). Done notices no longer wait behind an earlier prompt or adoption delivery, so they arrive within one poll. A successful `batches report NAME…` in the lead's Bash tool suppresses that attempt's later notice.
+- Check outcomes are typed. The runner keeps the checks' own result; a database cleanup failure exits 76 and keeps the slot until a later run retries the cleanup (`lanes` shows `runner cleanup pending`), and submission, checkout and database-start failures exit 74. `land` reports runner trouble as `FAILED infra REASON rc=N ...`; `mq` keeps those lanes queued, starts no fixer, and exits non-zero when it stops without landing. An unknown `land` result parks the lanes instead of starting a fixer. A `check:remote` that does not call `remote-ci` keeps the old rule: any failure except the runner codes 3/74/75/76 is the candidate's. `remote-ci check --summary` always prints its verdict lines last. `wt-dev install` returns the installer's own exit code, so a missing install tool (127) is reported as infrastructure.
+- Check policy comes from the main checkout: `land` decides the check kind from main's `check:remote` (the candidate's script runs only after a change to it was reviewed, see below) and runs `remote-ci` with main's `.remote-ci.conf` (`REMOTE_CI_CONF`). A first submission that changes check policy (check or CI config, `.remote-ci.conf`, `.wt-dev.conf`, `tools/land-preflight.sh`, lint config, `package.json` scripts) is parked with `check policy changed: review`; `mq add WT` after review lands it. Tests, baselines and Python dependency files do not trigger it on a first submission; bounce repairs keep the stricter guard.
+- `mq run` copies the helpers it uses (`land`, `wt-dev`, `remote-ci`, `migcheck`, the guard, the shell libraries) into one private folder at start and runs from there, so updating the tools during a long run cannot mix versions. Only the process that made a temporary copy removes it.
+- `wk NAME -r`: a resume keeps the worker's FEATURE:REASON tag, so `loop-stats` counts resumed runs under their feature instead of as untagged.
+- `lanes`: the "waits on" check of queued lanes works again (it called `mq` in place without the tool root and failed silently).
+- `mq claim` / `mq add` (and so `wk -o`): claims and edits only clash between worktrees on the same branch line (the checked-out branch a lane's HEAD is closest to). A lane on another feature branch no longer blocks this one.
+
 ## [0.8.3] - 2026-10-09
 
 ### Fixed
@@ -173,7 +212,8 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 - First public release: `wk`, `mq` with `land`, `ao-model` presets, `ctrash`, and the skills `agent-workers`, `model-presets`, `remote-ci`, `session-stats`, `ui-audit`, `ui-shots`, `wt-compare` and `wt-dev`.
 - README example setup with a laptop and a second Mac as the check runner.
 
-[Unreleased]: ../../compare/v0.8.3...HEAD
+[Unreleased]: ../../compare/v0.8.4...HEAD
+[0.8.4]: ../../compare/v0.8.3...v0.8.4
 [0.8.3]: ../../compare/v0.8.2...v0.8.3
 [0.8.2]: ../../compare/v0.8.1...v0.8.2
 [0.8.1]: ../../compare/v0.8.0...v0.8.1

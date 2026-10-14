@@ -5,6 +5,71 @@
 set -u
 runner_dir=$(cd "$(dirname "$0")" && pwd)
 . "$runner_dir/lib.sh"
+clean_databases() {
+  local owner_filter=""
+  [ "$REMOTE_CI_SLOTS" -gt 1 ] && owner_filter="and datdba = (select oid from pg_roles where rolname = '$role')"
+  if [ -n "${REMOTE_CI_DB_CLEAN:-}" ]; then
+    psql -d postgres -Atq -v pattern="$REMOTE_CI_DB_CLEAN" -v role="$role" <<SQL |
+select datname from pg_database
+where datname like :'pattern' $owner_filter;
+SQL
+      while read -r db; do dropdb --if-exists --force "$db" || exit 1; done
+    [ "${PIPESTATUS[*]}" = "0 0" ] || return 1
+  fi
+  [ "$REMOTE_CI_SLOTS" = 1 ] || dropdb --if-exists --force "$REMOTE_CI_DB"
+}
+# Recovery uses the failed run's settings, never the new candidate's settings.
+if [ "${1:-}" = --cleanup ]; then
+  pending=$2; dir=${pending%/results/*}; run=${pending##*/}; run=${run%.cleanup}
+  [ -f "$dir/runs/$run/conf" ] || exit 76
+  load_project "${dir##*/}" "$dir/runs/$run/conf" || exit 76
+  [ ! -f "$dir/runs/$run/env.local" ] || . "$dir/runs/$run/env.local"
+  slot="" role="" database="" owner=""
+  while IFS='=' read -r key value; do
+    case "$key" in slot) slot=$value ;; role) role=$value ;; database) database=$value ;; pid) owner=$value ;; esac
+  done <"$pending"
+  case "$slot" in ''|*[!0-9]*|0) exit 76 ;; esac
+  case "$role:$database" in *[!a-zA-Z0-9_:]*|:*|*:) exit 76 ;; esac
+  REMOTE_CI_DB=$database
+  acquire_guard || exit 76
+  trap 'release_guard' EXIT
+  trap 'exit 76' HUP INT TERM
+  [ -f "$pending" ] || exit 0
+  if [ -z "$owner" ]; then
+    for claim in "$dir"/results/tree-*.running.run; do
+      [ -f "$claim" ] || continue
+      read -r claim_pid claimed <"$claim"
+      [ "$claimed" != "$run" ] || owner=$claim_pid
+    done
+  fi
+  case "$owner" in ''|*[!0-9]*) ;; *) kill -0 "$owner" 2>/dev/null && exit 76 ;; esac
+  if [ "$REMOTE_CI_SLOTS" -gt 1 ]; then
+    claimed=$(cat "$dir/slots/$slot.run" 2>/dev/null)
+    [ -z "$claimed" ] || [ "$claimed" = "$run" ] || exit 76
+    lock_live "$dir/slots/$slot.lock" && exit 76
+  else
+    slots_active && exit 76
+  fi
+  if [ -n "${REMOTE_CI_POSTGRES:-}" ]; then
+    pg_ctl -D "$pgdata" status >/dev/null 2>&1 ||
+      pg_ctl -D "$pgdata" -l "$ci/pg/$REMOTE_CI_POSTGRES.log" start -w || exit 76
+    clean_databases || exit 76
+  fi
+  for claim in "$dir"/results/tree-*.running.run; do
+    [ -f "$claim" ] || continue
+    read -r owner claimed <"$claim"
+    [ "$claimed" = "$run" ] || continue
+    acquire_lock "${claim%.run}.guard" || exit 76
+    read -r owner claimed <"$claim"
+    [ "$claimed" != "$run" ] || rm -f "$claim" "${claim%.run}"
+    rm -f "${claim%.run}.guard"
+  done
+  if [ "$REMOTE_CI_SLOTS" -gt 1 ]; then rm -f "$dir/slots/$slot.lock" "$dir/slots/$slot.run"; fi
+  git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" || exit 76
+  rm -f "$pending" || exit 76
+  echo "== cleanup recovered: $run"
+  exit 0
+fi
 if [ -f "$runner_dir/../conf" ]; then
   load_project "$1" "$runner_dir/../conf" || { echo 2 >"$dir/results/$4.exit"; exit 2; }
   env_file=$runner_dir/../env.local
@@ -22,6 +87,7 @@ wait_deadline=$((submitted + REMOTE_CI_WAIT_TIMEOUT))
 child="" watchdog="" locked=0 slot=0 template_lock="" pg_started=0 guard_owned=0 template_locked=0
 claim=$dir/results/tree-$tree.running
 claim_owned=0 cache_result=0 claim_guard_owned=0
+check_rc="" cleanup_failed=0 candidate_failed=0
 work=$dir/work
 base_db=$REMOTE_CI_DB
 role=ci
@@ -35,7 +101,7 @@ release_claim_guard() {
   claim_guard_owned=0
 }
 finish() {
-  local rc=${1:-1} cleanup_start owner_filter="" published=0 claim_pid="" claim_run=""
+  local rc=${1:-1} cleanup_start published=0 claim_pid="" claim_run=""
   trap '' HUP INT TERM
   if [ -n "$watchdog" ]; then
     kill -TERM -"$watchdog" 2>/dev/null || kill -TERM "$watchdog" 2>/dev/null
@@ -53,24 +119,16 @@ finish() {
   [ "$template_locked" = 1 ] && rm -f "$template_lock"
   # A queued/busy run has no resources and must never stop another run's Postgres.
   if [ "$locked" = 1 ] && [ "$pg_started" = 1 ]; then
-    [ "$REMOTE_CI_SLOTS" -gt 1 ] && owner_filter="and datdba = (select oid from pg_roles where rolname = '$role')"
-    if [ -n "${REMOTE_CI_DB_CLEAN:-}" ]; then
-      psql -d postgres -Atq -v pattern="$REMOTE_CI_DB_CLEAN" -v role="$role" <<SQL |
-select datname from pg_database
-where datname like :'pattern' $owner_filter;
-SQL
-        while read -r db; do dropdb --if-exists --force "$db" || exit 1; done
-      [ "${PIPESTATUS[*]}" = "0 0" ] || { echo "Error: database cleanup failed"; rc=1; }
-    fi
-    if [ "$REMOTE_CI_SLOTS" -gt 1 ]; then dropdb --if-exists --force "$REMOTE_CI_DB" || rc=1; fi
+    clean_databases || { echo "Error: database cleanup failed"; cleanup_failed=1; }
   fi
-  if [ "$locked" = 1 ]; then
+  [ "$cleanup_failed" = 0 ] || rc=76
+  if [ "$locked" = 1 ] && [ "$cleanup_failed" = 0 ]; then
     if [ "$REMOTE_CI_SLOTS" -gt 1 ]; then
       if acquire_guard; then
         rm -f "$dir/slots/$slot.lock" "$dir/slots/$slot.run"
       else
         echo "lost-run: run $run cleanup guard unavailable after 60 seconds; slot retained"
-        rc=74
+        rc=74; cleanup_failed=1
       fi
     fi
     if [ "$guard_owned" = 1 ]; then
@@ -78,8 +136,14 @@ SQL
       release_guard
     fi
   fi
-  git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null
-  if [ "$claim_owned" = 1 ] && ! acquire_claim_guard; then
+  if [ "$cleanup_failed" = 1 ]; then
+    printf 'run=%s\nslot=%s\ndatabase=%s\nrole=%s\ncheck_rc=%s\npid=%s\n' \
+      "$run" "$slot" "$REMOTE_CI_DB" "$role" "$check_rc" "$$" >"$dir/results/$run.cleanup"
+    echo "runner cleanup pending: $run"
+  fi
+  [ "$cleanup_failed" = 0 ] || release_guard
+  [ "$cleanup_failed" = 0 ] && git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null
+  if [ "$claim_owned" = 1 ] && [ "$cleanup_failed" = 0 ] && ! acquire_claim_guard; then
     echo "lost-run: run $run claim release guard unavailable after 60 seconds; claim retained"
     rc=74
   fi
@@ -104,7 +168,7 @@ SQL
   fi
   if [ "$claim_guard_owned" = 1 ]; then
     read -r claim_pid claim_run 2>/dev/null <"$claim.run" || true
-    if [ "$published" = 1 ] && [ "$claim_pid" = "$$" ] && [ "$claim_run" = "$run" ]; then
+    if [ "$published" = 1 ] && [ "$cleanup_failed" = 0 ] && [ "$claim_pid" = "$$" ] && [ "$claim_run" = "$run" ]; then
       rm -f "$claim.run" "$claim"
     fi
     release_claim_guard
@@ -112,7 +176,7 @@ SQL
   claim_owned=0
   exit "$rc"
 }
-trap 'finish 1' HUP INT TERM
+trap 'finish 74' HUP INT TERM
 # run_live PID [RUN]: 0 runner (of RUN, when given), 1 dead/invalid PID,
 # 2 positively another program or another run's runner (a reused PID), 3 unobservable.
 run_live() {
@@ -126,6 +190,31 @@ run_live() {
   case "$owner_command " in *" $2 "*) return 0 ;; *) return 2 ;; esac
 }
 busy_claim() { echo "busy: $*"; finish 75; }
+cleanup_retried=0
+pending_cleanup() {
+  local pending remaining blocked="" deadline=$(( $(date +%s) + 60 ))
+  [ "$deadline" -le "$wait_deadline" ] || deadline=$wait_deadline
+  for pending in "$ci"/projects/*/results/*.cleanup; do
+    [ -f "$pending" ] || continue
+    remaining=$((deadline - $(date +%s)))
+    if [ "$cleanup_retried" = 0 ] && [ "$remaining" -gt 0 ]; then
+      # Bound the whole process group, including a stuck psql/dropdb or guard wait.
+      perl -e '
+        setpgrp(0,0); my $seconds=shift; my $pid=fork(); defined $pid or exit 76;
+        if (!$pid) { setpgrp(0,0); exec @ARGV; exit 76; }
+        $SIG{ALRM}=sub { kill "TERM", -$pid; sleep 1; kill "KILL", -$pid; waitpid($pid,0); exit 76; };
+        alarm $seconds; waitpid($pid,0); exit($? ? 76 : 0);
+      ' "$remaining" /bin/bash "$runner_dir/run.sh" --cleanup "$pending" || true
+    fi
+    [ ! -f "$pending" ] || [ -n "$blocked" ] || blocked=$pending
+  done
+  cleanup_retried=1
+  if [ -n "$blocked" ]; then
+    echo "runner cleanup pending: $(basename "$blocked" .cleanup)"
+    release_guard; finish 76
+  fi
+}
+pending_cleanup
 # shlock publishes the PID atomically. The sidecar binds that PID to a run ID;
 # readers wait for matching metadata rather than following a previous owner.
 if [ -z "$command" ] && [ "$force" = 0 ]; then
@@ -188,6 +277,8 @@ mkdir -p "$dir/slots"
 while [ "$locked" = 0 ]; do
   if ! lock_live "$ci/lock" && /usr/bin/shlock -f "$ci/lock" -p $$; then
     guard_owned=1
+    # A dead PID is reclaimable, but its failed cleanup still owns the resources.
+    pending_cleanup
     if [ "$REMOTE_CI_SLOTS" = 1 ]; then
       if ! slots_active; then locked=1; slot=1; fi
     else
@@ -222,13 +313,16 @@ fi
 started=$(date +%s)
 echo "== $project run $run sha $sha slot $slot/$REMOTE_CI_SLOTS start $(date '+%F %T')"
 echo "== timing queue $((started - submitted))s"
-step() { echo "== $*"; "$@" || { finish 1; }; }
+step() { echo "== $*"; "$@" || { finish 74; }; }
 phase() {
   local label=$1 start rc; shift
   start=$(date +%s)
   "$@"; rc=$?
   echo "== timing $label $(( $(date +%s) - start ))s"
-  [ "$rc" = 0 ] || { finish "$rc"; }
+  if [ "$rc" != 0 ]; then
+    case "$candidate_failed:$label:$rc" in 1:*) rc=1 ;; *:74|*:75) ;; 0:checkout:*|0:database:*) rc=74 ;; esac
+    finish "$rc"
+  fi
 }
 supervised() {
   local rc
@@ -253,6 +347,20 @@ supervised() {
   wait "$watchdog" 2>/dev/null; watchdog=""
   return "$rc"
 }
+candidate() {
+  local stage=$1 command=$2 rc; shift 2
+  candidate_failed=0
+  supervised "$@" /bin/bash -c '
+    /bin/bash -c "$1"; rc=$?
+    printf "%s\n" "$rc" >"$2" || exit 74
+    exit "$rc"
+  ' _ "$command" "$dir/results/$run.check"; rc=$?
+  check_rc=$(cat "$dir/results/$run.check" 2>/dev/null) || return 74
+  echo "== check-result rc=$check_rc"
+  [ "$rc" = "$check_rc" ] || return 74
+  case "$stage:$rc" in install:126|install:127) return 74 ;; esac
+  [ "$rc" = 0 ] || { candidate_failed=1; return 1; }
+}
 checkout() {
   [ -d "$work/.git" ] || git init -q "$work" || return
   cd "$work" || return
@@ -273,7 +381,7 @@ if [ -n "${REMOTE_CI_INSTALL:-}" ]; then
     echo "== install cached"; echo "== timing install 0s"
   else
     rm -f "$install_marker"
-    phase install supervised /bin/bash -c "$REMOTE_CI_INSTALL"
+    phase install candidate install "$REMOTE_CI_INSTALL"
     printf '%s\n' "$install_hash" >"$install_marker"
   fi
 fi
@@ -317,12 +425,13 @@ prepare_database() {
       dropdb --if-exists --force "$template" || return
       createdb -T template0 "$template" || return
       export "${REMOTE_CI_DATABASE_URL_VAR:-DATABASE_URL}=$(database_url "$template")"
-      supervised /bin/bash -c "$REMOTE_CI_DB_PREPARE" || return
+      candidate migration "$REMOTE_CI_DB_PREPARE" || return
       # Prevent clients attaching to a published template; createdb can still clone it.
       psql -d postgres -qc "alter database \"$template\" with allow_connections false" || return
       touch "$dir/templates/$template.ready"
     else
       echo "== template cached $template"
+      touch "$dir/templates/$template.ready"   # prune keeps recently used templates
     fi
     echo "== timing template $(( $(date +%s) - template_start ))s"
     clone_start=$(date +%s)
@@ -335,12 +444,12 @@ prepare_database() {
   export "${REMOTE_CI_DATABASE_URL_VAR:-DATABASE_URL}=$(database_url "$REMOTE_CI_DB" "$role")"
 }
 [ -n "${REMOTE_CI_POSTGRES:-}" ] && phase database prepare_database
-[ -n "${REMOTE_CI_PREPARE:-}" ] && phase prepare supervised /bin/bash -c "$REMOTE_CI_PREPARE"
+[ -n "${REMOTE_CI_PREPARE:-}" ] && phase prepare candidate prepare "$REMOTE_CI_PREPARE"
 [ "$force" = 1 ] && export TURBO_FORCE=true
 check=${command:-$REMOTE_CI_CHECK}
 echo "== $check"
 check_start=$(date +%s)
-supervised /usr/bin/time -l nice -n 10 /bin/bash -c "$check"; rc=$?
+candidate check "$check" /usr/bin/time -l nice -n 10; rc=$?
 echo "== timing check $(( $(date +%s) - check_start ))s"
 echo "== timing run $(( $(date +%s) - started ))s (before cleanup)"
 finish "$rc"

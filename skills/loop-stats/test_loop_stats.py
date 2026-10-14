@@ -51,6 +51,24 @@ class LoopStatsTests(unittest.TestCase):
         self.assertEqual(d['workers']['rebuild_rounds'], {'feature-a': 1})
         self.assertEqual(d['workers']['reasons']['untagged'], 1)
 
+    def test_resume_tag_counts_once_with_nearby_launch(self):
+        # R2/R3: a fresh resume tag counts its feature/reason once within the 180s window.
+        s = self.start
+        runs = [dict(name='alpha', start=at, status='unmatched', match='unmatched')
+                for at in (s, s+600, s+601)]
+        self.write('.claude/state/worker-tags.tsv',
+                   f'{s+1}\tdemo\talpha\tfeature-a\tnew\told-rev\n'
+                   f'{s+600}\tdemo\talpha\tfeature-a\trework\tcurrent-rev\n')
+        stats.tag_runs(runs, stats.read_tags(Path.home(), 'demo'))
+        self.assertEqual([r.get('feature') for r in runs], ['feature-a', 'feature-a', None])
+        self.assertEqual([r.get('reason') for r in runs], ['new', 'rework', None])
+        d = stats.daily(runs, [], [], s, s+86400, '2026-10-03')
+        self.assertEqual(d['workers']['runs'], 3)
+        self.assertEqual(d['workers']['reasons']['new'], 1)
+        self.assertEqual(d['workers']['reasons']['rework'], 1)
+        self.assertEqual(d['workers']['reasons']['untagged'], 1)
+        self.assertEqual(d['workers']['rebuild_rounds'], {'feature-a': 1})
+
     def test_queue_cross_day_retries_and_duplicate_enqueue(self):
         s = self.start
         self.write('.claude/state/mq/demo/events', '\n'.join([
@@ -72,6 +90,42 @@ class LoopStatsTests(unittest.TestCase):
         self.assertEqual(q['lanes']['bounced'], 1)
         self.assertEqual(q['events']['outside-claim'], 1)
         self.assertNotIn('PRIVATE_DETAIL', json.dumps(q))
+
+    def test_land_step_daily_medians_and_missing_data(self):
+        # R3: day-end attribution, one sample per train, per-step counts, no invented zero.
+        s = self.start
+        self.write('.claude/state/mq/demo/events', '\n'.join([
+            f'{s-1}\ta\tland-timing\tcheck=999 total=999',
+            f'{s}\ttrain\tland-timing\tlanes=a,b rebase=2 check=8 total=10; tool=abc',
+            f'{s+1}\ta\tland-timing\trebase=4 check=12 total=16',
+            f'{s+2}\tb\tland-timing\tcheck=20 total=20',
+            f'{s+3}\tb\tland-timing\tcheck=-1 install=nan unknown=7 total=inf',
+            f'{s+86400}\ta\tland-timing\tcheck=999 total=999',
+        ]))
+        events = stats.read_events(Path.home(), 'demo')
+        d = stats.daily([], events, [], s, s+86400, '2026-10-03')
+        self.assertEqual(d['land_steps']['rebase'], dict(median_seconds=3, samples=2))
+        self.assertEqual(d['land_steps']['check'], dict(median_seconds=12, samples=3))
+        self.assertEqual(d['land_steps']['total'], dict(median_seconds=16, samples=3))
+        self.assertEqual(d['land_steps']['install'], dict(median_seconds=None, samples=0))
+        self.assertNotIn('unknown', d['land_steps'])
+        text = stats.render(dict(repo='demo', day=d['day'], daily=d, trend=[d]))
+        self.assertIn('check=12s(n=3)', text)
+        self.assertIn('install=no data', text)
+        empty = stats.daily([], [], [], s, s+86400, '2026-10-03')
+        self.assertTrue(all(row == dict(median_seconds=None, samples=0)
+                            for row in empty['land_steps'].values()))
+
+    def test_land_step_key_with_older_snapshot(self):
+        # R3: every daily JSON row keeps land_steps when richer old history wins.
+        s = self.start
+        computed = stats.daily([], [], [], s, s+86400, '2026-10-03')
+        saved = dict(computed, workers=dict(computed['workers'], runs=1))
+        saved.pop('land_steps', None)
+        self.write('.claude/state/loop-stats/demo/2026-10-03.json', json.dumps(saved))
+        result = stats.keep_history(self.home, 'demo', computed, s+86400)
+        self.assertEqual(result['land_steps']['check'], dict(median_seconds=None, samples=0))
+        self.assertEqual(result['source'], 'snapshot')
 
     def test_bucket_classification_only_executed_commands(self):
         cases = {
@@ -230,6 +284,83 @@ class LoopStatsTests(unittest.TestCase):
         self.assertEqual((count, missing), (2, 1))
         self.assertAlmostEqual(features[0]['launch_to_last_landing_hours'], 3720/3600)
         self.assertTrue(features[0]['estimate'])
+
+    def test_outside_queue_counts_direct_and_other_by_reflog_day(self):
+        """R2: daily SHA matching excludes mq trains and splits direct from hand merges."""
+        s = self.start
+        self.write('.claude/state/mq/demo/events', '\n'.join([
+            f'{s+12}\ta\tlanded\taaaaaaa on main',
+            f'{s+13}\tb\tlanded\taaaaaaa on main (train)',
+            f'{s+86401}\tc\tlanded-direct\tbbbbbbb lanes=c reason=PRIVATE_REASON',
+            f'{s+31}\td\tlanded-direct\tddddddd lanes=d reason=test',
+            f'{s+41}\te\tlanded-direct\taaaaaaa lanes=e reason=test',
+        ]))
+        events = stats.read_events(self.home, 'demo')
+        reflog = [(s-1, 'fffffff000000'), (s+10, 'aaaaaaa000000'),
+                  (s+20, 'bbbbbbb000000'), (s+30, 'ccccccc000000'),
+                  (s+86400, 'eeeeeee000000')]
+        d = stats.daily([], events, reflog, s, s+86400, '2026-10-03')
+        self.assertEqual(d['outside_queue'], dict(total=2, direct=1, other=1))
+        text = stats.render(dict(repo='demo', day=d['day'], daily=d, trend=[d]))
+        self.assertIn('Outside queue: 2 (direct 1, other 1)', text)
+        self.assertNotIn('PRIVATE_REASON', json.dumps(d) + text)
+        next_day = stats.daily([], events, reflog, s+86400, s+172800, '2026-10-04')
+        self.assertEqual(next_day['outside_queue'], dict(total=1, direct=0, other=1))
+
+    def test_repeated_sha_only_matches_nearest_landing_occurrence(self):
+        """TASKS:170(b): a prior mq landing must not hide a later hand merge after reset."""
+        s = self.start
+        events = [(s-18, 'a', 'landed', 'abcdef1 on main (train)'),
+                  (s-17, 'b', 'landed', 'abcdef1 on main (train)'),
+                  (s+11, 'c', 'landed-direct', 'abcdef1 lanes=c reason=test')]
+        # The same tip is merged three times, with resets between merges.
+        reflog = [(s-20, 'abcdef100000'), (s+10, 'abcdef100000'),
+                  (s+30, 'abcdef100000')]
+        self.assertEqual(stats.outside_queue(events, reflog, s-86400, s),
+                         dict(total=0, direct=0, other=0))
+        self.assertEqual(stats.outside_queue(events, reflog, s, s+86400),
+                         dict(total=2, direct=1, other=1))
+
+    def test_direct_train_links_each_lanes_feature_once(self):
+        """R2: one direct landing links all train lanes to their latest completed feature."""
+        s = self.start
+        runs = [dict(start=s-60, end=s+5, name='a', lane='a', feature='first',
+                     status='complete', hashes=[]),
+                dict(start=s, end=s+10, name='b', lane='b', feature='second',
+                     status='complete', hashes=[])]
+        features, count, missing = stats.feature_stats(runs,
+            [(s+86401, 'a,b', 'landed-direct', 'abcdef1 lanes=a,b reason=test')],
+            [(s+20, 'abcdef100000')], s, s+86400)
+        self.assertEqual((count, missing), (1, 0))
+        self.assertEqual([row['feature'] for row in features], ['first', 'second'])
+        self.assertAlmostEqual(features[0]['launch_to_last_landing_hours'], 80/3600)
+        self.assertAlmostEqual(features[1]['launch_to_last_landing_hours'], 20/3600)
+
+    def test_direct_train_tip_hash_does_not_override_named_lanes(self):
+        """TASKS:170(a): a later tip-hash worker must not replace another train lane."""
+        s = self.start
+        runs = [dict(start=s-60, end=s+5, name='a', lane='demo-a', feature='first',
+                     status='complete', hashes=[]),
+                dict(start=s, end=s+10, name='b', lane='demo-b', feature='second',
+                     status='complete', hashes=['abcdef1'])]
+        features, count, missing = stats.feature_stats(runs,
+            [(s+21, 'demo-a,demo-b', 'landed-direct', 'abcdef1 lanes=demo-a,demo-b')],
+            [(s+20, 'abcdef100000')], s, s+86400)
+        self.assertEqual((count, missing), (1, 0))
+        self.assertEqual(features, [
+            dict(feature='first', launch_to_last_landing_hours=80/3600, estimate=True),
+            dict(feature='second', launch_to_last_landing_hours=20/3600, estimate=True)])
+
+    def test_outside_queue_key_with_older_snapshot(self):
+        """R2: every daily JSON row has outside_queue, including an older saved day."""
+        s = self.start
+        computed = stats.daily([], [], [(s+1, 'abcdef100000')], s, s+86400, '2026-10-03')
+        saved = dict(computed, workers=dict(computed['workers'], runs=1))
+        saved.pop('outside_queue', None)
+        self.write('.claude/state/loop-stats/demo/2026-10-03.json', json.dumps(saved))
+        result = stats.keep_history(self.home, 'demo', computed, s+86400)
+        self.assertEqual(result['outside_queue'], dict(total=1, direct=0, other=1))
+        self.assertEqual(result['source'], 'snapshot')
 
     def test_deleted_worktree_still_scoped_to_repo(self):
         s = self.start

@@ -1,3 +1,4 @@
+# Allow 60 s for fixture scheduling at host load 40-140; product deadlines stay separate.
 import unittest
 from workflow_fixture import ROOT, WorkflowFixture
 
@@ -69,6 +70,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('touched by b', result.stdout)
         self.assertFalse((self.f.state / 'claims/a').exists())
+
+    def test_claims_clash_only_within_one_branch_line(self):
+        other = self.f.root / 'other'
+        self.f.git('worktree', 'add', '-q', '-b', 'feature/other', str(other))
+        self.f.commit(other, 'o.txt', 'o\n')
+        c = self.f.home / 'worktrees/demo/c'
+        self.f.git('worktree', 'add', '-q', '-b', 'wt/c', str(c), 'feature/other')
+        self.f.lanes['c'] = c
+        self.f.mq('claim', 'c', 'shared')
+        self.f.commit(c, 'shared/c.txt', 'c\n')
+        # a builds on main, c on feature/other: neither the claim nor c's edit blocks a.
+        self.f.mq('claim', 'a', 'shared')
+        result = self.f.mq('claim', 'b', 'shared', check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('claimed by a', result.stdout)
+        self.assertNotIn(' by c ', result.stdout)
 
     def test_outside_claim_conflict_names_owner_and_refuses(self):
         self.prepare(('a',))
@@ -203,7 +220,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(all(rc == 0 for rc, _, _ in results), results)
         self.assertEqual(sum('runner started' in out for _, out, _ in results), 1, results)
         import time
-        until = time.monotonic() + 10
+        until = time.monotonic() + 60
         while time.monotonic() < until and (self.f.state / 'run.lock').exists():
             time.sleep(0.05)
         self.assertEqual(self.f.queue(), [])
@@ -267,7 +284,7 @@ class WorkflowTests(unittest.TestCase):
                                 env={**self.f.env, 'DISKGUARD_PAUSE': '5'},
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            until = time.monotonic() + 10
+            until = time.monotonic() + 60
             while time.monotonic() < until:
                 if '\tdisk-low\t' in (self.f.state / 'events').read_text():
                     break
@@ -278,7 +295,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(self.f.queue()[0][1], 'ready')
             self.f.shim('diskguard.new', '#!/bin/sh\necho "disk: 999 GB"\n')
             (self.f.shims / 'diskguard.new').replace(self.f.shims / 'diskguard')
-            out, err = proc.communicate(timeout=10)
+            out, err = proc.communicate(timeout=60)
             self.assertEqual(proc.returncode, 0, err)
             self.assertIn('LANDED', out)
             self.assertEqual(self.f.queue(), [])
@@ -286,7 +303,7 @@ class WorkflowTests(unittest.TestCase):
         finally:
             if proc.poll() is None:
                 proc.terminate()
-            proc.communicate(timeout=5)
+            proc.communicate(timeout=60)
 
     def test_stale_state_and_runner_locks_are_reclaimed(self):
         self.prepare(('b',))

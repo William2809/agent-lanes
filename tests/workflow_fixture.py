@@ -1,4 +1,5 @@
 """Isolated real Git lanes with deterministic Codex/land substitutes; no live state."""
+# Allow 60 s for fixture scheduling at host load 40-140; product deadlines stay separate.
 import json
 import os
 from pathlib import Path
@@ -25,13 +26,16 @@ class WorkflowFixture:
                     'CODEX_BIN': str(self.shims / 'codex'),
                     'WK_FORCE': '1', 'WK_DISK_OK': '1', 'WK_ALLOW_UNTAGGED': '0',
                     'MQ_NO_AUTORUN': '1', 'MQ_TRAIN': '1',
+                    'LAND_DIRECT': '1', 'LAND_REASON': 'test',
                     'MQ_REQUEUE_COOLDOWN': '0', 'DISKGUARD_PAUSE': '0',
                     # Status/overlap observers must not race the fake writer's Git index update.
                     'GIT_OPTIONAL_LOCKS': '0',
                     'FAKE_WORKER_MODE': 'noop', 'FIXTURE_ROOT': str(self.root)}
         # A caller's optional guard bypasses must not affect test expectations.
-        for key in ('WK_WRITERS_OK', 'WK_MAX_WRITERS', 'MQ_COPY', 'MQ_LOCK_HANDOFF', 'WK_ALLOW_XHIGH', 'WK_LAUNCH_INTENT'):
+        for key in ('WK_WRITERS_OK', 'WK_MAX_WRITERS', 'MQ_COPY', 'MQ_LOCK_HANDOFF', 'WK_ALLOW_XHIGH', 'WK_LAUNCH_INTENT', 'LAND_TARGET'):
             self.env.pop(key, None)
+        # Standalone fixture records must not use the host worker's launch lock.
+        self.env.pop('launch_lock', None)
         self.git('init', '-q', '-b', 'main')
         self.git('config', 'user.email', 'user@example.invalid')
         self.git('config', 'user.name', 'Queue fixture')
@@ -104,9 +108,10 @@ print('LANDED fixture')
         p.write_text(source)
         p.chmod(0o755)
 
-    def run(self, *args, cwd=None, check=True, env=None, input=None):
+    # One command can enqueue or repair several lanes; allow 180 s under host load.
+    def run(self, *args, cwd=None, check=True, env=None, input=None, timeout=180):
         result = subprocess.run(args, cwd=cwd or self.repo, env={**self.env, **(env or {})},
-                                input=input, capture_output=True, text=True, timeout=40)
+                                input=input, capture_output=True, text=True, timeout=timeout)
         if check and result.returncode:
             raise AssertionError(f'{args[0]} {args[1:]} failed: {result.stdout}{result.stderr}')
         return result
@@ -143,13 +148,14 @@ print('LANDED fixture')
             p.stdin.close()
             p.stdin = None
         try:
+            # Twelve claim writes share one lock; allow 180 s for the loaded host.
             return [(p.returncode, out, err) for p in procs
-                    for out, err in [p.communicate(timeout=40)]]
+                    for out, err in [p.communicate(timeout=180)]]
         finally:
             for p in procs:
                 if p.poll() is None:
                     p.terminate()
-                p.wait(timeout=5)
+                p.wait(timeout=60)
 
     def worker(self, name, lane, sandbox, recorded=False, at=1):
         """A finished legacy registry entry, or role publication before a log header exists."""
@@ -168,7 +174,7 @@ print('LANDED fixture')
 
     def wait_worker(self, name):
         log = self.home / '.claude/state/logs/demo' / (name + '.log')
-        until = time.monotonic() + 10
+        until = time.monotonic() + 60
         while time.monotonic() < until:
             if Path(str(log) + '.exit').exists():
                 return

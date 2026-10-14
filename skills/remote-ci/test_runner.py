@@ -1,5 +1,7 @@
 """Local runner fixtures. Real shlock/Git/process groups; stub suite, no database or SSH."""
+# Allow 60 s for fixture scheduling at host load 40-140; product deadlines stay separate.
 import base64
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
@@ -68,10 +70,10 @@ exit "$FIXTURE_RC"
             if proc.poll() is None:
                 proc.terminate()
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=60)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                proc.wait(timeout=5)
+                proc.wait(timeout=60)
 
     def start(self, run, force=False, command=''):
         self.git('-C', self.dir / 'repo.git', 'fetch', '-q', self.source,
@@ -84,12 +86,12 @@ exit "$FIXTURE_RC"
         return proc
 
     def wait_for(self, condition):
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
             if condition():
                 return
             time.sleep(0.02)
-        self.fail('fixture event did not arrive within 10 seconds')
+        self.fail('fixture event did not arrive within 60 seconds')
 
     def log(self, run):
         path = self.dir / 'logs' / (run + '.log')
@@ -100,8 +102,219 @@ exit "$FIXTURE_RC"
         return len(path.read_text().splitlines()) if path.exists() else 0
 
     def assert_result(self, proc, run, rc):
-        self.assertEqual(proc.wait(timeout=10), rc)
+        self.assertEqual(proc.wait(timeout=60), rc)
         self.assertEqual((self.dir / 'results' / (run + '.exit')).read_text().strip(), str(rc))
+
+    def cleanup_failure(self, rc, slots, fault):
+        self.configure(rc, slots)
+        with (self.dir / 'conf').open('a') as conf:
+            conf.write('REMOTE_CI_POSTGRES=16\nREMOTE_CI_DB_CLEAN=fixture_%\n')
+        (self.dir / 'env.local').write_text(
+            'pg_ctl() { return 0; }\n'
+            'database_url() { echo fixture; }\n'
+            'psql() { cat >/dev/null; [ -f "$HOME/checks" ] || return 0; '
+            + ('return 1; }\n' if fault == 'query' else 'echo fixture_test; }\n') +
+            'dropdb() { [ ! -f "$HOME/checks" ]; }\n'
+            'createdb() { return 0; }\n'
+            'stop_idle_postgres() { touch "$HOME/stopped"; }\n'
+            # Exercise finish with a deterministic suite result, without macOS time/nice.
+            'supervised() { shift 5; "$@"; }\n')
+        run = 'cleanup'
+        (self.home / 'release').touch()
+        self.assert_result(self.start(run), run, 76)
+        self.assertEqual((self.dir / 'results/cleanup.check').read_text().strip(), str(rc))
+        self.assertIn(f'== check-result rc={rc}', self.log(run))
+        pending = self.dir / 'results/cleanup.cleanup'
+        self.assertTrue(pending.exists())
+        self.assertIn('role=', pending.read_text())
+        self.assertFalse((self.home / 'stopped').exists())
+        self.assertFalse((self.dir / 'results' / ('tree-' + self.tree + '.pass')).exists())
+        claim = self.dir / 'results' / ('tree-' + self.tree + '.running')
+        metadata = claim.with_name(claim.name + '.run').read_text()
+        self.assertIn(' cleanup', metadata)
+        if slots > 1:
+            self.assertEqual((self.dir / 'slots/1.run').read_text().strip(), run)
+        before = self.count()
+        for force in (False, True):
+            retry = 'retry-' + str(force)
+            self.assert_result(self.start(retry, force=force), retry, 76)
+            self.assertEqual(self.count(), before, 'pending cleanup must prevent resource reuse')
+            self.assertEqual(claim.with_name(claim.name + '.run').read_text(), metadata)
+        # An operator retries cleanup, then clears its record. Runs can use the slot again.
+        pending.unlink()
+        (self.dir / 'env.local').write_text(
+            'supervised() { shift 5; "$@"; }\n')
+        self.configure(0, slots)
+        self.assert_result(self.start('recovered', force=True), 'recovered', 0)
+        self.assertEqual(self.count(), before + 1)
+
+    def test_cleanup_green_drop(self):
+        """Requirement 1: failed cleanup preserves green checks and exclusive ownership."""
+        self.cleanup_failure(0, 1, 'drop')
+
+    def test_cleanup_red_drop(self):
+        """Requirement 1: cleanup takes precedence over red checks without losing their rc."""
+        self.cleanup_failure(7, 2, 'drop')
+
+    def test_cleanup_green_query(self):
+        """Requirement 1: a failed cleanup query retains the slot as a failed drop does."""
+        self.cleanup_failure(0, 2, 'query')
+
+    def test_check_wrapper_failure_keeps_green_check_result(self):
+        """Brief goal: timing-wrapper infrastructure failure must not become a red check."""
+        (self.dir / 'env.local').write_text('supervised() { shift 5; "$@"; return 1; }\n')
+        (self.home / 'release').touch()
+        self.assert_result(self.start('wrapper-failed'), 'wrapper-failed', 74)
+        self.assertEqual((self.dir / 'results/wrapper-failed.check').read_text().strip(), '0')
+        self.assertEqual(self.count(), 1)
+        self.assertFalse((self.dir / 'results' / ('tree-' + self.tree + '.pass')).exists())
+
+    def test_checkout_failure_is_infrastructure(self):
+        """Requirement 2: checkout failure is not a candidate check verdict."""
+        with (self.bin / 'lib.sh').open('a') as lib:
+            lib.write('\ngit() { [ "$1" != fetch ] || return 1; command git "$@"; }\n')
+        self.assert_result(self.start('checkout-failed'), 'checkout-failed', 74)
+        self.assertEqual(self.count(), 0)
+
+    def test_database_start_failure_is_infrastructure(self):
+        """Requirement 2: database startup failure must not request a coding fixer."""
+        with (self.dir / 'conf').open('a') as conf:
+            conf.write('REMOTE_CI_POSTGRES=16\n')
+        (self.dir / 'env.local').write_text('pg_ctl() { return 1; }\n')
+        self.assert_result(self.start('database-failed'), 'database-failed', 74)
+        self.assertEqual(self.count(), 0)
+
+    def review_candidate_env(self):
+        (self.dir / 'env.local').write_text(
+            'pg_ctl() { return 0; }; createdb() { return 0; }; dropdb() { return 0; }\n'
+            'psql() { cat >/dev/null; }; database_url() { echo fixture; }\n'
+            'stop_idle_postgres() { :; }\n'
+            'supervised() { [ "$1" != /usr/bin/time ] || shift 5; "$@"; }\n')
+
+    def test_review_candidate_check_codes_are_normalized(self):
+        """Review 6: candidate codes cannot collide with runner infrastructure codes."""
+        self.review_candidate_env()
+        (self.home / 'release').touch()
+        for rc in (2, 3, 7, 74, 75, 76):
+            with self.subTest(rc=rc):
+                self.configure(rc)
+                run = f'candidate-{rc}'
+                self.assert_result(self.start(run, force=True), run, 1)
+                self.assertEqual((self.dir / 'results' / (run + '.check')).read_text().strip(), str(rc))
+
+    def test_review_prepare_code_seven_is_a_verdict(self):
+        """Review 6: candidate prepare failures keep their raw code but publish 1."""
+        self.review_candidate_env()
+        with (self.dir / 'conf').open('a') as conf:
+            conf.write("REMOTE_CI_PREPARE='exit 7'\n")
+        self.assert_result(self.start('prepare-red'), 'prepare-red', 1)
+        self.assertEqual((self.dir / 'results/prepare-red.check').read_text().strip(), '7')
+        self.assertEqual(self.count(), 0)
+
+    def test_review_candidate_migration_is_a_verdict(self):
+        """Review 4: a candidate migration is not database infrastructure."""
+        self.review_candidate_env()
+        with (self.dir / 'conf').open('a') as conf:
+            conf.write("REMOTE_CI_POSTGRES=16\nREMOTE_CI_TEMPLATE_INPUTS=source.txt\nREMOTE_CI_DB_PREPARE='exit 1'\n")
+        self.assert_result(self.start('migration-red'), 'migration-red', 1)
+        self.assertEqual((self.dir / 'results/migration-red.check').read_text().strip(), '1')
+        self.assertEqual(self.count(), 0)
+
+    def saved_cleanup(self, stalled=False):
+        saved = self.dir / 'runs/pending'
+        saved.mkdir(parents=True)
+        (saved / 'conf').write_text('REMOTE_CI_POSTGRES=16\nREMOTE_CI_DB_CLEAN=saved_%\nREMOTE_CI_SLOTS=2\n')
+        (saved / 'env.local').write_text(
+            'pg_ctl() { return 0; }\n'
+            'psql() { cat >/dev/null; echo "query $*" >>"$HOME/cleanup.calls"; echo saved_test; }\n'
+            'dropdb() { echo "drop $*" >>"$HOME/cleanup.calls"; ' +
+            ('while [ ! -f "$HOME/cleanup-release" ]; do /bin/sleep 0.05; done; ' if stalled else '') + 'return 0; }\n')
+        pending = self.dir / 'results/pending.cleanup'
+        pending.write_text('run=pending\nslot=1\ndatabase=saved_ci_s1\nrole=saved_role\ncheck_rc=0\n')
+        (self.dir / 'results/pending.exit').write_text('76\n')
+        (self.dir / 'slots/1.lock').write_text('99999999\n')
+        (self.dir / 'slots/1.run').write_text('pending\n')
+        self.git('-C', self.dir / 'repo.git', 'fetch', '-q', self.source, 'HEAD:refs/heads/run/pending')
+        return pending
+
+    def test_review_pending_cleanup_retries_saved_ownership(self):
+        """Review 8: retry cleanup once using its saved config before resource reuse."""
+        pending = self.saved_cleanup()
+        self.review_candidate_env()
+        (self.home / 'release').touch()
+        self.assert_result(self.start('after-cleanup', force=True), 'after-cleanup', 0)
+        self.assertFalse(pending.exists())
+        calls = (self.home / 'cleanup.calls').read_text()
+        self.assertIn('pattern=saved_%', calls)
+        self.assertIn('role=saved_role', calls)
+        self.assertIn('drop --if-exists --force saved_ci_s1', calls)
+        self.assertEqual(calls.count('query '), 1)
+        self.assertEqual(self.count(), 1)
+
+    def test_review_pending_cleanup_retry_is_bounded(self):
+        """Review 8: a stalled cleanup retry cannot hold the caller indefinitely."""
+        pending = self.saved_cleanup(stalled=True)
+        with (self.dir / 'conf').open('a') as conf:
+            conf.write('REMOTE_CI_WAIT_TIMEOUT=2\n')
+        started = time.monotonic()
+        self.assert_result(self.start('bounded-cleanup', force=True), 'bounded-cleanup', 76)
+        self.assertLess(time.monotonic() - started, 60)
+        self.assertTrue(pending.exists())
+        self.assertTrue((self.home / 'cleanup.calls').exists(), 'must attempt cleanup before refusing')
+        self.assertIn('drop ', (self.home / 'cleanup.calls').read_text())
+        self.assertEqual((self.dir / 'slots/1.run').read_text().strip(), 'pending')
+        self.assertEqual(self.count(), 0)
+
+    def test_review_prune_retains_pending_cleanup_inputs(self):
+        """Review 2: daily prune must retain recovery inputs and the pending run ref."""
+        self.saved_cleanup()
+        result = subprocess.run(['/bin/bash', str(self.bin / 'prune.sh')], env=self.env,
+                                capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue((self.dir / 'runs/pending/conf').exists())
+        self.assertEqual(self.git('-C', self.dir / 'repo.git', 'rev-parse', 'refs/heads/run/pending'), self.sha)
+
+    def prune_templates(self, recent, old_count):
+        """Run prune over RECENT templates used within 3 days (newest first) and OLD_COUNT
+        10-day-old ones; return the names and what prune dropped."""
+        pg = self.ci / 'pg/16'
+        pg.mkdir(parents=True)
+        (pg / 'PG_VERSION').write_text('16\n')
+        prefix = 'mci_' + hashlib.sha256(b'fixture').hexdigest()[:12] + '_'
+        names = [prefix + f'{i:032x}' for i in range(recent + old_count)]
+        templates = self.dir / 'templates'
+        templates.mkdir()
+        old = time.time() - 10 * 86400
+        for i, name in enumerate(names):
+            marker = templates / (name + '.ready')
+            marker.touch()
+            t = time.time() - i * 3600 if i < recent else old - i * 60
+            os.utime(marker, (t, t))
+        # prune.sh reads no env.local and load_project resets PATH; stub Postgres in the conf.
+        with (self.dir / 'conf').open('a') as conf:
+            conf.write('REMOTE_CI_POSTGRES=16\n'
+                       'pg_ctl() { return 0; }\n'
+                       'psql() { printf "%s\\n" ' + ' '.join(names) + '; }\n'
+                       'dropdb() { echo "$*" >>"$HOME/dropped"; }\n')
+        result = subprocess.run(['/bin/bash', str(self.bin / 'prune.sh')], env=self.env,
+                                capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0)
+        log = self.home / 'dropped'
+        dropped = sorted(l.split()[-1] for l in log.read_text().split('\n') if l) if log.exists() else []
+        for name in names:
+            self.assertEqual((templates / (name + '.ready')).exists(), name not in dropped)
+        return names, dropped
+
+    def test_prune_keeps_every_template_used_in_three_days(self):
+        """More than 5 recent templates all stay; only the 10-day-old ones go."""
+        names, dropped = self.prune_templates(recent=7, old_count=3)
+        self.assertEqual(dropped, names[7:])
+        self.assertIn('template dropped', (self.ci / 'logs/prune.log').read_text())
+
+    def test_prune_keeps_the_five_newest_old_templates(self):
+        """With nothing used recently, the 5 newest stay as the cache."""
+        names, dropped = self.prune_templates(recent=0, old_count=8)
+        self.assertEqual(dropped, names[5:])
 
     def test_pass_appears_while_queued(self):
         (self.ci / 'lock').write_text(str(os.getpid()))
@@ -139,8 +352,9 @@ exit "$FIXTURE_RC"
                                         capture_output=True, text=True, check=True).stdout
                 self.assertIn('slot 1: busy', status)
                 release.touch()
-                self.assert_result(owner, owner_id, rc)
-                self.assert_result(follower, follower_id, rc)
+                self.assert_result(owner, owner_id, 1 if rc else 0)
+                self.assert_result(follower, follower_id, 1 if rc else 0)
+                self.assertEqual((self.dir / 'results' / (owner_id + '.check')).read_text().strip(), str(rc))
                 self.assertEqual(self.count(), before + 1)
                 claim = self.dir / 'results' / ('tree-' + self.tree + '.running')
                 self.assertFalse(claim.exists())
@@ -148,7 +362,7 @@ exit "$FIXTURE_RC"
                 marker = self.dir / 'results' / ('tree-' + self.tree + '.pass')
                 self.assertEqual(marker.exists(), rc == 0)
                 if rc:
-                    self.assertIn(f'Error: followed run rc={rc} (log ', self.log(follower_id))
+                    self.assertIn('Error: followed run rc=1 (log ', self.log(follower_id))
                     # Force the follower to be latest even on a coarse filesystem clock.
                     os.utime(self.dir / 'logs' / (follower_id + '.log'),
                              ns=(time.time_ns() + 1000000,) * 2)
@@ -301,7 +515,7 @@ exit "$FIXTURE_RC"
                 for pid in map(int, children.stdout.split()):
                     self.addCleanup(self.stop_group, pid)
                 owner.kill()
-                owner.wait(timeout=5)
+                owner.wait(timeout=60)
                 self.assertTrue(self.group_live(child))
                 for retry in ('first', 'again'):
                     attempt = f'{retry}-after-kill-{slots}'
@@ -421,7 +635,7 @@ exec /bin/ps "$@"
         (self.home / 'release').touch()
         self.wait_for(lambda: (self.home / f'waiting-{owner.pid}').exists())
         self.advance_clock(60)
-        self.assertEqual(owner.wait(timeout=3), 74)
+        self.assertEqual(owner.wait(timeout=60), 74)
         self.assertEqual((self.dir / 'results/guard-blocked.exit').read_text().strip(), '74')
         self.assertIn('lost-run:', self.log('guard-blocked'))
         self.assertIn('cleanup guard', self.log('guard-blocked'))
@@ -437,7 +651,7 @@ exec /bin/ps "$@"
         follower = self.start('lost-follower')
         self.wait_for(lambda: 'following run lost-owner' in self.log('lost-follower'))
         owner.kill()
-        owner.wait(timeout=5)
+        owner.wait(timeout=60)
         self.assert_result(follower, 'lost-follower', 74)
         self.assertIn('lost-run: followed run lost-owner', self.log('lost-follower'))
         self.assertTrue(claim.exists())
@@ -453,7 +667,7 @@ exec /bin/ps "$@"
         follower = self.start('short-guard-wait')
         self.wait_for(lambda: (self.home / f'waiting-{follower.pid}').exists())
         self.advance_clock(20)
-        self.assertEqual(follower.wait(timeout=3), 75)
+        self.assertEqual(follower.wait(timeout=60), 75)
         self.assertEqual((self.dir / 'results/short-guard-wait.exit').read_text().strip(), '75')
         self.assertEqual(guard.read_text(), str(os.getpid()))
         self.assertEqual(self.count(), 0)
@@ -488,7 +702,7 @@ exec /bin/mv "$@"
                     self.stub('mv', 'exec /bin/mv "$@"\n')
                     (self.dir / 'results' / (run + '.exit.new')).mkdir()
                 owner = self.start(run)
-                self.assertEqual(owner.wait(timeout=10), 74)
+                self.assertEqual(owner.wait(timeout=60), 74)
                 self.assertIn('lost-run:', self.log(run))
                 self.assertFalse((self.dir / 'results' / (run + '.exit')).exists())
                 self.assertFalse((self.dir / 'results' / ('tree-' + self.tree + '.pass')).exists())
@@ -496,7 +710,7 @@ exec /bin/mv "$@"
     def test_setup_lock_wait_respects_the_total_deadline(self):
         (self.ci / 'lock').write_text(str(os.getpid()))
         setup = subprocess.run(['/bin/bash', str(self.bin / 'setup.sh'), 'fixture', '1'], env=self.env,
-                               capture_output=True, text=True, timeout=10)
+                               capture_output=True, text=True, timeout=60)
         self.assertEqual(setup.returncode, 74, setup.stdout + setup.stderr)
         self.assertIn('lost-run:', setup.stdout)
         self.assertEqual((self.ci / 'lock').read_text(), str(os.getpid()))
@@ -504,7 +718,7 @@ exec /bin/mv "$@"
     def test_setup_slot_wait_respects_the_total_deadline(self):
         (self.dir / 'slots/1.lock').write_text(str(os.getpid()))
         setup = subprocess.run(['/bin/bash', str(self.bin / 'setup.sh'), 'fixture', '1'], env=self.env,
-                               capture_output=True, text=True, timeout=10)
+                               capture_output=True, text=True, timeout=60)
         self.assertEqual(setup.returncode, 74, setup.stdout + setup.stderr)
         self.assertFalse((self.ci / 'lock').exists())
 
@@ -516,9 +730,10 @@ exec /bin/mv "$@"
 esac
 exec /bin/mv "$@"
 ''')
-        self.assert_result(self.start('red'), 'red', 7)
+        self.assert_result(self.start('red'), 'red', 1)
+        self.assertEqual((self.dir / 'results/red.check').read_text().strip(), '7')
         seen = (self.home / 'log-at-exit').read_text()
-        self.assertIn('== finished rc=7', seen)
+        self.assertIn('== finished rc=1', seen)
         self.assertTrue(failure.parse(seen)['failed'])
 
     def test_reused_pid_of_another_runner_is_not_the_claim_owner(self):
@@ -658,7 +873,7 @@ os.execv('/bin/bash', ['bash', '-c', command])
         for proc in self.procs:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate(timeout=5)
+            proc.communicate(timeout=60)
 
     def start(self, summary=False):
         proc = subprocess.Popen(['/bin/bash', str(self.client), 'check',
@@ -669,7 +884,7 @@ os.execv('/bin/bash', ['bash', '-c', command])
         return proc
 
     def wait_for(self, condition):
-        end = time.monotonic() + 10
+        end = time.monotonic() + 60
         while time.monotonic() < end:
             if condition():
                 return
@@ -686,12 +901,30 @@ os.execv('/bin/bash', ['bash', '-c', command])
                         '*) exec /bin/date "$@" ;;\nesac\n')
         self.env['FIXTURE_CLIENT_MODE'] = 'completed'
 
+    def test_review_cached_pass_cannot_bypass_pending_cleanup(self):
+        """Review 3: cached checks must reach recovery when cleanup is pending."""
+        git = lambda *args: subprocess.check_output(['/usr/bin/git', *map(str, args)],
+                                                     cwd=self.root, text=True).strip()
+        blobs = ''.join(script.name + '\n' + git('hash-object', script) + '\n'
+                        for script in sorted((self.kit / 'remote').glob('*.sh')))
+        rev = subprocess.check_output(['/usr/bin/git', 'hash-object', '--stdin'],
+                                      input=blobs, text=True).strip()[:8]
+        key = git('rev-parse', 'HEAD^{tree}') + '-' + git('hash-object', self.root / '.remote-ci.conf')[:8] + '-' + rev
+        (self.dir / 'results' / ('tree-' + key + '.pass')).touch()
+        (self.dir / 'results/pending.cleanup').write_text('run=pending\n')
+        self.env['FIXTURE_CLIENT_MODE'] = 'completed'
+        proc = self.start(summary=True)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 7, out + err)  # Published result from the fixture submission.
+        self.assertTrue((self.home / 'submitted').exists())
+        self.assertNotIn('already passed', out)
+
     def test_run_ids_differ_with_same_time_commit_and_pid(self):
         self.fixed_run_prefix()
         runs = []
         for _ in range(2):
             proc = self.start(summary=True)
-            out, err = proc.communicate(timeout=5)
+            out, err = proc.communicate(timeout=60)
             self.assertEqual(proc.returncode, 7, err)
             runs.append((self.home / 'submitted').read_text())
         self.assertEqual(len(set(runs)), 2, 'same time/commit/PID must not share a run')
@@ -706,15 +939,15 @@ os.execv('/bin/bash', ['bash', '-c', command])
         random.write_text('#!/bin/bash\necho 00112233445566778899aabb\n')
         random.chmod(0o755)
         first = self.start(summary=True)
-        out, err = first.communicate(timeout=5)
+        out, err = first.communicate(timeout=60)
         self.assertEqual(first.returncode, 7, err)
         run = (self.home / 'submitted').read_text()
         conf = self.dir / 'runs' / run / 'conf'
         conf.write_text('keep existing run config\n')
         pushes = (self.home / 'push-stub').read_text()
         second = self.start(summary=True)
-        out, err = second.communicate(timeout=5)
-        self.assertEqual(second.returncode, 1, err)
+        out, err = second.communicate(timeout=60)
+        self.assertEqual(second.returncode, 74, err)  # Requirement 2: submission is infrastructure.
         self.assertIn('cannot reserve run directory', out)
         self.assertEqual(conf.read_text(), 'keep existing run config\n')
         self.assertEqual((self.home / 'push-stub').read_text(), pushes)
@@ -725,7 +958,7 @@ os.execv('/bin/bash', ['bash', '-c', command])
         (self.kit / 'remote/setup.sh').write_text('#!/bin/bash\nprintf "%s %s\\n" "$0" "$2" >"$HOME/setup-call"\n')
         self.env['FIXTURE_CLIENT_MODE'] = 'completed'
         proc = self.start(summary=True)
-        out, err = proc.communicate(timeout=10)
+        out, err = proc.communicate(timeout=60)
         self.assertEqual(proc.returncode, 7, out + err)
         run = (self.home / 'submitted').read_text()
         script, budget = (self.home / 'setup-call').read_text().split()
@@ -737,7 +970,7 @@ os.execv('/bin/bash', ['bash', '-c', command])
         for summary in (False, True):
             with self.subTest(summary=summary):
                 proc = self.start(summary)
-                out, err = proc.communicate(timeout=5)
+                out, err = proc.communicate(timeout=60)
                 self.assertEqual(proc.returncode, 7, err)
                 self.assertIn('FAIL fixture', out)
                 self.assertIn('== finished rc=7', out)
@@ -753,7 +986,7 @@ os.execv('/bin/bash', ['bash', '-c', command])
                     proc = self.start(summary)
                     self.wait_for(lambda: (self.home / 'client-waiting').exists())
                     self.clock(100)
-                    out, err = proc.communicate(timeout=3)
+                    out, err = proc.communicate(timeout=60)
                     self.assertEqual(proc.returncode, 74, err)
                     self.assertIn('lost-run: run ', out)
                     self.assertIn('total wait exceeded 100 seconds', out)
@@ -809,7 +1042,7 @@ os.execv('/usr/bin/git', ['git', *args])
                                for script in sorted((kit / 'remote').glob('*.sh')))
             call = subprocess.run(['/bin/bash', str(client), 'check'], cwd=root,
                                   env=env, capture_output=True, text=True)
-            self.assertEqual(call.returncode, 1)  # Stub setup failed before any push.
+            self.assertEqual(call.returncode, 74)  # Requirement 2: setup failed before any check.
             self.assertTrue((home / 'mutated').exists())
             self.assertEqual((home / 'hashed-kit').read_text(), expected)
             self.assertNotEqual((kit / 'remote/run.sh').read_bytes(), original)
@@ -865,7 +1098,7 @@ os.execv('/usr/bin/git', ['git', *args])
                 attempt.unlink(missing_ok=True)
                 call = subprocess.run(['/bin/bash', str(client), 'check'], cwd=root,
                                       env=env, capture_output=True, text=True)
-                self.assertEqual(call.returncode, 0 if hit else 1)
+                self.assertEqual(call.returncode, 0 if hit else 74)  # Requirement 2: sync is infrastructure.
                 self.assertEqual('already passed' in call.stdout, hit)
                 self.assertEqual(attempt.exists(), not hit)
 
@@ -910,7 +1143,7 @@ class Summary(unittest.TestCase):
                 with self.subTest(pattern=pattern):
                     env['REMOTE_CI_SUMMARY_PATTERN'] = pattern
                     result = subprocess.run(['/bin/bash', '-c', script], env=env,
-                                            capture_output=True, text=True, timeout=5)
+                                            capture_output=True, text=True, timeout=60)
                     self.assertEqual(result.returncode, 7)
                     self.assertIn('== following run owner', result.stdout)
                     self.assertEqual(result.stdout.count('== finished rc=7'), 1)
@@ -919,7 +1152,7 @@ class Summary(unittest.TestCase):
             # A pruned owner log must not hide the follower's result or event.
             owner.unlink()
             result = subprocess.run(['/bin/bash', '-c', script], env=env,
-                                    capture_output=True, text=True, timeout=5)
+                                    capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 7)
             self.assertIn('== following run owner', result.stdout)
             self.assertEqual(result.stderr, '')
