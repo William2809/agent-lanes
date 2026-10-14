@@ -1,27 +1,20 @@
 #!/usr/bin/env python3
 # ABOUTME: End-to-end tests for wt-dev's framework presets, installs and database copies, run against
 # ABOUTME: throwaway git repos under a temporary HOME with stub dev servers (no network, no real frameworks).
-import json, os, re, shutil, socket, sqlite3, subprocess, tempfile, textwrap, time, unittest
+import json, os, re, shutil, sqlite3, subprocess, tempfile, textwrap, time, unittest
 
 BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin')
 # install.sh links the repo's bin/ (ctrash, ...) next to wt-dev; mirror that without an install.
 REPO_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'bin')
 SERVE = textwrap.dedent('''\
-    import http.server, os, sys
+    import http.server, os, socketserver, sys
     port = int(sys.argv[1])
     open(os.environ['STUB_OUT'], 'w').write(repr(sys.argv) + '\\n' + os.environ.get('DATABASE_URL', '-') + '\\n' + os.environ.get('SECRET', '-'))
-    http.server.HTTPServer(('127.0.0.1', port), http.server.SimpleHTTPRequestHandler).serve_forever()
+    # TCPServer, not HTTPServer: HTTPServer looks up getfqdn() between bind and listen, which takes seconds on
+    # GitHub's macOS runners; the socket then sits bound but not listening (lsof shows it as CLOSED).
+    socketserver.TCPServer.allow_reuse_address = True  # as HTTPServer, so a restart can reuse the port
+    socketserver.TCPServer(('127.0.0.1', port), http.server.SimpleHTTPRequestHandler).serve_forever()
 ''')
-
-
-def blind_lsof(tmp):
-    """A dir with an lsof that finds nothing for -sTCP:LISTEN: GitHub's macOS runners list a listening socket as CLOSED."""
-    stubs = os.path.join(tmp, 'blind-lsof'); os.makedirs(stubs)
-    real = shutil.which('lsof') or '/usr/sbin/lsof'
-    with open(os.path.join(stubs, 'lsof'), 'w') as f:
-        f.write('#!/bin/sh\ncase " $* " in *" -sTCP:LISTEN "*) exit 1 ;; esac\nexec ' + real + ' "$@"\n')
-    os.chmod(os.path.join(stubs, 'lsof'), 0o755)
-    return stubs
 
 
 class WtDev(unittest.TestCase):
@@ -85,20 +78,7 @@ class WtDev(unittest.TestCase):
         return open(os.path.join(self.home, '.cache', 'wt-dev', 'repo', name + '.port')).read().strip()
 
     def listening(self, port):
-        # A real connect: some hosts' lsof shows a listening socket as CLOSED.
-        try:
-            socket.create_connection(('127.0.0.1', int(port)), timeout=15).close()
-            return True
-        except OSError:
-            return False
-
-    def test_ready_when_lsof_hides_the_listen_state(self):
-        self.env['PATH'] = blind_lsof(self.tmp.name) + ':' + self.env['PATH']
-        self.write('.wt-dev.conf', "WT_DEV_CMD='exec python3 serve.py \"$PORT\"'\nWT_DEV_INSTALL=''\n")
-        self.commit()
-        self.names.append('h1')
-        self.new('h1')
-        self.assertTrue(self.listening(self.port('h1')))
+        return subprocess.run(['lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN'], capture_output=True).returncode == 0
 
     def test_parallel_new_reserves_distinct_ports_and_releases_them(self):
         self.write('.wt-dev.conf', "WT_DEV_CMD='sleep 2; exec python3 serve.py \"$PORT\"'\nWT_DEV_INSTALL=''\n")
@@ -701,7 +681,8 @@ class WtDev(unittest.TestCase):
 
 class DevRestart(unittest.TestCase):
     """devrestart stops only this checkout's server, never another project's (real processes)."""
-    LISTEN = 'import http.server, sys; http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_forever()'
+    # TCPServer, not HTTPServer: see SERVE.
+    LISTEN = 'import http.server, socketserver, sys; socketserver.TCPServer.allow_reuse_address = True; socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_forever()'
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='devrestart-test-')
@@ -797,14 +778,6 @@ class DevRestart(unittest.TestCase):
         self.assertFalse(self.alive(first), 'the old server still answers on the port')
         listener = subprocess.run(['lsof', '-tiTCP:' + self.port, '-sTCP:LISTEN'], capture_output=True, text=True).stdout.split()
         self.assertEqual(listener, [self.read(rec).splitlines()[0]])
-
-
-class DevRestartBlindLsof(DevRestart):
-    """The same checks where lsof hides the LISTEN state."""
-
-    def setUp(self):
-        super().setUp()
-        self.env['PATH'] = blind_lsof(self.tmp.name) + ':' + self.env['PATH']
 
 
 if __name__ == '__main__':

@@ -19,17 +19,14 @@ if [ -f "$rec" ]; then
 fi
 # ours PID: the process works inside this checkout.
 ours() { lsof -a -p "$1" -d cwd -Fn 2>/dev/null | awk -v d="$top" 'sub(/^n/, "") && ($0 == d || index($0, d "/") == 1) {f=1} END {exit !f}'; }
-# PIDs with a bound TCP socket on port $1 and no peer (listeners; connections show "a->b").
-# Not -sTCP:LISTEN: some hosts (GitHub's macOS runners) show a listening socket as CLOSED.
-listen_pids() { lsof -nP -iTCP:"$1" -Fpn 2>/dev/null | awk '/^p/ {p = substr($0, 2)} /^n/ && !/->/ {print p}' | sort -u; }
-for p in $(listen_pids "$port"); do ours "$p" && kill "$p" 2>/dev/null; done; sleep 3
-for p in $(listen_pids "$port"); do
+for p in $(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null); do ours "$p" && kill "$p" 2>/dev/null; done; sleep 3
+for p in $(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null); do
   ours "$p" || { echo "port $port is held by pid $p outside $top; not restarting"; exit 1; }
   # Only the server devrestart started (its recorded group) is killed outright.
   [ -n "$group" ] && [ "$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')" = "$group" ] && kill -KILL "$p" 2>/dev/null
 done
 # The new server must be the one that answers: the port has to be free first.
-sleep 1; p=$(listen_pids "$port" | head -1)
+sleep 1; p=$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
 [ -z "$p" ] || { echo "port $port is still held by pid $p; not restarting"; exit 1; }
 for c in "$top"/apps/*/.next; do [ -d "$c" ] && mv "$c" "$trash/$(basename "$(dirname "$c")")-next-cache-$(date +%H%M%S)"; done
 [ -f "$log" ] && mv "$log" "$trash/devserver-$(date +%H%M%S).log"

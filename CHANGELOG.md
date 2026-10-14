@@ -42,7 +42,6 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 - `wk NAME -r`: a resume keeps the worker's FEATURE:REASON tag, so `loop-stats` counts resumed runs under their feature instead of as untagged.
 - `lanes`: the "waits on" check of queued lanes works again (it called `mq` in place without the tool root and failed silently).
 - `mq claim` / `mq add` (and so `wk -o`): claims and edits only clash between worktrees on the same branch line (the checked-out branch a lane's HEAD is closest to). A lane on another feature branch no longer blocks this one.
-- `wt-dev` and `devrestart` find a port's listeners by socket shape (bound, no peer) instead of the LISTEN state, which GitHub's macOS runners show as CLOSED. The dev server readiness check, the port-in-use check and devrestart's "held by another process" check now work there too.
 - `wtcommit`: accepts `.` and `..` as the worktree path.
 - `batches`: counts a worktree's commits to land against the main checkout's branch, so a detached worktree with commits is no longer offered for removal.
 - `remote-ci`: slot cleanup drops a test database that a test harness marked as a template (it clears the flag first; `dropdb` refuses templates).
