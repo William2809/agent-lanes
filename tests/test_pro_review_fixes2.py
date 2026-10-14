@@ -53,17 +53,16 @@ case "$1" in path) echo "{lanes}/$2" ;; install) ;; *) exit 2 ;; esac
         self.assert_restored(text)
 
     def test_sigterm_during_the_check_restores_the_stack(self):
-        p, out = self.start('sleep 30')
-        until = time.monotonic() + 30
-        while 'stacked b' not in out.read_text():
+        # The check writes its PID, so TERM arrives while it is the running step. TERM goes to land and the
+        # check, as a group signal would: os.killpg can fail with EPERM on GitHub's macOS runners.
+        pid_file = self.f.root / 'check.pid'
+        p, out = self.start(f'echo $$ >"{pid_file}.tmp" && mv "{pid_file}.tmp" "{pid_file}" && exec sleep 30')
+        until = time.monotonic() + 60
+        while not pid_file.exists():
             self.assertLess(time.monotonic(), until, out.read_text())
             time.sleep(0.05)
-        time.sleep(0.3)
-        try:
-            os.killpg(p.pid, signal.SIGTERM)
-        except PermissionError:
-            # macOS can refuse a group signal (EPERM) while a group member is in some states; land's trap still runs.
-            os.kill(p.pid, signal.SIGTERM)
+        os.kill(p.pid, signal.SIGTERM)
+        os.kill(int(pid_file.read_text()), signal.SIGTERM)
         p.wait(timeout=30)
         text = out.read_text()
         self.assertEqual(p.returncode, 143, text)
