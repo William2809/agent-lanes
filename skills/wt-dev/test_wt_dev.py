@@ -219,11 +219,13 @@ class WtDev(unittest.TestCase):
         self.write('tools/vite', '#!/bin/sh\nexec python3 "$(dirname "$0")/../../serve.py" "$2" "$@"\n', 0o755)
         self.write('.wt-dev.conf', 'WT_DEV_INSTALL="mkdir -p node_modules/.bin && cp tools/vite node_modules/.bin/vite"\n')
         self.commit()
-        other = subprocess.Popen(['python3', '-m', 'http.server', '3999', '--bind', '127.0.0.1'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Not python3 -m http.server: its getfqdn() delays listen on some hosts (see SERVE).
+        other = subprocess.Popen(['python3', '-c', DevRestart.LISTEN, '3999'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            for _ in range(50):
+            for _ in range(150):
                 if self.listening(3999): break
                 time.sleep(0.1)
+            self.assertTrue(self.listening(3999), 'the blocking server never listened')
             r = self.wt('new', 'p1', '--port', '3999', check=False); self.names.append('p1')
             self.assertNotEqual(r.returncode, 0)
             self.assertIn('port 3999 is already in use', r.stderr)
