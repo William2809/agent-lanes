@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import type { RunRecord } from '../types'
 
-import { commands, DELIVERY_LIMIT, FLOOR, outcome, events, identity, remember, isProblem, lastTitle, notices, originLabel, origins, parse, repoOf, unclaimed } from '../hooks/parse'
+import { commands, DELIVERY_LIMIT, FLOOR, outcome, events, identity, remember, isProblem, lastTitle, notices, originLabel, origins, parse, readReports, repoOf, unclaimed } from '../hooks/parse'
 
 const SAMPLE = `reports                    ERRORED (high demand) -> wk reports -r  @reports
 guide-w1                 running 17m  @guide-w1
@@ -150,4 +150,29 @@ test('a report whose lead is open but names no receipt-writing mod stays unclaim
   const runs: RunRecord[] = [{ ...base, runId: 'open', session: 'OPEN' }, { ...base, runId: 'gone', session: 'GONE' }]
   expect(unclaimed(runs, 'ME', 1_000, new Set(), new Set(['OPEN'])).map(r => [r.runId, !!r.leadOpen]))
     .toEqual([['open', true], ['gone', false]])
+})
+
+test('a resumed run supersedes the older run of the same log', async () => {
+  const old = { ...run('a', 'first', 'done'), rc: 0, ended: 150 }
+  const resumed = { ...run('a', 'second'), started: 200 }
+  expect(events([old, resumed], [], 'S')).toEqual([])
+  const finished = { ...resumed, status: 'done', rc: 0, ended: 300 }
+  expect(events([old, finished], [], 'S')).toEqual([finished])
+  const other = { ...run('b', 'first', 'done'), rc: 0, ended: 150 }
+  expect(events([other, resumed], [], 'S')).toEqual([other])
+})
+
+test('read-report suppression requires a matching named log and a nonempty report', () => {
+  const a = run('a', 'one')
+  const b = run('b', 'two')
+  const report = `=================== ${a.log}\nChanged: finished work\n`
+  expect(readReports("batches report 'review'", report, [a, b])).toEqual([a])
+  expect(readReports('batches report other', report, [a, b])).toEqual([])
+  expect(readReports('echo batches report review', report, [a])).toEqual([])
+  expect(readReports('batches report review; echo fake', report, [a])).toEqual([])
+  expect(readReports('batches report review', `=================== ${a.log}\nNO REPORT (still running, or failed).\n`, [a])).toEqual([])
+  expect(readReports('batches report review', `=================== ${a.log}\n`, [a])).toEqual([])
+  const read = { ...a, read: true, rc: 0, ended: 110 }
+  expect(events([read], [], 'S')).toEqual([])
+  expect(unclaimed([read], 'OTHER', 300)).toEqual([])
 })

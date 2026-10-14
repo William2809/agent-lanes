@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 GUARD = Path(__file__).with_name('diskguard').resolve()
-WT_DEV = shutil.which('wt-dev')
+WT_DEV = Path(__file__).resolve().parents[1] / 'skills/wt-dev/bin/wt-dev'
 
 
 class CacheRecovery(unittest.TestCase):

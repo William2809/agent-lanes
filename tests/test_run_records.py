@@ -1,4 +1,5 @@
 """Run records with fake Codex CLIs, real supervisors/readers and isolated HOME."""
+# Allow 60 s for fixture scheduling at host load 40-140; product deadlines stay separate.
 import os
 from pathlib import Path
 import signal
@@ -44,7 +45,7 @@ class RunRecordTests(unittest.TestCase):
         return Path(str(self.log(name)) + suffix)
 
     def finish(self, name):
-        until = time.monotonic() + 10
+        until = time.monotonic() + 60
         while time.monotonic() < until:
             if self.side(name, '.exit').exists():
                 return self.side(name, '.exit').read_text()
@@ -109,7 +110,7 @@ class RunRecordTests(unittest.TestCase):
     def test_sigkill_of_worker_still_writes_exit(self):
         self.start(FAKE_WORKER_MODE='hold')
         childfile = self.f.root / 'codex-child.pid'
-        until = time.monotonic() + 5
+        until = time.monotonic() + 60
         while not childfile.exists() and time.monotonic() < until:
             time.sleep(0.02)
         self.assertTrue(childfile.exists())
@@ -262,7 +263,7 @@ class RunRecordTests(unittest.TestCase):
             self.assertEqual((lock / 'handoff').read_text(), str(proc.pid) + '\n')
         finally:
             proc.terminate()
-            proc.wait(timeout=5)
+            proc.wait(timeout=60)
 
     def test_killed_releaser_leaves_no_mover_for_a_successor_lock(self):
         # Review of v0.8.3 (round 2), finding 3: a lock-cleanup child outlived its killed releaser
@@ -276,7 +277,7 @@ class RunRecordTests(unittest.TestCase):
         locked = '. "$1/state.sh"; ops_lock "$2" || exit 1; '
         releaser = subprocess.Popen(['sh', '-c', locked + 'ops_unlock "$2"', 'sh', str(SCRIPTS), str(lock)],
                                     env={**self.f.env, 'PATH': f'{slow}:{self.f.env["PATH"]}'})
-        until = time.monotonic() + 10
+        until = time.monotonic() + 60
         while not (lock / 'pid').exists() and time.monotonic() < until:
             time.sleep(0.02)
         time.sleep(0.4)
@@ -379,7 +380,7 @@ exec /bin/mv "$@"
                                             stdin=subprocess.DEVNULL, stdout=stream, stderr=subprocess.STDOUT)
                 pid = None
                 try:
-                    until = time.monotonic() + 5
+                    until = time.monotonic() + 60
                     while not self.side(name, '.pid').exists() and time.monotonic() < until:
                         time.sleep(0.02)
                     pid = int(self.side(name, '.pid').read_text())
@@ -390,7 +391,7 @@ exec /bin/mv "$@"
                     self.side(name, '.last').write_text('replacement report\n')
                     Path(str(log) + '.' + old_id + '.last').write_text('old report\n')
                     os.kill(pid, signal.SIGTERM)
-                    self.assertEqual(proc.wait(timeout=10), 0)
+                    self.assertEqual(proc.wait(timeout=60), 0)
                     self.assertEqual(self.side(name, '.last').read_text(), 'replacement report\n')
                     if replacement_exit:
                         self.assertEqual(self.side(name, '.exit').read_text(), replacement_exit)
@@ -405,7 +406,7 @@ exec /bin/mv "$@"
                             pass
                     if proc.poll() is None:
                         proc.terminate()
-                    proc.wait(timeout=10)
+                    proc.wait(timeout=60)
 
     def test_pause_rechecks_exit_after_listing(self):
         self.start(FAKE_WORKER_MODE='hold')
@@ -483,7 +484,7 @@ exec /bin/mv "$@"
 
     def quiet(self):
         # Wait for the stub header before changing mtime; registration can finish first.
-        until = time.monotonic() + 5
+        until = time.monotonic() + 60
         while not (self.f.root / 'codex-child.pid').exists() and time.monotonic() < until:
             time.sleep(0.02)
         self.assertTrue((self.f.root / 'codex-child.pid').exists())
@@ -529,13 +530,13 @@ exec /bin/mv "$@"
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True)
         try:
-            out, err = proc.communicate(timeout=2)
+            out, err = proc.communicate(timeout=60)
             self.assertEqual(proc.returncode, 0, err)
             self.assertEqual(out.strip(), 'r1 finished')
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGTERM)
-            proc.communicate(timeout=5)
+            proc.communicate(timeout=60)
 
     def test_named_wait_obeys_exit_even_with_live_registry_pid(self):
         self.start(FAKE_WORKER_MODE='hold')

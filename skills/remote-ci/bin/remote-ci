@@ -21,7 +21,7 @@ remote-ci log [-C n] <regex>                                           grep the 
 remote-ci info                                                         one-line route, ssh command, ports, paths (cheap lookup)
 remote-ci setup                                                        prepare the runner for this project
 remote-ci init                                                         add .remote-ci.conf + pre-push hook here
-Exit codes: check result, 3 = runner unreachable, 74 = lost run/infrastructure failure, 75 = busy.
+Exit codes: see ../SKILL.md (check, infrastructure, busy, cleanup).
 USAGE
 }
 cmd=${1:-}; shift || true
@@ -39,8 +39,9 @@ if [ "$cmd" = fail ] || [ "$cmd" = blame ]; then
   fi
 fi
 root=$(git rev-parse --show-toplevel 2>/dev/null) || { [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: not in a git repository" >&2; exit 2; }
-conf=$root/.remote-ci.conf
-[ -f "$conf" ] || { [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: no .remote-ci.conf in $root (run: remote-ci init)" >&2; exit 2; }
+# land pins this to the main checkout; normal calls use this repo's config.
+conf=${REMOTE_CI_CONF:-$root/.remote-ci.conf}
+[ -f "$conf" ] || { [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: no config at $conf (run: remote-ci init)" >&2; exit 2; }
 # Keep the settings used for cache identity and execution identical while queued.
 conf_snapshot=$(mktemp)
 chmod 600 "$conf_snapshot"
@@ -224,45 +225,50 @@ else
   sha=$(git rev-parse "$target^{commit}") || exit 2
 fi
 # A pass identifies code, project settings and the synced runner scripts.
-snapshot_kit || exit 1
+snapshot_kit || exit 74
 kit_rev=$(cd "$kit_snapshot" && for script in *.sh; do
   printf '%s\n' "$script"
-  git hash-object "$script" || exit 1
-done | git hash-object --stdin | cut -c1-8) || exit 1
+  git hash-object "$script" || exit 74
+done | git hash-object --stdin | cut -c1-8) || exit 74
 tree=$(git rev-parse "$sha^{tree}")-$(git hash-object "$conf" | cut -c1-8)-$kit_rev
-if [ "$force" = 0 ] && [ -z "$command" ] && remote "test -f $p/results/tree-$tree.pass"; then
+# A cache hit needs no slot, but pending cleanup must reach the bounded recovery path.
+if [ "$force" = 0 ] && [ -z "$command" ] && remote "for pending in ~/ci/projects/*/results/*.cleanup; do
+  [ ! -f \"\$pending\" ] || exit 76
+  done; test -f $p/results/tree-$tree.pass"; then
   echo "remote-ci: this exact code already passed on the runner ($route); skipping."
   exit 0
 fi
 wait_deadline=$(( $(date +%s) + REMOTE_CI_WAIT_TIMEOUT ))
-nonce=$(openssl rand -hex 12) || { echo "remote-ci: cannot create run ID" >&2; exit 1; }
-case "$nonce" in *[!0-9a-f]* | "") echo "remote-ci: invalid random run ID" >&2; exit 1 ;; esac
-[ "${#nonce}" = 24 ] || { echo "remote-ci: invalid random run ID" >&2; exit 1; }
+nonce=$(openssl rand -hex 12) || { echo "remote-ci: cannot create run ID" >&2; exit 74; }
+case "$nonce" in *[!0-9a-f]* | "") echo "remote-ci: invalid random run ID" >&2; exit 74 ;; esac
+[ "${#nonce}" = 24 ] || { echo "remote-ci: invalid random run ID" >&2; exit 74; }
 run=$(date +%Y%m%d-%H%M%S)-${sha:0:8}-$$-$nonce
-sync_kit "$run" || exit 1
+sync_kit "$run" || exit 74
 # First-time setup runs this run's own scripts and config (the ones its pass key hashes), within the total wait.
-remote "test -f $p/.ready" || wait_remote "bash $p/runs/$run/bin/setup.sh $REMOTE_CI_NAME \$((deadline - \$(date +%s)))" || { rc=$?; [ "$rc" = 74 ] && exit 74; exit 1; }
+remote "test -f $p/.ready" || wait_remote "bash $p/runs/$run/bin/setup.sh $REMOTE_CI_NAME \$((deadline - \$(date +%s)))" || exit 74
 # One ref per run, so parallel callers never overwrite each other's commit while queued.
-GIT_SSH_COMMAND="$git_ssh" git push -q --force "$git_url" "$sha:refs/heads/run/$run" || exit 1
+GIT_SSH_COMMAND="$git_ssh" git push -q --force "$git_url" "$sha:refs/heads/run/$run" || exit 74
 echo "remote-ci: $REMOTE_CI_NAME ${sha:0:8} on the runner via $route (log $p/logs/$run.log)"
 encoded=$(printf '%s' "$command" | base64)
-remote "nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$encoded' $force </dev/null >/dev/null 2>&1 &" || exit 1
+remote "nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$encoded' $force </dev/null >/dev/null 2>&1 &" || exit 74
 # If this connection drops, the run still finishes and cleans up on the runner (see: remote-ci status).
 if [ "$summary" = 1 ]; then
+  echo "remote-ci: full log on the runner at $p/logs/$run.log"
   wait_remote "done=$p/results/$run.exit
     await_file \"\$done\"
     log=$p/logs/$run.log
     followed=\$(sed -n 's/^== following run \([a-zA-Z0-9_.-][a-zA-Z0-9_.-]*\) sha .*/\1/p' \"\$log\" | head -1)
     set -- \"\$log\"
     if [ -n \"\$followed\" ] && [ -f $p/logs/\$followed.log ]; then
-      set -- \"\$@\" $p/logs/\$followed.log
+      set -- $p/logs/\$followed.log \"\$log\"
     fi
     sed 's/\x1b\[[0-9;]*m//g' \"\$@\" |
-      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|lost-run:|== following|== cached:|== timing|== finished|maximum resident' |
-      sed 's/^[^ :]*:[a-z:-]*: *//' | awk '!seen[\$0]++' | head -60
+      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|lost-run:|== following|== cached:|== timing|runner cleanup pending:|== cleanup recovered:|maximum resident' |
+      sed 's/^[^ :]*:[a-z:-]*: *//' | grep -v -E '^== (check-result|finished) rc=|^runner cleanup pending:' | awk '!seen[\$0]++' | head -60
+    grep -h '^runner cleanup pending:' \"\$@\" | awk '!seen[\$0]++'
+    grep -h -E '^== (check-result|finished) rc=' \"\$@\" | awk '!seen[\$0]++'
     exit \$(cat \$done)"
   rc=$?
-  echo "remote-ci: full log on the runner at $p/logs/$run.log"
   exit $rc
 fi
 wait_remote "log=$p/logs/$run.log; done=$p/results/$run.exit

@@ -20,6 +20,12 @@ function world(on: On) {
   const memory = new Map<string, unknown>()
   const store = new Map<string, unknown>()
   const prompts: string[] = []
+  const toasts: string[] = []
+  let releasePrompt: (() => void) | undefined
+  let startedPrompt: (() => void) | undefined
+  const promptStarted = new Promise<void>(resolve => { startedPrompt = resolve })
+  let holdPrompt = false
+  let rejectHeldPrompt = false
   // deliver.sh stand-in: a receipt set shared by every session of this world.
   const calls: string[][] = []
   const receipts = new Map<string, 'pending' | 'final'>()
@@ -28,12 +34,13 @@ function world(on: On) {
   let rejectPrompt = false
   let markFails = false
   let version = 0
+  const batchStatus = 'review running 0m\n(1 finished workers; --all lists them)\n'
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('session.usage', () => ({ value: { context: { tokens: 0, window: 200_000 }, rateLimits: [] } }) as never)
   on('session.id', () => ({ value: 'S' }))
   on('ui.open', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_$, e) => { toasts.push(e.text); return { value: undefined } })
   on('state.get', (_$, e) => ({ value: { value: memory.get(e.key) ?? null, version } }) as never)
   on('state.set', (_$, e) => {
     memory.set(e.key, e.value)
@@ -62,16 +69,25 @@ function world(on: On) {
     }
     return { value: {
     exitCode: e.argv[0] === 'python3' && failed ? 1 : 0,
-    stdout: e.argv[0] === 'python3' ? JSON.stringify(data) : '', stderr: '',
+    stdout: e.argv[0] === 'python3' ? JSON.stringify(data) : e.argv[0]?.endsWith('/batches') ? batchStatus : '', stderr: '',
   } }
   })
-  on('prompt.submit', (_$, e) => {
+  on('prompt.submit', async (_$, e) => {
     if (rejectPrompt) throw new Error('queue unavailable')
     prompts.push(e.text)
+    startedPrompt?.()
+    if (holdPrompt) {
+      holdPrompt = false
+      await new Promise<void>(resolve => { releasePrompt = resolve })
+      if (rejectHeldPrompt) throw new Error('queue unavailable')
+    }
     return { text: e.text }
   })
   return {
-    memory, store, prompts, clock, calls, receipts,
+    memory, store, prompts, clock, calls, receipts, toasts, promptStarted,
+    holdPrompt: () => { holdPrompt = true },
+    releasePrompt: () => { releasePrompt?.() },
+    rejectHeldPrompt: () => { rejectHeldPrompt = true },
     data: (next: Collection) => { data = next },
     fail: (next: boolean) => { failed = next },
     rejectPrompt: (next: boolean) => { rejectPrompt = next },
@@ -80,6 +96,109 @@ function world(on: On) {
 }
 
 const start = { surface: 'terminal' as const, isInteractive: true, cwd: '/home' }
+
+test('bare /workers and status print the short batches status', async ($, on) => {
+  const w = world(on)
+  await $.session.start(start)
+  await w.clock.settle()
+  for (const args of [undefined, '', '   ', 'status']) {
+    const reply = await $.command.run({ command: 'workers', args })
+    expect(reply.text).toBe('review running 0m\n(1 finished workers; --all lists them)')
+  }
+  expect(w.prompts.length).toBe(0)
+})
+
+test('a pending prompt does not delay a second finish past one poll', async ($, on) => {
+  const w = world(on)
+  const first = { ...run('a', 'first'), rc: 0, ended: 100 }
+  const second = run('b', 'second')
+  w.holdPrompt()
+  w.data(collection([first, second]))
+  await $.session.start(start)
+  await w.promptStarted
+  try {
+    w.data(collection([first, { ...second, rc: 0, ended: 110 }]))
+    await w.clock.advance(30_000)
+    expect(w.prompts.length).toBe(2)
+    expect(w.prompts[1]).toContain('b/review (second) done rc=0')
+    expect(w.toasts).toContain('Worker b/review done (second)')
+    expect((w.memory.get('summary') as Summary).checkedAt).toBe(130_000)
+  } finally {
+    w.releasePrompt()
+    await w.clock.settle()
+  }
+})
+
+test('a late queue rejection retries only its report and preserves a later delivery', async ($, on) => {
+  const w = world(on)
+  const first = { ...run('a', 'first'), rc: 0, ended: 100 }
+  const second = run('b', 'second')
+  w.holdPrompt()
+  w.data(collection([first, second]))
+  await $.session.start(start)
+  await w.promptStarted
+  try {
+    w.data(collection([first, { ...second, rc: 0, ended: 110 }]))
+    await w.clock.advance(30_000)
+    expect(w.receipts.get('second')).toBe('final')
+  } finally {
+    w.rejectHeldPrompt()
+    w.releasePrompt()
+    await w.clock.settle()
+  }
+  expect(w.receipts.has('first')).toBe(false)
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(3)
+  expect(w.prompts[2]).toContain('(first) done rc=0')
+  expect(w.prompts[2]).not.toContain('(second)')
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(3)
+})
+
+test('a pending adoption does not delay an automatic finish notice', async ($, on) => {
+  const w = world(on)
+  const lost = { ...run('a', 'lost', 'done', 'GONE'), rc: 0, ended: -100 }
+  const current = run('b', 'current')
+  w.data(collection([lost, current]))
+  await $.session.start(start)
+  await w.clock.settle()
+  await $.command.run({ command: 'workers', args: 'adopt' })
+  w.holdPrompt()
+  const firstTick = w.clock.advance(30_000)
+  await w.promptStarted
+  try {
+    w.data(collection([lost, { ...current, rc: 0, ended: 140 }]))
+    await w.clock.advance(30_000)
+    expect(w.prompts.length).toBe(2)
+    expect(w.prompts[1]).toContain('b/review (current) done rc=0')
+  } finally {
+    w.releasePrompt()
+    await firstTick
+    await w.clock.settle()
+  }
+})
+
+test('a lead-read batches report suppresses the next done notice across a cache reload', async ($, on) => {
+  const w = world(on)
+  const current = run('a', 'one')
+  w.data(collection([current]))
+  on('tool.call', { tool: 'Bash' }, () => ({ result: {
+    stdout: `=================== ${current.log}\nChanged: finished work\n`, stderr: '', interrupted: false,
+  } }) as never)
+  await $.session.start(start)
+  await w.clock.settle()
+  await $.tool.call({ tool: 'Bash', command: 'batches report review' })
+  w.memory.clear()
+  w.data(collection([{ ...current, rc: 0, ended: 110 }]))
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(0)
+  expect(w.calls.length).toBe(0)
+  // A successor uses the same name and path, but needs its own notice.
+  w.data(collection([{ ...current, runId: 'two', started: 120, rc: 0, ended: 125 }]))
+  await w.clock.advance(30_000)
+  expect(w.prompts.length).toBe(1)
+  expect(w.prompts[0]).toContain('(two) done rc=0')
+})
 
 test('poll failure keeps the last good snapshot; recovery does not repeat', async ($, on) => {
   const w = world(on)

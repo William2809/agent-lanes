@@ -1,4 +1,5 @@
 """Non-Codex harnesses through wk: fake cursor-agent/opencode/pi/omp CLIs, real harness_run.py, isolated HOME."""
+# Allow 60 s for fixture scheduling at host load 40-140; product deadlines stay separate.
 import json
 import os
 import signal
@@ -191,14 +192,14 @@ class HarnessTests(unittest.TestCase):
     def test_stop_kills_the_harness_tree_and_batches_sees_it(self):
         self.f.wk('h1', '-d', 'a', '-m', 'pibuild', '-t', 'fixture:new', env={'FAKE_HARNESS_MODE': 'hold'})
         gc = self.f.root / 'grandchild.pid'
-        until = time.monotonic() + 10
+        until = time.monotonic() + 60
         while not gc.exists() and time.monotonic() < until:
             time.sleep(0.05)
         status = self.f.run(str(ROOT / 'skills/agent-workers/scripts/batches.sh'), check=False).stdout
         self.assertRegex(status, r'h1 +running')
         wrapper = int((self.log('h1').parent / 'h1.log.pid').read_text())
         os.kill(wrapper, signal.SIGTERM)
-        until = time.monotonic() + 10
+        until = time.monotonic() + 60
         while time.monotonic() < until and subprocess.run(['kill', '-0', gc.read_text()], capture_output=True).returncode == 0:
             time.sleep(0.05)
         self.assertNotEqual(subprocess.run(['kill', '-0', gc.read_text()], capture_output=True).returncode, 0)
@@ -243,12 +244,12 @@ class HarnessTests(unittest.TestCase):
         if gc.exists(): gc.rename(self.f.root / f'grandchild.{mode}.old')
         self.f.wk(name, '-d', 'a', '-m', 'pibuild', '-t', 'fixture:new', env={'FAKE_HARNESS_MODE': mode})
         gc = self.f.root / 'grandchild.pid'
-        until = time.monotonic() + 10
+        until = time.monotonic() + 60
         while not gc.exists() and time.monotonic() < until:
             time.sleep(0.05)
         time.sleep(0.3)
         os.kill(int((self.log(name).parent / (name + '.log.pid')).read_text()), signal.SIGTERM)
-        until = time.monotonic() + 12
+        until = time.monotonic() + 60
         while time.monotonic() < until and subprocess.run(['kill', '-0', gc.read_text()], capture_output=True).returncode == 0:
             time.sleep(0.1)
         self.assertNotEqual(subprocess.run(['kill', '-0', gc.read_text()], capture_output=True).returncode, 0)

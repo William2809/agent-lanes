@@ -118,7 +118,10 @@ mq run                             # only if no runner is up (mq add starts one)
 mq ls                              # queue, claims, bounced lanes and their workers
 ```
 
+`land` runs from mq: use `mq add WT`. Integration branches (e.g. `integ/*`) are lanes too: use `mq add WT`, never `git merge`. A direct exception needs `LAND_DIRECT=1 LAND_REASON="why" land WT` and records `landed-direct`.
+
 `mq` lands ready lanes in trains of up to 4 (`MQ_TRAIN=1` for one at a time): rebase, preflight, one full check, fast-forward, then removes each worktree, its dev server and its database copy. A red train lands the lanes the failure does not point at first, then checks the suspect alone. A conflict or red check goes back to the lane's worker with the error, and the lane rejoins the queue when the worker finishes with everything committed (uncommitted leftovers park it). After two failed fixes the lane is parked for you (`mq drop NAME` to remove it from the queue). `mq add` starts a runner when none is running; an atomic lock refuses concurrent runners and allows takeover of a dead runner’s lock. If you edit files in the main checkout yourself, a lane that changes the same files waits (`mq waiting` names it) until you commit.
+First submissions that change check or CI config, the land preflight, or `package.json` scripts park with `check policy changed: review`; test and baseline changes are allowed. Review the diff, then use `mq add NAME` to land that commit. `land` selects checks from the main checkout's `package.json` and `.remote-ci.conf`; `check:remote` still runs the candidate's script body.
 
 ```sh
 lanes                              # one line per lane; what needs you first
@@ -148,7 +151,7 @@ Presets are the only place model names live. `ao-model ls` shows them; override 
 | A worker shows `DIED` in `batches` | `batches report NAME`, then `wk NAME -r` to continue or `batches ack NAME` to hide it. |
 | A worker shows `STALLED` | Its log has been quiet for a while but the process lives. Check `batches report NAME`; stop it with `batches pause --stalled NAME` before `wk NAME -r`. `batches ack NAME` hides it from the default listing while leaving the process alive. |
 | `mq` says `PARKED` | Read `mq ls` and the lane's last report; fix it in the worktree, `wtcommit`, then `mq add NAME` again. |
-| `remote-ci` exits 3 | The runner is unreachable. `remote-ci info` still shows configured direct/alias and SSH routes; check the cable, network or VPN and `~/.config/agent-lanes/config`. `land` and `mq` treat this as a failed check; only the pre-push hook falls back to a local run. |
+| `remote-ci` exits 3 | The runner is unreachable. `remote-ci info` still shows configured direct/alias and SSH routes; check the cable, network or VPN and `~/.config/agent-lanes/config`. `land` reports infrastructure failure and `mq` keeps the lanes queued without a fixer; only the pre-push hook falls back to a local run. |
 | `wt-dev new` stops with a database error | The copy of the local database failed (missing client tools, a failed create or dump/restore, different table counts, or a database without a built-in adapter: set `WT_DEV_DB_CLONE`/`WT_DEV_DB_DROP`), so the new worktree was removed. Fix the cause, or rerun with `--shared-db` to use the main database on purpose. No `DATABASE_URL` means no database; a remote one stays shared with a warning. |
 
 ## Supported harnesses

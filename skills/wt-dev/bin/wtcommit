@@ -6,6 +6,8 @@ set -eu
 case "${1:-}" in -h|--help|help) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 0;; -*) [ "$1" = -n ] || { echo "wtcommit: unknown option $1" >&2; exit 2; };; esac
 [ "${1:-}" = "-n" ] && { dry=1; shift; } || dry=0
 name=${1:?usage: wtcommit [-n] <worktree> "<message>"}; msg=${2:-}
+# A worktree path works too: run from inside it and use its folder name.
+case "$name" in */*) [ -d "$name" ] && { cd "$name"; name=$(basename "$name"); };; esac
 # Run inside a worktree with only a message: commit that worktree.
 if [ $# -eq 1 ] && [ ! -d "$(wt-dev path "$name" 2>/dev/null)" ]; then
   top=$(git rev-parse --show-toplevel 2>/dev/null || true); msg=$name; name=$(basename "${top:-.}")

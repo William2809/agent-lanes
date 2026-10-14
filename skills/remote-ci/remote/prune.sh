@@ -14,10 +14,23 @@ for conf in "$ci"/projects/*/conf; do
   [ -f "$conf" ] || continue
   project=$(basename "$(dirname "$conf")")
   ( load_project "$project"
-    if [ -n "${REMOTE_CI_POSTGRES:-}" ] && [ -n "${REMOTE_CI_DB_CLEAN:-}" ] && [ -f "$pgdata/PG_VERSION" ]; then
-      (pg_ctl -D "$pgdata" status >/dev/null 2>&1 || pg_ctl -D "$pgdata" -l "$ci/pg/$REMOTE_CI_POSTGRES.log" start -w >/dev/null) &&
+    for pending in "$dir"/results/*.cleanup; do
+      [ ! -f "$pending" ] || { echo "$project cleanup pending; skipped"; exit 0; }
+    done
+    if [ -n "${REMOTE_CI_POSTGRES:-}" ] && [ -f "$pgdata/PG_VERSION" ] &&
+      { pg_ctl -D "$pgdata" status >/dev/null 2>&1 || pg_ctl -D "$pgdata" -l "$ci/pg/$REMOTE_CI_POSTGRES.log" start -w >/dev/null; }; then
+      [ -z "${REMOTE_CI_DB_CLEAN:-}" ] ||
         psql -d postgres -Atqc "select datname from pg_database where datname like '$REMOTE_CI_DB_CLEAN'" |
         while read -r db; do dropdb --if-exists "$db"; done
+      # Template cache: keep the 5 newest and any used in 3 days. run.sh rebuilds a missing one.
+      prefix=mci_$(printf '%s' "$project" | shasum -a 256 | cut -c1-12)_
+      keep=$({ ls -t "$dir"/templates/*.ready 2>/dev/null | head -5; find "$dir/templates" -name '*.ready' -mtime -3 2>/dev/null; } | sed 's|.*/||; s|\.ready$||')
+      psql -d postgres -Atqc "select datname from pg_database where datname ~ '^${prefix}[0-9a-f]{32}\$'" |
+        while read -r db; do
+          printf '%s\n' "$keep" | grep -qxF "$db" && continue
+          rm -f "$dir/templates/$db.ready"
+          dropdb --if-exists --force "$db" && echo "$project template dropped: $db"
+        done
       pg_ctl -D "$pgdata" stop -m fast >/dev/null 2>&1
     fi
     command -v pnpm >/dev/null && (cd "$dir/work" && pnpm store prune >/dev/null 2>&1)

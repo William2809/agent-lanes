@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Collection, Context, Delivery, RunRecord, Summary } from '../types'
-import { ADOPT_LIMIT, ADOPTED, events, identity, isProblem, lastTitle, notices, originLabel, origins, outcome, parse, remember, repoOf, unclaimed } from './parse'
+import { ADOPT_LIMIT, ADOPTED, eventKey, events, identity, isProblem, lastTitle, notices, originLabel, origins, outcome, parse, readReports, remember, repoOf, unclaimed } from './parse'
 import { short, sparkline, weather } from './weather'
 
 const PANE = 'workers'
@@ -24,6 +24,19 @@ const adopted = new Set<string>()
 
 const DAY = 86_400
 const DELIVERED = 'delivered-runs-v1'
+const READ = 'read-runs-v1'
+let latestRuns: RunRecord[] = []
+// A queue rejection can overlap a later successful delivery. Serialize edits
+// and remove only the rejected events, never restore an older whole snapshot.
+let saving = Promise.resolve()
+async function history($: EngineInterface, key: string, edit: (saved: Delivery[]) => Delivery[]) {
+  const task = saving.then(async () => {
+    const saved = await $.store.get(key)
+    await $.store.set(key, edit(Array.isArray(saved) ? saved : []))
+  })
+  saving = task.catch(() => {})
+  await task
+}
 // The session this mod last named in ~/.claude/state/receipt-sessions/ (it writes receipts).
 let registered = ''
 
@@ -174,6 +187,20 @@ async function collect($: EngineInterface, home: string, cutoff: number): Promis
   return JSON.parse(ran.stdout) as Collection
 }
 
+async function queueNotice($: EngineInterface, home: string, deliveryKey: string, send: RunRecord[], text: string) {
+  try {
+    const sent = await $.prompt.submit({ text })
+    if (sent.drop !== undefined) throw new Error('worker prompt was not queued')
+  } catch {
+    const rejected = new Set(send.map(eventKey))
+    await history($, deliveryKey, saved => saved.filter(item => !rejected.has(item.key)))
+    await receipts($, home, 'release', send.filter(run => run.rc !== undefined))
+    await update($, summary, before => ({ workers: [], finished: 0, checkedAt: 0, ...before, error: 'worker poll failed' }))
+    return
+  }
+  await receipts($, home, 'confirm', send.filter(run => run.rc !== undefined))
+}
+
 async function poll($: EngineInterface, notify = true) {
   if (isPolling) return
   isPolling = true
@@ -186,11 +213,17 @@ async function poll($: EngineInterface, notify = true) {
     const mine = await $.session.id()
     await markReceipts($, home, mine)
     const data = await collect($, home, cutoff)
+    const readHistory = await $.store.get(`${READ}:${mine}`)
+    const readKeys = new Set(Array.isArray(readHistory) ? readHistory.map((item: Delivery) => item.key) : [])
+    for (const run of data.runs) run.read = readKeys.has(`${identity(run)}:end`)
+    latestRuns = data.runs
     const deliveryKey = `${DELIVERED}:${mine}`
     const saved = await $.store.get(deliveryKey)
     const delivered: Delivery[] = Array.isArray(saved) ? saved : []
     const next = await withOrigins($, home, data, checkedAt, new Set(delivered.map(d => d.key)))
     const fresh = events(data.runs, delivered, mine)
+    let queued: { send: RunRecord[]; text: string } | undefined
+    let adoption: { chosen: string[]; runs: RunRecord[] } | undefined
     if (fresh.length && notify) {
       const claims = await receipts($, home, 'claim', fresh.filter(run => run.rc !== undefined))
       // Live problems need no receipt; an exit goes out only with this session's claim. Busy or
@@ -199,27 +232,29 @@ async function poll($: EngineInterface, notify = true) {
       const send = settled.filter(run => run.rc === undefined || claims.get(run.runId) === 'claimed')
       const text = notices(send)
       // Save before enqueueing. A failed enqueue restores history and receipts so it can retry.
-      await $.store.set(deliveryKey, remember(delivered, settled, cutoff))
+      await history($, deliveryKey, saved => remember(saved, settled, cutoff))
       if (text) {
-        try {
-          const sent = await $.prompt.submit({ text })
-          if (sent.drop !== undefined) throw new Error('worker prompt was not queued')
-        } catch (error) {
-          await $.store.set(deliveryKey, delivered)
-          await receipts($, home, 'release', send.filter(run => run.rc !== undefined))
-          throw error
-        }
         announce($, send)
-        await receipts($, home, 'confirm', send.filter(run => run.rc !== undefined))
+        queued = { send, text }
       }
     }
     if (adopting && notify) {
       // Recheck at send time: a lead that reopened since the command makes its report delivery-unknown.
       const allowed = new Set((next.unclaimed ?? []).filter(run => adoptOpen || !run.leadOpen).map(identity))
-      const taken = await adopt($, home, data.runs.filter(run => allowed.has(identity(run))))
-      next.unclaimed = next.unclaimed?.filter(run => !taken.has(identity(run)))
+      adoption = { chosen: adopting, runs: data.runs.filter(run => allowed.has(identity(run))) }
+      adopting = null
     }
     await update($, summary, () => next)
+    // Publish the snapshot first. Queue callbacks can then update it without
+    // the detecting poll overwriting their result. Neither queue holds the
+    // polling lock or the timer's next period while the lead is busy.
+    if (queued) void queueNotice($, home, deliveryKey, queued.send, queued.text).catch(() => {})
+    if (adoption) {
+      const { chosen, runs } = adoption
+      void adopt($, home, runs, chosen).then(taken =>
+        update($, summary, before => before && ({ ...before, unclaimed: before.unclaimed?.filter(run => !taken.has(identity(run))) }))
+      ).catch(() => { adopting ??= chosen })
+    }
   } catch {
     // A failed read never replaces the last good workers or the delivery history.
     await update($, summary, () => ({
@@ -232,8 +267,8 @@ async function poll($: EngineInterface, notify = true) {
 }
 
 // One prompt with the chosen reports this session could claim; a rejected prompt releases them.
-async function adopt($: EngineInterface, home: string, runs: RunRecord[]): Promise<Set<string>> {
-  const chosen = new Set(adopting)
+async function adopt($: EngineInterface, home: string, runs: RunRecord[], ids: string[]): Promise<Set<string>> {
+  const chosen = new Set(ids)
   const open = runs.filter(run => chosen.has(identity(run)) && run.rc !== undefined && !run.delivered)
   const claims = await receipts($, home, 'claim', open)
   const pick = open.filter(run => claims.get(run.runId) === 'claimed')
@@ -251,7 +286,6 @@ async function adopt($: EngineInterface, home: string, runs: RunRecord[]): Promi
   }
   const gone = chosen.size - pick.length
   if (gone > 0) $.ui.toast(`${gone} chosen report${gone > 1 ? 's were' : ' was'} not sent: already received, its session reopened, past 24 h, or unreadable`)
-  adopting = null
   return new Set(pick.map(identity))
 }
 
@@ -321,8 +355,26 @@ async function measure($: EngineInterface) {
 }
 
 export const register: Register = on => {
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const snapshot = latestRuns.slice()
+    const result = await next(e)
+    if (e.agentId || result.deny || result.isError || result.result?.interrupted) return result
+    const read = readReports(e.command, result.result?.stdout ?? '', snapshot)
+    if (read.length) {
+      // A failed bookkeeping write must not turn a successful Bash call into
+      // an error or conceal its report from the lead.
+      try {
+        const mine = await $.session.id()
+        const now = await $.clock.now() / 1000
+        await history($, `${READ}:${mine}`, saved => remember(saved,
+          read.map(run => ({ ...run, rc: run.rc ?? 0, ended: now })), now - DAY))
+      } catch {}
+    }
+    return result
+  })
+
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'workers', description: 'Show all workers and worktrees in a side pane; /workers adopt takes unclaimed reports (adopt open: also those of open sessions)' })
+    await $.command.register({ name: 'workers', description: 'Short worker status (default or status); pane opens the full list; adopt takes unclaimed reports (adopt open: also those of open sessions)' })
     void poll($)
     void measure($)
     $.clock.every(POLL_MS, () => poll($))
@@ -349,6 +401,10 @@ export const register: Register = on => {
       adopting = lost.map(identity)
       adoptOpen = args === 'adopt open'
       return { text: `Adopting ${lost.length} unclaimed worker report${lost.length > 1 ? 's' : ''}: one prompt follows this turn.${more}` }
+    }
+    if (!args || args === 'status') {
+      const ran = await $.process.run([`${(await $.env.get('HOME')) ?? ''}/.local/bin/batches`], { timeoutMs: 30_000 })
+      return { text: (ran.stdout + ran.stderr).trim() || 'No workers.' }
     }
     await update($, detail, () => 'Loading…')
     await $.ui.open({ id: PANE, title: 'Workers' })

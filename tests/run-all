@@ -1,0 +1,57 @@
+#!/bin/sh
+# ABOUTME: Runs public syntax checks and suites, with queue suites in the background.
+set -eu
+cd "$(dirname "$0")/.."
+logs=$(mktemp -d "${TMPDIR:-/tmp}/run-all.XXXXXX")
+export PYTHONPYCACHEPREFIX="$logs/pycache"
+run() (
+  name=$1; shift
+  start=$(date +%s)
+  log="$logs/$(printf '%s' "$name" | tr / _)"
+  if "$@" >"$log" 2>&1; then
+    echo "ok $name $(($(date +%s) - start))s"
+  else
+    echo "FAIL $name $(($(date +%s) - start))s"
+    tail -20 "$log"
+    exit 1
+  fi
+)
+syntax() {
+  find . -type d \
+    \( -name .git -o -name .local -o -name .reviews -o -name .venv \
+       -o -name __pycache__ -o -name node_modules \) -prune -o -type f -print >"$logs/files" || return 1
+  while IFS= read -r f; do
+    case "$(head -c 40 "$f")" in
+      '#!/bin/sh'*) sh -n "$f" ;;
+      '#!/bin/bash'*|'#!/usr/bin/env bash'*) bash -n "$f" ;;
+      '#!/usr/bin/env node'*) cp "$f" "$logs/check.mjs"; node --check "$logs/check.mjs" ;;
+      '#!/usr/bin/env python3'*) python3 -m py_compile "$f" ;;
+    esac || return 1
+  done <"$logs/files"
+}
+python_suite() (
+  cd "$1"
+  [ "$2" != test_wt_dev ] || export PYTHONWARNINGS=ignore
+  python3 -m unittest -q "$2"
+)
+run syntax syntax || exit 1
+# Keep the two slow queue suites sequential in one background job.
+(
+  status=0
+  for suite in test_workflow test_bounce_train; do
+    run "tests/$suite" python_suite tests "$suite" || status=1
+  done
+  exit "$status"
+) & queue_tests=$!
+status=0
+for spec in skills/session-stats/test_session_stats.py skills/loop-stats/test_loop_stats.py \
+  bin/test_lanes.py bin/test_diskguard.py skills/wt-dev/test_wt_dev.py tests/test_*.py \
+  skills/*/test_diagnostics.py skills/*/test_runner.py; do
+  case "$spec" in tests/test_workflow.py|tests/test_bounce_train.py) continue ;; esac
+  suite=${spec##*/}; suite=${suite%.py}
+  run "${spec%.py}" python_suite "${spec%/*}" "$suite" || status=1
+done
+# test_browser_tools.mjs needs a project with Playwright installed.
+run skills/ui-shots/test_auth_cache node --test skills/ui-shots/test_auth_cache.mjs || status=1
+wait "$queue_tests" || status=1
+exit "$status"

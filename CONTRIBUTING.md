@@ -21,13 +21,7 @@ Thanks for helping. agent-lanes is a set of small tools, and the aim is to keep 
 ## Checks before you open a pull request
 
 ```sh
-for f in bin/* skills/*/bin/* skills/*/scripts/*.sh skills/*/remote/*.sh; do
-  case "$(head -1 "$f")" in
-    *bash*) bash -n "$f" ;; *node*) node --check --input-type=module < "$f" ;;
-    *python*) python3 -m py_compile "$f" ;; *) sh -n "$f" ;;
-  esac || echo "FAIL $f"
-done
-(cd skills/session-stats && python3 -m unittest -q test_session_stats)
+tests/run-all
 ```
 
 Then try the changed tool for real (for example, launch a worker with `wk`, or land a test lane with `mq`). Say in the pull request what you ran and on which OS, and what you could not test.

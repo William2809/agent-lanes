@@ -1,4 +1,5 @@
 """Regressions for the PR #9 review (v0.8.1): worker records, pause identity, record locks."""
+# Allow 60 s for fixture scheduling at host load 40-140; product deadlines stay separate.
 import os
 from pathlib import Path
 import signal
@@ -21,7 +22,7 @@ class V081Tests(unittest.TestCase):
     def side(self, name, suffix, repo='demo'):
         return Path(str(self.log(name, repo)) + suffix)
 
-    def wait_for(self, path, timeout=10):
+    def wait_for(self, path, timeout=60):
         until = time.monotonic() + timeout
         while time.monotonic() < until:
             if path.exists():
@@ -116,7 +117,7 @@ exec /bin/mkdir "$@"
         os.kill(supervisor, signal.SIGSTOP)
         try:
             os.kill(child, signal.SIGTERM)
-            until = time.monotonic() + 10
+            until = time.monotonic() + 60
             while time.monotonic() < until:
                 try:
                     os.kill(worker, 0)
@@ -161,7 +162,7 @@ exec /bin/mkdir "$@"
         os.kill(supervisor, signal.SIGSTOP)
         try:
             os.kill(child, signal.SIGTERM)
-            until = time.monotonic() + 10
+            until = time.monotonic() + 60
             while time.monotonic() < until:
                 try:
                     os.kill(worker, 0)
@@ -191,7 +192,7 @@ exec /bin/mkdir "$@"
             self.wait_for(self.side('r1', '.exit'))
             (self.f.root / 'codex-child.pid').unlink()
             self.f.wk('r1', '-d', 'a', '-t', 'fixture:new', env={'FAKE_WORKER_MODE': 'hold'})
-            out, _ = waiter.communicate(timeout=10)
+            out, _ = waiter.communicate(timeout=60)
             self.assertEqual(out.strip(), 'all workers finished')
         finally:
             if waiter.poll() is None:
@@ -218,7 +219,7 @@ exec /bin/mkdir "$@"
             self.f.wk('r2', '-d', 'b', '-t', 'fixture:new', env=hold)
             self.wait_for(pids)
             os.kill(first, signal.SIGTERM)
-            out, _ = waiter.communicate(timeout=10)
+            out, _ = waiter.communicate(timeout=60)
             self.assertEqual(out.strip(), 'all workers finished')
         finally:
             if waiter.poll() is None:

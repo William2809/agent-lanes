@@ -1,0 +1,27 @@
+#!/bin/sh
+# mq-wait NAME [REPO]: block until the latest mq attempt for worktree NAME ends; print its result lines.
+# Exit 0 = LANDED, 1 = PARKED/BOUNCED/other end. Matches whole names only (lane a never matches lane ab).
+name=${1:?usage: mq-wait NAME [REPO]}
+repo=${2:-$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")}
+log="$HOME/.claude/state/mq/$repo/run.log"
+[ -f "$log" ] || { echo "mq-wait: no log $log" >&2; exit 2; }
+# An attempt starts at a solo or train landing line, or at a park/bounce printed before any landing.
+lane="( [^ :]+)* $name( [^ :]+)*"
+start() { grep -nE "^(landing $name\$|landing train:$lane\$|PARKED $name[: ]|BOUNCED $name )" "$log" | tail -1 | cut -d: -f1; }
+begin=$(wc -l <"$log" | tr -d ' ')
+# Each poll reads the latest attempt again, so a retry that started since the last poll replaces an older result.
+# With no attempt yet, a run that ends after the wait began (e.g. stopped before this lane) ends the wait.
+while :; do
+  n=$(start)
+  if [ -n "$n" ]; then
+    out=$(tail -n +"$n" "$log")
+    hit=$(printf '%s\n' "$out" | grep -E "^($name: LANDED|train$lane: LANDED|PARKED $name[: ]|BOUNCED $name )" | tail -1)
+  else
+    out=$(tail -n +"$((begin + 1))" "$log"); hit=""
+  fi
+  [ -n "$hit" ] || hit=$(printf '%s\n' "$out" | grep "^mq done:" | head -1)
+  [ -n "$hit" ] && break
+  sleep "${MQ_WAIT_POLL:-15}"
+done
+printf '%s\n' "$out" | grep -E "^($name[: ]|train$lane:|PARKED $name[: ]|BOUNCED $name |mq done:)" | tail -6
+case "$hit" in "$name: LANDED"*|train*": LANDED"*) exit 0 ;; *) exit 1 ;; esac

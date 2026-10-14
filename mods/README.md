@@ -4,7 +4,7 @@ Function-hook plugins that load in every Claude Code session (user scope), read 
 
 | Mod | What it does |
 |---|---|
-| `workers` | Band above the prompt: context weather + sparkline, `batches` worker count per repo, failed workers with their origin (repo/worktree, or another session's title), 5h limit, fresh-session toast at 150k. `/workers` opens the full list in a pane. When one of this session's workers finishes or fails, it submits a short prompt to this session, so the lead wakes up and acts without a waiter. |
+| `workers` | Band above the prompt: context weather + sparkline, `batches` worker count per repo, failed workers with their origin (repo/worktree, or another session's title), 5h limit, fresh-session toast at 150k. `/workers` or `/workers status` prints short status; `/workers pane` opens the full list. When one of this session's workers finishes or fails, it shows a toast and submits a short prompt. A queued prompt does not block later polls. A successful, simple `batches report NAME…` call in the lead's Bash tool suppresses that attempt's later notice. |
 | `guards` | Blocks `rm` (use `ctrash`), `pkill`/`killall`, untagged subagents, subagents on models you list in `GUARDS_BLOCK_SUBAGENT_MODELS`, AI commit trailers. Force pushes and pushes to main/staging are blocked with an "Allow once" button in `/guards`. Known false positive: text that starts a shell segment with `rm` (e.g. after a backtick in a heredoc); write such files with an editor tool. |
 
 Settings (in `~/.config/agent-lanes/config`):
