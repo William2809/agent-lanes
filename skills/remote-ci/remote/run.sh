@@ -13,7 +13,11 @@ clean_databases() {
 select datname from pg_database
 where datname like :'pattern' $owner_filter;
 SQL
-      while read -r db; do dropdb --if-exists --force "$db" || exit 1; done
+      # A test harness may mark its own clone source as a template; dropdb refuses templates.
+      while read -r db; do
+        dropdb --if-exists --force "$db" ||
+          { psql -d postgres -q -c "alter database \"$db\" is_template false" </dev/null && dropdb --if-exists --force "$db"; } || exit 1
+      done
     [ "${PIPESTATUS[*]}" = "0 0" ] || return 1
   fi
   [ "$REMOTE_CI_SLOTS" = 1 ] || dropdb --if-exists --force "$REMOTE_CI_DB"

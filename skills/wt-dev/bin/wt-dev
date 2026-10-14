@@ -332,9 +332,13 @@ running() {
 listener_ours() {
   local l tree
   # Commands whose listener is another process (docker compose ...) opt out of the ownership check.
-  [ "${WT_DEV_READY_ANY:-0}" != 1 ] || { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; return; }
+  [ "${WT_DEV_READY_ANY:-0}" != 1 ] || { port_listens "$1"; return; }
   tree=" $(server_tree "$(cat "$state/$name.pid")") "
   for l in $(lsof -nP -t -iTCP:"$1" -sTCP:LISTEN 2>/dev/null); do case "$tree" in *" $l "*) return 0;; esac; done
+  # Some hosts (GitHub's macOS runners) show a listening socket as CLOSED, so -sTCP:LISTEN finds nothing.
+  # Then: the port answers, and a process of this server's tree holds a socket on it.
+  [ -z "$(lsof -nP -t -iTCP:"$1" -sTCP:LISTEN 2>/dev/null)" ] && port_listens "$1" || return 1
+  for l in $(lsof -nP -t -iTCP:"$1" 2>/dev/null); do case "$tree" in *" $l "*) return 0;; esac; done
   return 1
 }
 
