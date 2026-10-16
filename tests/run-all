@@ -50,6 +50,7 @@ status=0
 for spec in skills/session-stats/test_session_stats.py skills/loop-stats/test_loop_stats.py \
   bin/test_lanes.py bin/test_diskguard.py skills/wt-dev/test_wt_dev.py tests/test_*.py \
   skills/*/test_diagnostics.py skills/*/test_runner.py skills/*/test_resources.py skills/remote-ci/test_pool*.py \
+  skills/*/test_client_process.py skills/*/test_route_policy.py \
   skills/*/test_scheduler*.py skills/*/test_fast_*.py skills/*/test_memory.py skills/*/test_tree_scheduler.py \
   skills/*/test_review_followup.py skills/*/test_ci_reliability.py skills/*/test_ci_policy.py skills/*/test_receipts.py skills/*/test_hostkit.py skills/*/test_cache*.py; do
   case "$spec" in tests/test_workflow.py|tests/test_bounce_train.py) continue ;; esac
