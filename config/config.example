@@ -21,3 +21,12 @@
 # AGENT_CI_MEM_RESERVE_MB=2048
 # AGENT_CI_WORKER_MB=2048
 # Local mode always grants one worker; framework flags must respect AGENT_CI_WORKERS.
+
+# Optional remote runner pool; aliases and capabilities belong on the submitting host.
+# Set up the project on each compatible runner before enabling these entries.
+# CI_RUNNERS='mac=runner-mac:macos linux=runner-linux:linux'
+# CI_RUNNER_mac_EXPECTED_SECONDS=300
+# CI_RUNNER_linux_EXPECTED_SECONDS=300
+# CI_RUNNER_linux_ENABLED=1
+# Projects can restrict eligibility with REMOTE_CI_NEEDS=macos (space-separated capabilities).
+# Host administration must name a runner, e.g. REMOTE_CI_RUNNER=mac remote-ci freeze.

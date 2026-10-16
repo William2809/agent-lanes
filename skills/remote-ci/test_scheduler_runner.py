@@ -38,6 +38,30 @@ class SchedulerRunner(unittest.TestCase):
         path = self.home / '.local/state/agent-ci/queue.json'
         return json.loads(path.read_text())['jobs'] if path.exists() else {}
 
+    def test_existing_project_lease_client_accepts_only_live_v2_group(self):
+        # Use the unchanged shipped v1 reader, also vendored by existing projects.
+        helper = Path(__file__).parent.parent/'resource-safe-checks/scripts/resource-lease.cjs'
+        (self.home/'legacy-lease.cjs').write_bytes(helper.read_bytes())
+        (self.home/'probe.cjs').write_text(
+            "require('./legacy-lease.cjs').requireAllocation();console.log('legacy-lease-ok');")
+        active = self.start('legacy-client',
+                            command='node "$HOME/probe.cjs" && bash "$HOME/check"')
+        self.wait_for(lambda: self.count() == 1 or active.poll() is not None)
+        self.assertEqual(self.count(), 1, self.log('legacy-client'))
+        token, row = next((t,r) for t,r in self.rows().items() if r.get('state') == 'running')
+        self.assertEqual(row['group'], row['process']['group'])
+        outside = subprocess.run(['node', '-e',
+            "console.log(require(process.argv[1]).allocation() !== null)",
+            str(self.home/'legacy-lease.cjs')], env=dict(self.env, AGENT_CI_TOKEN=token),
+            capture_output=True, text=True, timeout=10, start_new_session=True)
+        self.assertEqual(outside.returncode, 0, outside.stderr)
+        self.assertEqual(outside.stdout.strip(), 'false')
+        (self.home/'release').touch()
+        self.assert_result(active, 'legacy-client', 0)
+        self.assertIn('legacy-lease-ok', self.log('legacy-client'))
+        self.assertNotIn('group', self.rows()[token])
+        self.assertFalse(self.rows()[token].get('groups'))
+
     def test_targeted_duplicates_share_failure_without_second_execution(self):
         self.configure(rc=1)
         first = self.start('first', command='bash "$HOME/check"')
