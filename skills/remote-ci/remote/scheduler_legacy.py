@@ -6,6 +6,8 @@ an incomplete handover; it is not a second admission authority.
 from pathlib import Path
 import re
 
+import scheduler
+
 
 def pid_live(path, procs):
     try:
@@ -34,7 +36,12 @@ def import_cleanup(data, root, now):
     root = Path(root)
     for path in root.glob('projects/*/results/*.cleanup'):
         project, run = path.parent.parent.name, path.stem
-        if any(r.get('project') == project and r.get('run_id') == run for r in data['jobs'].values()):
+        matches = [r for r in data['jobs'].values()
+                   if r.get('project') == project and r.get('run_id') == run]
+        active = lambda r: (r.get('state') not in scheduler.TERMINAL or
+                            r.get('workers') or r.get('memory_mb') or r.get('process') or
+                            r.get('groups') or r.get('quarantined_leases'))
+        if any(active(row) for row in matches):
             continue
         values = dict(line.split('=', 1) for line in path.read_text().splitlines() if '=' in line)
         slot = int(values.get('slot', '1'))
@@ -46,11 +53,20 @@ def import_cleanup(data, root, now):
             match = re.search(r'^REMOTE_CI_POSTGRES=[\"\x27]?(\d+)', conf.read_text(), re.M)
             if match:
                 leases.append('postgres:' + match[1])
-        data['sequence'] += 1
-        data['jobs']['recovery-' + project + '-' + run] = dict(
-            version=2, protocol=2, project=project, run_id=run, sequence=data['sequence'],
-            lease_generation=data['sequence'], owner=0, start='', state='quarantined',
-            phase='cleanup', result=76, slot=slot, cleanup_required=True, recover_after=now,
-            submitted_at=now, finished_at=now, updated_at=now,
+        recovery = dict(
+            version=2, protocol=2, project=project, run_id=run, owner=0, start='',
+            state='quarantined', phase='cleanup', slot=slot, cleanup_required=True,
+            recover_after=now, updated_at=now,
             quarantined_leases=[x for x in leases if not x.startswith('postgres:')],
             requested=dict(slots=slot, workers=1, memory_mb=6144, leases=leases))
+        if matches:
+            # A terminal ledger row is history, not ownership. Reuse the latest
+            # row so its failure result, timestamps, and receipt identity survive.
+            row = max(matches, key=lambda item: item.get('sequence', 0))
+            row.update(recovery)
+            row.setdefault('result', 76)
+        else:
+            data['sequence'] += 1
+            recovery.update(sequence=data['sequence'], lease_generation=data['sequence'],
+                            result=76, submitted_at=now, finished_at=now)
+            data['jobs']['recovery-' + project + '-' + run] = recovery
