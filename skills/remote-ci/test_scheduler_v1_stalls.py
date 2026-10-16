@@ -116,17 +116,14 @@ class V1StallBounds(unittest.TestCase):
         self.short_deadlines()
         with (self.dir / 'conf').open('a') as stream:
             stream.write('REMOTE_CI_TIMEOUT=8\nREMOTE_CI_WAIT_TIMEOUT=90\n')
-        tools = self.ci / 'node/stall/bin'
-        tools.mkdir(parents=True)
+        # Intercept only copying; a fake node also breaks npm identity probes.
+        tools = self.home / 'tool-versions'
         marker = self.home / 'stuck-cp'
         cp = tools / 'cp'
         cp.write_text('#!/bin/bash\nsleep 30 & child=$!; echo "$child" >"$HOME/stuck-cp"; wait "$child"\n')
         cp.chmod(cp.stat().st_mode | stat.S_IXUSR)
-        node = tools / 'node'
-        node.write_text('#!/bin/bash\n[ "$1" = --version ] && { echo v20.0.0; exit 0; }\nexit 97\n')
-        node.chmod(node.stat().st_mode | stat.S_IXUSR)
         with (self.dir / 'conf').open('a') as stream:
-            stream.write("REMOTE_CI_NODE=stall\nREMOTE_CI_INSTALL='mkdir -p node_modules; touch node_modules/ready'\n")
+            stream.write("REMOTE_CI_INSTALL='mkdir -p node_modules; touch node_modules/ready'\n")
         started = time.monotonic()
         self.assert_result(self.start('stuck-cp', force=True, command='touch "$HOME/candidate-ran"'),
                            'stuck-cp', 74)
