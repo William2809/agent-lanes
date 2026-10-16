@@ -325,6 +325,7 @@ class MemoryBackfill(unittest.TestCase):
                     sequence=1, submitted_at=100, deadline=200, requested_workers=1,
                     requested_memory_mb=8192)
             with patch.object(r, 'sample', return_value=metrics), \
+                    patch.object(r, 'processes', return_value=procs), \
                     patch.object(r.time, 'time', side_effect=lambda: clock[0]), \
                     patch.object(r.time, 'sleep', side_effect=lambda _: clock.__setitem__(0, clock[0]+1)):
                 self.assertEqual(r.acquire(queue, 'small', os.getpid(), 111, limits, 1), (1, 2048))

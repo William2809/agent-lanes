@@ -482,6 +482,21 @@ probe, not an application suite.
 
 ## Host scheduler v2 (opt-in; default off)
 
+For a first v1-to-v2 upgrade, keep the v1 selector while intake is frozen and
+existing queued owners drain. Record their run IDs and receipts; do not cancel
+and recreate them. Install only after the installer reports zero owners and
+cleanup blockers, select v2 while still frozen, verify the authority, then thaw.
+Clients already waiting at the intake probe read the new selector after thaw;
+their original wait deadline still applies. A submission racing the freeze before
+it launches is fenced with an explicit retry result; it is not a parked job.
+Subsequent v2 maintenance uses `remote-ci pause` and `remote-ci resume` to preserve
+supported queued runs. Qualify this lifecycle on the target operating system.
+
+V2 owner liveness uses the exact kernel process birth identity when recorded.
+Linux/WSL display start times can drift as the wall-clock boot estimate changes;
+that display string is not a second identity requirement. Cancelled running jobs
+retain their lease for bounded cleanup, and their final result remains cancelled.
+
 Set `AGENT_CI_SCHEDULER=v2` in the execution host config only after review.
 Default is v1. Use the host kit install path above. Freeze submissions, drain
 all runs and maintenance, install a reviewed pinned master revision, then change

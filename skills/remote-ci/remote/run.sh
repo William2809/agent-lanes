@@ -353,7 +353,7 @@ finish() {
     if [ "$scheduler_version" = v2 ]; then
       [ "$locked" != 1 ] || scheduler_cache_release || { rc=74; cleanup_failed=1; }
     else
-      [ "$resource_owned" != 1 ] || cache release --token "$resource_token" || { rc=76; cleanup_failed=1; }
+      [ "$resource_memory" = 0 ] || cache release --token "$resource_token" || { rc=76; cleanup_failed=1; }
       # Early rejection and queue expiry never acquired capacity for a scan.
       # Preserve cache infrastructure errors (74) versus capacity errors (75).
       if [ "$scheduler_version" = v1 ] && [ "$resource_owned" = 1 ] && [ "$resource_memory" -gt 0 ]; then
@@ -363,7 +363,7 @@ finish() {
   fi
   if [ "$cleanup_failed" = 0 ] && [ "$resource_owned" = 1 ]; then
     if [ "$scheduler_version" = v1 ]; then
-      infra_exec cleanup git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null
+      [ "$resource_memory" = 0 ] || infra_exec cleanup git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null
       [ "$?" != 76 ] || cleanup_failed=1
     else
       [ "$locked" != 1 ] || scheduler_exec cleanup git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null || cleanup_failed=1

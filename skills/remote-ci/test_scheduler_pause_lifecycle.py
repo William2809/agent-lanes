@@ -154,3 +154,60 @@ class PauseLifecycle(unittest.TestCase):
         self.control('resume')
         self.assertEqual((self.home/'calls').read_text(), 'savedlater')
         self.assertFalse((self.ci/'freeze').exists())
+
+    def test_upgrade_drains_v1_queue_before_switching_authority(self):
+        """The first v1 upgrade drains saved work; only v2 work can park."""
+        settings = self.home/'.config/agent-lanes/config'
+        settings.write_text('AGENT_CI_SCHEDULER=v1\nAGENT_CI_MAX_JOBS=1\n'
+                            'AGENT_CI_MAX_WORKERS=1\n')
+        sampler = self.bin/'resources.py'
+        sampler.write_text(sampler.read_text().replace("if __name__ == '__main__':",
+            "sample=lambda: dict(cores=8, load=0, available_mb=16000, pressure=1)\nif __name__ == '__main__':"))
+        holder = self.launch('legacy-holder', 'touch "$HOME/holding"; while [ ! -f "$HOME/release" ]; do sleep .1; done')
+        self.wait(lambda: (self.home/'holding').exists())
+        queued = self.launch('legacy-queued', 'printf legacy >> "$HOME/calls"')
+        log = self.project/'logs/legacy-queued.log'
+        self.wait(log.exists)
+        saved = self.project/'runs/legacy-queued'
+        original = {str(path.relative_to(saved)): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in saved.rglob('*') if path.is_file()}
+        self.assertIsNone(queued.poll(), self.evidence())
+        self.assertFalse((self.home/'calls').exists())
+        (self.ci/'freeze').write_text('v1 to v2 upgrade\n')
+        count = subprocess.run(['/bin/bash', str(self.bin/'install-kit.sh'), 'count'],
+                               env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(count.returncode, 0, count.stderr)
+        self.assertGreater(int(count.stdout), 0)
+        self.assertIsNone(queued.poll(), self.evidence())
+        # Already queued work continues unchanged while new intake is frozen.
+        (self.home/'release').touch()
+        self.assertEqual(holder.wait(timeout=40), 0, self.evidence())
+        self.assertEqual(queued.wait(timeout=40), 0, self.evidence())
+        self.assertEqual((self.home/'calls').read_text(), 'legacy')
+        for name, digest in original.items():
+            self.assertEqual(hashlib.sha256((saved/name).read_bytes()).hexdigest(), digest)
+        self.assertEqual((self.project/'results/legacy-queued.exit').read_text(), '0\n')
+        count = subprocess.run(['/bin/bash', str(self.bin/'install-kit.sh'), 'count'],
+                               env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual((count.returncode, count.stdout.strip()), (0, '0'), count.stderr)
+        stage = self.ci/'upgrade-stage'
+        (self.ci/'kits').mkdir()
+        shutil.copytree(self.bin, stage)
+        install = subprocess.run(['/bin/bash', str(self.bin/'install-kit.sh'), 'install',
+                                  str(stage), 'def456', '2', self.sha], env=self.env,
+                                 capture_output=True, text=True, timeout=30)
+        self.assertEqual(install.returncode, 0, install.stdout+install.stderr)
+        self.assertTrue((self.ci/'freeze').exists())
+        settings.write_text('AGENT_CI_SCHEDULER=v2\nAGENT_CI_MAX_JOBS=1\n'
+                            'AGENT_CI_MAX_WORKERS=1\nAGENT_CI_FAST_LANE=1\n')
+        version = subprocess.run(['python3', str(self.ci/'kit/resources.py'), 'scheduler-version'],
+                                 env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual((version.returncode, version.stdout.strip()), (0, 'v2'), version.stderr)
+        (self.ci/'freeze').rename(self.ci/'freeze.last')
+        upgraded = self.launch('new-v2', 'printf new >> "$HOME/calls"')
+        self.assertEqual(upgraded.wait(timeout=40), 0, self.evidence())
+        self.assertEqual((self.home/'calls').read_text(), 'legacynew')
+        row = next(row for row in self.rows().values() if row.get('run_id') == 'new-v2')
+        self.assertEqual(row['version'], 2)
+        self.assertEqual(row['state'], 'finished')
+        self.assertFalse(row.get('workers') or row.get('process') or row.get('groups'))

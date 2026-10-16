@@ -35,6 +35,37 @@ class Scheduler(unittest.TestCase):
         s.schedule(self.data, METRICS if metrics is None else metrics, LIMITS,
                    PROCS if procs is None else procs, now)
 
+    def test_kernel_birth_survives_display_start_time_jitter(self):
+        holder = self.submit('holder', project='shared')
+        queued = self.submit('queued', project='shared')
+        for row in (holder, queued):
+            row['owner_birth'] = '12345'
+        procs = {10: dict(start='shifted display time', birth='12345', group=10, rss=0)}
+        self.tick(procs=procs)
+        self.assertEqual(holder['state'], 'running')
+        self.assertEqual(queued['state'], 'queued')
+        self.assertTrue(r.live(queued, procs))
+        # PID reuse, missing birth and a missing process still fail closed.
+        for other in ({10: dict(start='birth', birth='12346')},
+                      {10: dict(start='birth')}, {}):
+            self.assertFalse(r.live(queued, other))
+        self.tick(now=101, procs={10: dict(start='birth', birth='12346')})
+        self.assertEqual(queued['state'], 'lost')
+        self.assertEqual(queued['result'], 74)
+
+    def test_live_cancelled_owner_keeps_lease_for_cleanup(self):
+        row = self.submit('cancelled')
+        self.tick()
+        row['cancel'] = True
+        self.tick(now=101)
+        self.assertEqual(row['state'], 'running')
+        self.assertEqual(row['workers'], 1)
+        # Finishing cleanup cannot turn the cancelled check green.
+        s.complete(self.data, 'cancelled', 0, 102)
+        self.assertEqual(row['state'], 'finished')
+        self.assertEqual(row['result'], 74)
+        self.assertNotIn('workers', row)
+
     def test_atomic_grant_and_project_slots(self):
         self.submit('a', project='p', slots=1, leases=['template:p'])
         self.submit('b', project='p', slots=1)

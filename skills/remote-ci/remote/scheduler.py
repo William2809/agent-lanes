@@ -232,7 +232,10 @@ def schedule(data, metrics, limits, procs, now):
             # The pause controller owns result publication and launcher reaping.
             # A starting row may still own a live pre-admission process tree.
             continue
-        if row.get('cancel') and not row.get('process') and not row.get('groups'):
+        # A live running owner must retain its lease through bounded cleanup.
+        # Completing between its cancelled check and cleanup loses the grant.
+        if (row.get('cancel') and not row.get('process') and not row.get('groups')
+                and (state != 'running' or not resources.live(row, procs))):
             complete(data, token, 74, now, state == 'running' and needs_cleanup(row))
             continue
         if not resources.live(row, procs):

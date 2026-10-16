@@ -73,7 +73,7 @@ def run(queue, token, phase, seconds, marker, command):
     try:
         with queue.transaction() as data:
             row = data['jobs'][token]
-            if row['state'] != 'running' or row.get('cancel'):
+            if row['state'] != 'running' or (row.get('cancel') and phase != 'cleanup'):
                 return 74
             generation, memory = row['lease_generation'], row['memory_mb']
             if phase not in ('cleanup', 'maintenance'):
@@ -106,7 +106,7 @@ def run(queue, token, phase, seconds, marker, command):
         phase_deadline = time.monotonic() + seconds
         with queue.transaction() as data:
             row = data['jobs'][token]
-            if row['state'] != 'running' or row['lease_generation'] != generation or row.get('cancel'):
+            if row['state'] != 'running' or row['lease_generation'] != generation or (row.get('cancel') and phase != 'cleanup'):
                 return 74
             # Commit potential side effects before opening the child's execution gate.
             row.update(process=record, phase=phase, touched=True)
@@ -129,7 +129,7 @@ def run(queue, token, phase, seconds, marker, command):
             with queue.transaction() as data:
                 row = data['jobs'].get(token, {})
                 owner = procs.get(row.get('owner'), {})
-                if (row.get('lease_generation') != generation or row.get('cancel') or
+                if (row.get('lease_generation') != generation or (row.get('cancel') and phase != 'cleanup') or
                         owner.get('birth') != row.get('owner_birth') or interrupted[0]):
                     reason = 74
                 else:
@@ -163,7 +163,7 @@ def run(queue, token, phase, seconds, marker, command):
             with queue.transaction() as data:
                 row = data['jobs'].get(token, {})
                 if row.get('lease_generation') == record['generation']:
-                    if row.get('cancel') and code == 0:
+                    if row.get('cancel') and code == 0 and phase != 'cleanup':
                         code = 74
                     if clean:
                         row.get('groups', {}).pop(str(record['group']), None)
@@ -199,7 +199,8 @@ def reconcile(queue):
             if dead or row.get('cancel'):
                 row['cancel'] = True
                 for record in row.get('groups', {}).values():
-                    candidates.append((token, row['lease_generation'], dict(record)))
+                    if dead or record.get('phase') != 'cleanup':
+                        candidates.append((token, row['lease_generation'], dict(record)))
     for token, generation, record in candidates:
         clean = reap(record)
         with queue.transaction() as data:
