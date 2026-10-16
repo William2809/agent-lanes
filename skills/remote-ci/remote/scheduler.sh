@@ -14,11 +14,14 @@ scheduler_admit() {
   receipt profile "$resource_profile"
   resource_owned=1
   echo "== resources queued scheduler=v2"
+  adopt=(); [ "$resume_mode" != resume ] || adopt=(--park-adopt)
   allocation=$(python3 "$runner_dir/resources.py" acquire --token "$resource_token" --owner "$$" \
     --deadline "$wait_deadline" --mode "$resource_mode" --request-file "$request" \
+    --park-envelope "$resume_hash" --park-nonce "$resume_nonce" ${adopt[@]+"${adopt[@]}"} \
     ${first_submitted:+--submitted "$first_submitted"}); resource_rc=$?
   # 78 means a followed execution passed. It is not a grant to execute.
-  # 79: a pool client withdrew this queued run to move it to another runner. Nothing ran.
+  # 79 moves; 80 parks without publishing a terminal result.
+  [ "$resource_rc" != 80 ] || parked_exit
   [ "$resource_rc" != 78 ] || finish 0
   [ "$resource_rc" = 0 ] || finish "$resource_rc"
   read -r resource_workers resource_memory slot resource_predicted scheduler_job_deadline scheduler_lane <<<"$allocation"

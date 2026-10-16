@@ -174,9 +174,17 @@ else
   env_file=$dir/env.local
 fi
 sha=$2 tree=$3 run=$4
+resource_token=${10:-"$project-$run-$$"}
+resume_mode=${11:-}
+resume_nonce=${12:-}
 # Pool launches carry one durable generation; duplicate delivery cannot execute twice.
 if [ -n "${8:-}" ]; then
-  python3 "$runner_dir/platform_info.py" fence "$runner_dir/../assignment.started" "$8" || exit 3
+  if [ "$resume_mode" = resume ]; then
+    python3 "$runner_dir/resources.py" verify-resume --token "$resource_token" --owner "$$" --park-nonce "$resume_nonce" || exit 80
+    python3 "$runner_dir/platform_info.py" verify-fence "$runner_dir/../assignment.started" "$8" || exit 3
+  else
+    python3 "$runner_dir/platform_info.py" fence "$runner_dir/../assignment.started" "$8" || exit 3
+  fi
 fi
 command=$(printf '%s' "${5:-}" | platform_decode 2>/dev/null)
 database_config_error=0
@@ -196,7 +204,6 @@ if [ -n "$command" ] && [ -n "${REMOTE_CI_NO_DB_COMMANDS:-}" ]; then
 fi
 force=${6:-0}
 resource_mode=${7:-runner}
-resource_token="$project-$run-$$"
 resource_owned=0 resource_memory=0
 scheduler_version=v1
 cache() {
@@ -224,7 +231,7 @@ cache_delete() {
   fi
 }
 log=$dir/logs/$run.log
-exec >"$log" 2>&1
+if [ "$resume_mode" = resume ]; then exec >>"$log" 2>&1; else exec >"$log" 2>&1; fi
 [ -z "$exclusive_notice" ] || echo "$exclusive_notice"
 submitted=$(date +%s) first_submitted=""; launched=$submitted
 # A pool move (arg 9) keeps the first submission time: queue age and total wait survive it.
@@ -296,6 +303,14 @@ stop_watchdog() {
   done
   wait "$watchdog" 2>/dev/null || true
   watchdog=""
+}
+parked_exit() {
+  trap '' HUP INT TERM
+  resource_owned=0
+  kill -TERM "$receipt_sampler" 2>/dev/null || true
+  wait "$receipt_sampler" 2>/dev/null || true
+  echo "== parked for maintenance"
+  exit 0
 }
 finish() {
   local rc=${1:-1} cleanup_start published=0 claim_pid="" claim_run=""
@@ -475,6 +490,38 @@ pending_cleanup() {
 scheduler_version=$(python3 "$runner_dir/resources.py" scheduler-version) || finish 74
 if [ "$scheduler_version" = v2 ]; then
   . "$runner_dir/scheduler.sh" || finish 74
+  # Bind the saved envelope to the exact identity used by admission.
+  [ "$cache_identity" = 1 ] || tree=uncached-$run
+  resume_envelope=$dir/runs/$run/resume.json
+  resume_hash=""
+  # Old protocol-2 invocations remain drain-only. Only a client that advertised
+  # a complete pinned run directory can promise durable park/resume.
+  if [ "$resume_mode" = resume ] || { [ -f "$runner_dir/../submission.json" ] &&
+      python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("park_version") == 1 else 1)' "$runner_dir/../submission.json"; }; then
+  if [ "$resume_mode" != resume ]; then
+    python3 - "$resume_envelope.new" "$project" "$sha" "$tree" "$run" "${5:-}" "$force" "$resource_mode" "${8:-}" "$submitted" "$resource_token" "$wait_deadline" <<'PY'
+import json, os, sys
+import hashlib
+from pathlib import Path
+path, *values = sys.argv[1:]
+root = Path(path).parent
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+manifest = hashlib.sha256()
+for item in sorted((root/'bin').iterdir(), key=lambda value: value.name):
+    if item.is_file():
+        manifest.update(item.name.encode() + b'\0' + bytes.fromhex(sha(item)))
+record = dict(version=1, argv=values[:9], token=values[9], deadline=int(values[10]),
+              config_sha256=sha(root/'conf'), kit_sha256=manifest.hexdigest())
+with open(path, 'w') as stream:
+    json.dump(record, stream, separators=(',', ':'))
+os.chmod(path, 0o600)
+PY
+    mv "$resume_envelope.new" "$resume_envelope" || finish 74
+  fi
+  resume_hash=$(shasum -a 256 "$resume_envelope" 2>/dev/null | awk '{print $1}')
+  [ "${#resume_hash}" = 64 ] || finish 74
+  fi
 else
   bounded_wrap_database
 fi

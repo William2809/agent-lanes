@@ -103,6 +103,12 @@ def main():
             return 0
         except FileExistsError:
             return 3
+    if action == 'verify-fence':
+        # Resumed work retains its original pool assignment fence.
+        try:
+            return 0 if Path(sys.argv[2]).read_text() == sys.argv[3] + '\n' else 3
+        except OSError:
+            return 3
     if action == 'time':
         result = subprocess.run(sys.argv[2:])
         usage = resource.getrusage(resource.RUSAGE_CHILDREN)

@@ -11,5 +11,6 @@ branch = subprocess.run(['git', '-C', root, 'symbolic-ref', '--quiet', '--short'
                         capture_output=True, text=True)
 lane = branch.stdout.strip() if branch.returncode == 0 else 'worktree-' + hashlib.sha256(root.encode()).hexdigest()[:16]
 print(json.dumps(dict(schema='agent-ci.submission/v1', protocol=2, lane=lane,
+                      park_version=1,
                       generation=time.time_ns(), task=os.environ.get('REMOTE_CI_TASK', ''),
                       landing=target != 'HEAD')))

@@ -23,14 +23,15 @@ remote-ci log [-C n] <regex>                                           grep the 
 remote-ci info                                                         one-line route, ssh command, ports, paths (cheap lookup)
 remote-ci setup [runner]                                               prepare a named runner for this project
 remote-ci init                                                         add .remote-ci.conf + pre-push hook here
-remote-ci freeze [reason] | thaw                                       hold new checks on the runner (running ones finish) / resume
+remote-ci freeze [reason] | thaw                                       hold new checks on the runner / resume intake
+remote-ci pause [reason] | resume                                      park supported queued v2 checks / resume them
 remote-ci install-runner                                               freeze, wait for running checks, install this master kit as the host kit, thaw
 Exit codes: see ../SKILL.md (check, infrastructure, busy, cleanup).
 USAGE
 }
 cmd=${1:-}; shift || true
 [ "$cmd" = init ] && exec bash "$kit/bin/remote-ci-init" "$@"
-case "$cmd" in check | fail | blame | status | setup | info | log | freeze | thaw | install-runner) ;; *) usage; exit 2 ;; esac
+case "$cmd" in check | fail | blame | status | setup | info | log | freeze | thaw | pause | resume | install-runner) ;; *) usage; exit 2 ;; esac
 # Runner protocol this client speaks. A runner with a host kit (~/ci/kit, see install-runner) refuses pushes
 # from older clients (remote/pre-receive.sh), so one admission protocol runs on the runner at a time.
 protocol=2
@@ -132,7 +133,7 @@ router=""
 alias_opt=(); [ -n "${REMOTE_CI_HOSTKEY_ALIAS:-}" ] && alias_opt=(-o "HostKeyAlias=$REMOTE_CI_HOSTKEY_ALIAS")
 if [ "${CI_RUNNERS+x}" = x ]; then
   # Host-wide admin must never act on a scored runner, and the project's needs do not apply to it.
-  case "$cmd" in freeze | thaw | install-runner)
+  case "$cmd" in freeze | thaw | pause | resume | install-runner)
     [ -n "$requested_runner" ] || { echo "remote-ci: CI_RUNNERS is set; name the runner: REMOTE_CI_RUNNER=<name> remote-ci $cmd" >&2; exit 2; }
     REMOTE_CI_NEEDS="" env_needs="" ;;
   esac
@@ -142,7 +143,7 @@ if [ "${CI_RUNNERS+x}" = x ]; then
   pool_args=(--project "$REMOTE_CI_NAME")
   [ -z "$requested_runner" ] || pool_args+=(--runner "$requested_runner")
   # Setup and admin need only a reachable host, not the project or an open queue.
-  case "$cmd" in setup | freeze | thaw | install-runner) pool_args+=(--setup) ;; esac
+  case "$cmd" in setup | freeze | thaw | pause | resume | install-runner) pool_args+=(--setup) ;; esac
   if [ "$cmd" = check ]; then
     assignment_job=$(openssl rand -hex 16) || exit 3
     pool_args+=(--job "$assignment_job")
@@ -198,6 +199,13 @@ wait_remote() {
     await_file() {
       while [ ! -f \"\$1\" ]; do
         if [ \"\$(date +%s)\" -ge \"\$deadline\" ]; then
+          if [ -f ~/ci/pause.json ]; then
+            python3 ~/ci/kit/scheduler_pause.py expire '$REMOTE_CI_NAME' '$run'; expire_rc=\$?
+            if [ "\$expire_rc" = 75 ]; then
+              echo 'busy: run $run reached its original deadline while parked for maintenance'
+              exit 75
+            fi
+          fi
           echo 'lost-run: run $run total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds (log $p/logs/$run.log)'
           exit 74
         fi
@@ -218,12 +226,12 @@ wait_remote() {
     done
     kill -TERM -"$2" 2>/dev/null
     sleep 1; kill -KILL -"$2" 2>/dev/null
-  ' _ "$wait_deadline" "$wait_child" &
+  ' _ "$((wait_deadline + 2))" "$wait_child" &
   wait_watchdog=$!
   wait "$wait_child" 2>/dev/null; rc=$?
   kill -TERM -"$wait_watchdog" 2>/dev/null || kill -TERM "$wait_watchdog" 2>/dev/null
   wait "$wait_watchdog" 2>/dev/null
-  if [ "$rc" != 0 ] && [ "$rc" != 74 ] && [ "$(date +%s)" -ge "$wait_deadline" ]; then
+  if [ "$rc" != 0 ] && [ "$rc" != 74 ] && [ "$rc" != 75 ] && [ "$(date +%s)" -ge "$wait_deadline" ]; then
     echo "lost-run: run $run total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds (log $p/logs/$run.log)"
     return 74
   fi
@@ -325,6 +333,16 @@ thaw)
   echo "remote-ci: runner thawed; waiting checks continue"
   exit 0
   ;;
+pause)
+  printf '%s\n' "${*:-maintenance}" | remote "s=~/ci/kit/scheduler_pause.py; [ -f \$s ] || { echo 'remote-ci: installed kit does not support durable pause' >&2; exit 75; }; python3 \$s pause" || exit $?
+  echo "remote-ci: intake paused; compatible queued v2 checks are parking"
+  exit 0
+  ;;
+resume)
+  remote "s=~/ci/kit/scheduler_pause.py; [ -f \$s ] || { echo 'remote-ci: installed kit does not support durable resume' >&2; exit 75; }; python3 \$s resume" || exit $?
+  echo "remote-ci: parked checks resumed; any pre-existing manual freeze is preserved"
+  exit 0
+  ;;
 install-runner)
   # Only reviewed code becomes the host kit: a clean master checkout of this kit.
   branch=$(git -C "$kit" rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -371,7 +389,7 @@ log)
   exit $?
   ;;
 status)
-  remote "s=~/ci/kit/status.sh; [ -f \$s ] || s=~/ci/bin/status.sh; bash \$s $REMOTE_CI_NAME '$route' ${REMOTE_CI_SLOTS:-1} ${REMOTE_CI_EXCLUSIVE:-0}"
+  remote "s=~/ci/kit/status.sh; [ -f \$s ] || s=~/ci/bin/status.sh; bash \$s $REMOTE_CI_NAME '$route' ${REMOTE_CI_SLOTS:-1} ${REMOTE_CI_EXCLUSIVE:-0}; p=~/ci/kit/scheduler_pause.py; [ ! -f \$p ] || python3 \$p status"
   exit $?
   ;;
 esac

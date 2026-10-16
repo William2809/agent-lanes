@@ -66,6 +66,8 @@ def main():
                    slots=int(os.environ.get('SCHEDULER_SLOTS', '1')), workers=workers,
                    memory_mb=max(memory_floor, max(floor, model['predicted_mb']) + (2048 if postgres else 0)),
                    leases=sorted(set(leases)), cleanup_required=bool(postgres), **model)
+    if meta.get('park_version') == 1:
+        request['park_version'] = 1
     scheduler.validate(request)
     print(json.dumps(request))
 
