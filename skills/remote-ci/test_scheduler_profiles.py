@@ -52,7 +52,8 @@ class SchedulerProfiles(unittest.TestCase):
         row = dict(project='project', command_digest=self.digest,
                    profile_context=self.context, workers=1, memory_mb=1536, leases=[],
                    profile_known=True, predicted_s=1, estimate_scope='job',
-                   samples=999, source='caller', profile='f' * 64, predicted_mb=1)
+                   memory_known=True, samples=999, source='caller',
+                   profile='f' * 64, predicted_mb=1)
         row.update(changes)
         return row
 
@@ -99,6 +100,7 @@ class SchedulerProfiles(unittest.TestCase):
                                                      service=service))
         result = self.p.read_model(self.root, 'project', self.profile, 512)
         self.assertTrue(result['profile_known'])
+        self.assertTrue(result['memory_known'])
         self.assertEqual(result['samples'], 5)
         self.assertEqual(result['predicted_s'], 62.5)
         self.assertEqual(result['predicted_mb'], 512)
@@ -112,6 +114,7 @@ class SchedulerProfiles(unittest.TestCase):
         (self.directory / 'truncated.json').write_text('{"project":')
         result = self.p.read_model(self.root, 'project', self.profile, 512)
         self.assertFalse(result['profile_known'])
+        self.assertFalse(result['memory_known'])
         self.assertEqual(result['samples'], 0)
         self.assertIsNone(result['predicted_s'])
 
@@ -123,13 +126,33 @@ class SchedulerProfiles(unittest.TestCase):
             self.write('after-%d.json' % index, self.row(started=300 + index))
         result = self.p.read_model(self.root, 'project', self.profile, 512)
         self.assertFalse(result['profile_known'])
+        self.assertTrue(result['memory_known'])
         self.assertEqual(result['samples'], 4)
+
+    def test_one_complete_success_allows_bounded_memory_without_fast_runtime(self):
+        self.write('success.json', self.row(peak=100 * 1048576))
+        result = self.p.read_model(self.root, 'project', self.profile, 1024)
+        self.assertTrue(result['memory_known'])
+        self.assertFalse(result['profile_known'])
+        self.assertEqual(result['samples'], 1)
+        self.assertIsNone(result['predicted_s'])
+        self.assertEqual(result['predicted_mb'], 1024)
+
+    def test_failure_revokes_memory_confidence_but_keeps_high_peak(self):
+        self.write('success.json', self.row(started=100, peak=100 * 1048576))
+        self.write('failure.json', self.row(started=200, code=137,
+                                            peak=5 * 1024 * 1048576))
+        result = self.p.read_model(self.root, 'project', self.profile, 1024)
+        self.assertFalse(result['memory_known'])
+        self.assertFalse(result['profile_known'])
+        self.assertEqual(result['predicted_mb'], 6656)
 
     def test_failed_peak_is_retained_as_memory_lower_bound(self):
         self.write('oom.json', self.row(code=137, peak=8 * 1024 * 1048576))
         result = self.p.read_model(self.root, 'project', self.profile, 1024)
         self.assertEqual(result['predicted_mb'], 10496)
         self.assertFalse(result['profile_known'])
+        self.assertFalse(result['memory_known'])
 
     def test_queue_delay_is_excluded_and_check_duration_is_not_used(self):
         for index in range(5):
@@ -151,6 +174,7 @@ class SchedulerProfiles(unittest.TestCase):
             self.write('%d.json' % index, row)
         result = self.p.read_model(self.root, 'project', self.profile, 768)
         self.assertFalse(result['profile_known'])
+        self.assertFalse(result['memory_known'])
         self.assertEqual(result['predicted_mb'], 768)
 
     def test_explicit_killed_and_incomplete_flags_reset_successes(self):
@@ -163,8 +187,9 @@ class SchedulerProfiles(unittest.TestCase):
                 stopped = self.row(started=200, profile=profile)
                 stopped[flag] = True
                 self.write('%s-stopped.json' % flag, stopped)
-                self.assertFalse(self.p.read_model(
-                    self.root, 'project', profile, 512)['profile_known'])
+                result = self.p.read_model(self.root, 'project', profile, 512)
+                self.assertFalse(result['profile_known'])
+                self.assertFalse(result['memory_known'])
 
     def test_invalid_project_and_nonfinite_floor_are_rejected(self):
         for project in ('../project', 'project/path', ''):
@@ -195,6 +220,7 @@ class SchedulerProfiles(unittest.TestCase):
     def test_authorize_denies_forged_known_claim_without_receipts(self):
         result = self.p.authorize(self.request(), self.root, self.limits)
         self.assertFalse(result['profile_known'])
+        self.assertFalse(result['memory_known'])
         self.assertIsNone(result['predicted_s'])
         self.assertEqual(result['samples'], 0)
         self.assertEqual(result['source'], 'unknown')
@@ -209,13 +235,16 @@ class SchedulerProfiles(unittest.TestCase):
             with self.subTest(change=change):
                 result = self.p.authorize(self.request(**change), self.root, self.limits)
                 self.assertFalse(result['profile_known'])
+                self.assertFalse(result['memory_known'])
                 self.assertIsNone(result['predicted_s'])
+                self.assertEqual(result['memory_mb'], 4096)
 
     def test_authorize_valid_trusted_history_allows_fast_classification(self):
         profile = self.trusted_history()
         result = self.p.authorize(self.request(), self.root, self.limits)
         self.assertEqual(result['profile'], profile)
         self.assertTrue(result['profile_known'])
+        self.assertTrue(result['memory_known'])
         self.assertEqual(result['predicted_s'], 25)
         self.assertEqual(result['estimate_scope'], 'job')
         self.assertEqual(result['source'], 'receipts')
@@ -226,6 +255,7 @@ class SchedulerProfiles(unittest.TestCase):
                 request = self.request(profile_context=context, memory_mb=6144)
                 result = self.p.authorize(request, self.root, self.limits)
                 self.assertFalse(result['profile_known'])
+                self.assertFalse(result['memory_known'])
                 self.assertIsNone(result['profile'])
                 self.assertEqual(result['memory_mb'], 6144)
 
@@ -242,6 +272,28 @@ class SchedulerProfiles(unittest.TestCase):
             self.request(memory_mb=512, leases=['postgres:main']), self.root, self.limits)
         self.assertEqual(database['profile'], db_profile)
         self.assertGreaterEqual(database['memory_mb'], database['predicted_mb'] + 2048)
+
+    def test_authorize_one_success_reduces_unknown_floor_but_keeps_all_floors(self):
+        profile = self.p.key('project', self.digest, self.context, 1, False)
+        self.write('one.json', self.row(profile=profile, workers=1,
+                                        peak=100 * 1048576))
+        learned = self.p.authorize(self.request(memory_mb=512), self.root, self.limits)
+        self.assertTrue(learned['memory_known'])
+        self.assertFalse(learned['profile_known'])
+        self.assertEqual(learned['memory_mb'], 1024)
+
+        project_floor = self.p.authorize(self.request(memory_mb=3072), self.root,
+                                         self.limits)
+        self.assertEqual(project_floor['memory_mb'], 3072)
+
+        db_profile = self.p.key('project', self.digest, self.context, 1, True)
+        self.write('db-one.json', self.row(profile=db_profile, workers=1,
+                                           peak=100 * 1048576))
+        database = self.p.authorize(
+            self.request(memory_mb=512, leases=['postgres:main']), self.root, self.limits)
+        self.assertFalse(database['profile_known'])
+        self.assertTrue(database['memory_known'])
+        self.assertEqual(database['memory_mb'], 3072)
 
     def test_authorize_rejects_budget_above_maximum_instead_of_lowering(self):
         limits = dict(self.limits, MAX_JOB_MB=4096)
