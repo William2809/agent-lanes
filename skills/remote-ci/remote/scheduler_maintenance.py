@@ -52,7 +52,8 @@ def main():
         with queue.transaction() as data:
             scheduler_legacy.import_cleanup(data, root, time.time())
             tokens = [t for t, r in data['jobs'].items()
-                      if r.get('project') == path.parent.parent.name and r.get('run_id') == path.stem]
+                      if r.get('project') == path.parent.parent.name and
+                      r.get('run_id') == path.stem and r.get('state') == 'quarantined']
         if not tokens:
             return 76
         action, sys.argv[2] = 'recover', tokens[0]

@@ -16,6 +16,7 @@ fixtures.KIT = KIT
 host_fixtures.KIT = KIT
 sys.path.insert(0, str(KIT/'remote'))
 import resources as r
+import scheduler_legacy
 import scheduler_maintenance as maintenance
 import scheduler_process as supervisor
 
@@ -148,6 +149,59 @@ class Migration(unittest.TestCase):
             with queue.transaction() as data:
                 data['jobs']['old']['state'] = 'finished'
             self.assertEqual(r.scheduler_version(), 'v1')
+
+    def test_terminal_failed_row_imports_pending_cleanup_and_preserves_receipt(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, HOME=temp):
+            base = Path(temp)/'ci/projects/fixture/results'
+            base.mkdir(parents=True)
+            pending = base/'cancelled.cleanup'
+            pending.write_text('slot=1\n')
+            receipt = Path(temp)/'ci/receipts/fixture/cancelled.json'
+            receipt.parent.mkdir(parents=True)
+            receipt.write_text('{"exit_code":74,"complete":false}')
+            queue = r.Queue()
+            with queue.transaction() as data:
+                data['sequence'] = 8
+                data['jobs']['cancelled-token'] = dict(
+                    version=2, protocol=2, project='fixture', run_id='cancelled',
+                    sequence=8, lease_generation=8, owner=0, start='', phase='check',
+                    state='finished', result=74, groups={}, requested=dict(
+                        slots=1, workers=1, memory_mb=4096, leases=[]))
+                scheduler_legacy.import_cleanup(data, Path(temp)/'ci', 100)
+                row = data['jobs']['cancelled-token']
+                self.assertEqual(len(data['jobs']), 1)
+                self.assertEqual((row['state'], row['phase'], row['result']),
+                                 ('quarantined', 'cleanup', 74))
+                self.assertEqual(row['quarantined_leases'],
+                                 ['cleanup:fixture', 'template:fixture'])
+            with patch.object(sys, 'argv', ['scheduler_maintenance.py', 'recover-file', str(pending)]), \
+                    patch.object(r, 'acquire_v2', return_value=dict(workers=1)) as acquire, \
+                    patch.object(supervisor, 'run', return_value=0):
+                self.assertEqual(maintenance.main(), 0)
+                self.assertEqual(acquire.call_args[0][5]['recovery_of'], 'cancelled-token')
+            with queue.transaction() as data:
+                row = data['jobs']['cancelled-token']
+                self.assertEqual((row['state'], row['result']), ('finished', 74))
+            self.assertEqual(receipt.read_text(), '{"exit_code":74,"complete":false}')
+            self.assertTrue(pending.with_suffix('.recovered').exists())
+
+    def test_pending_cleanup_does_not_replace_active_matching_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)/'ci'
+            pending = root/'projects/fixture/results/active.cleanup'
+            pending.parent.mkdir(parents=True)
+            pending.write_text('slot=1\n')
+            for owned in ({'groups': {'1': {'birth': 'live'}}}, {'workers': 1},
+                          {'memory_mb': 4096}, {'process': {'group': 1, 'generation': 1}},
+                          {'quarantined_leases': ['cleanup:fixture']}):
+                with self.subTest(owned=next(iter(owned))):
+                    data = dict(sequence=1, jobs={'active': dict(
+                        version=2, project='fixture', run_id='active', state='finished',
+                        result=74, requested=dict(slots=1, workers=1, memory_mb=4096,
+                                                  leases=[]), **owned)})
+                    scheduler_legacy.import_cleanup(data, root, 100)
+                    self.assertEqual(data['jobs']['active']['state'], 'finished')
+                    self.assertEqual(len(data['jobs']), 1)
 
     def test_grant_checks_authority_again_inside_transaction(self):
         limits = dict(MAX_JOBS=2, MAX_WORKERS=4, CPU_RESERVE=1,
@@ -285,7 +339,7 @@ class MemoryBackfill(unittest.TestCase):
 class SubmissionGating(unittest.TestCase):
     setUp = host_fixtures.HostKit.setUp
     git = host_fixtures.HostKit.git
-    remote_ci = host_fixtures.HostKit.remote_ci
+    mini_ci = host_fixtures.HostKit.mini_ci
     host_kit = host_fixtures.HostKit.host_kit
 
     def runnable_host(self):
@@ -298,7 +352,7 @@ class SubmissionGating(unittest.TestCase):
     def test_default_v1_skips_metadata_helper_upload_and_ledger(self):
         self.runnable_host()
         (self.kit/'remote/scheduler_submit.py').write_text('raise SystemExit(93)\n')
-        call = self.remote_ci('check', '--summary')
+        call = self.mini_ci('check', '--summary')
         self.assertEqual(call.returncode, 0, call.stdout + call.stderr)
         self.assertTrue((self.home/'push-args').exists())
         self.assertEqual(list(self.project.glob('runs/*/submission.json*')), [])
@@ -309,7 +363,7 @@ class SubmissionGating(unittest.TestCase):
         config = self.home/'.config/agent-lanes/config'
         config.parent.mkdir(parents=True)
         config.write_text('AGENT_CI_SCHEDULER=v2\n')
-        call = self.remote_ci('check', '--summary')
+        call = self.mini_ci('check', '--summary')
         self.assertEqual(call.returncode, 0, call.stdout + call.stderr)
         submissions = list(self.project.glob('runs/*/submission.json'))
         self.assertEqual(len(submissions), 1)
