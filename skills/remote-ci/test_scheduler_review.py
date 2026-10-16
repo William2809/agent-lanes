@@ -339,7 +339,7 @@ class MemoryBackfill(unittest.TestCase):
 class SubmissionGating(unittest.TestCase):
     setUp = host_fixtures.HostKit.setUp
     git = host_fixtures.HostKit.git
-    mini_ci = host_fixtures.HostKit.mini_ci
+    remote_ci = host_fixtures.HostKit.remote_ci
     host_kit = host_fixtures.HostKit.host_kit
 
     def runnable_host(self):
@@ -352,7 +352,7 @@ class SubmissionGating(unittest.TestCase):
     def test_default_v1_skips_metadata_helper_upload_and_ledger(self):
         self.runnable_host()
         (self.kit/'remote/scheduler_submit.py').write_text('raise SystemExit(93)\n')
-        call = self.mini_ci('check', '--summary')
+        call = self.remote_ci('check', '--summary')
         self.assertEqual(call.returncode, 0, call.stdout + call.stderr)
         self.assertTrue((self.home/'push-args').exists())
         self.assertEqual(list(self.project.glob('runs/*/submission.json*')), [])
@@ -363,7 +363,7 @@ class SubmissionGating(unittest.TestCase):
         config = self.home/'.config/agent-lanes/config'
         config.parent.mkdir(parents=True)
         config.write_text('AGENT_CI_SCHEDULER=v2\n')
-        call = self.mini_ci('check', '--summary')
+        call = self.remote_ci('check', '--summary')
         self.assertEqual(call.returncode, 0, call.stdout + call.stderr)
         submissions = list(self.project.glob('runs/*/submission.json'))
         self.assertEqual(len(submissions), 1)
