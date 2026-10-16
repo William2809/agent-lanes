@@ -122,6 +122,18 @@ check stays queued where it is. `REMOTE_CI_MOVE=0` turns moves off; a check that
 names its runner (`REMOTE_CI_RUNNER`) never moves. `REMOTE_CI_MOVE_GAP` (seconds
 between the two probes, default 5) exists for test fixtures.
 
+Automatic routing can be enabled for selected projects through host settings
+`CI_ROUTE_POLICY` (a JSON file) and `CI_ROUTE_RUNNERS` (the same registry syntax).
+The policy uses `{"version":1,"projects":{"example":{"default_needs":["macos"],
+"commands":{"pnpm check:full":[]}}}}`. Every project needs a nonempty fallback.
+Only exact reviewed commands receive their mapped capabilities; unknown commands,
+including added shell operators, use the fallback. Explicit project and environment
+needs are always added. Unlisted projects keep their existing route. Parse check
+arguments before routing, and provision/qualify a project on each destination before
+adding portable commands. Malformed policy refuses routing. Existing already-launched
+clients keep their old implementation; new submissions from existing sessions use
+updated entry points. A running execution never transfers.
+
 When the pool is configured, host administration must name the device:
 `REMOTE_CI_RUNNER=mac remote-ci install-runner`, `freeze`, or `thaw`. To temporarily
 exclude a runner, set `CI_RUNNER_linux_ENABLED=0` on the submitting machine.
@@ -513,7 +525,7 @@ External host load can still change.
 The versioned submission file is `runs/RUN/submission.json`. It contains
 `schema=agent-ci.submission/v1`, `protocol=2`, `lane`, `task`, `generation`, and
 `landing`. Positional argument 8 is unchanged and reserved for pool use.
-Positional argument 9 is a moved check's first submission time: queue age and the
+Positional argument 9 is the original first submission time: queue age and the
 wait deadline count from it, and the queue row's `submitted_at` keeps it.
 The host builds `agent-ci.request/v1` from that file and the trusted run config.
 It adds project, sha, tree, mode, command digest, run ID, and requested resources.

@@ -359,7 +359,14 @@ home=$FAKE_HOSTS/$1; shift
 [ -d "$home" ] || exit 255
 command="$*"
 command=${command/#git-receive-pack /git receive-pack }
-cd "$home" && HOME=$home exec /bin/bash -c "$command"
+cd "$home" || exit 1
+export HOME=$home
+# Model the SSH server's separate process group for detached run launch. Other
+# transports stay attached so the hung-push fixture exercises inherited pipes.
+case "$command" in
+  *'nohup bash '*) exec python3 -c 'import subprocess,sys; sys.exit(subprocess.Popen(["/bin/bash","-c",sys.argv[1]], start_new_session=True).wait())' "$command" ;;
+  *) exec /bin/bash -c "$command" ;;
+esac
 '''
 
 
@@ -402,7 +409,7 @@ class Client(unittest.TestCase):
         (tools / 'ssh').write_text(SSH)
         (tools / 'ssh').chmod(0o755)
         (root / 'config').write_text('CI_RUNNERS="a=a-route:unit b=b-route:unit"\n')
-        self.conf = 'REMOTE_CI_NAME=fixture\nREMOTE_CI_NEEDS=unit\nREMOTE_CI_CHECK="echo full"\n'
+        self.conf = 'REMOTE_CI_NAME=fixture\nREMOTE_CI_NEEDS=unit\nREMOTE_CI_WAIT_TIMEOUT=30\nREMOTE_CI_CHECK="echo full"\n'
         (self.repo / '.remote-ci.conf').write_text(self.conf)
         self.env = dict(os.environ, HOME=str(root), AGENT_LANES_CONFIG=str(root / 'absent'),
                         PATH=str(tools) + os.pathsep + os.environ['PATH'], FAKE_HOSTS=str(self.hosts),
@@ -477,6 +484,29 @@ class Client(unittest.TestCase):
         self.assertEqual(first[1], second[1])
         self.assertEqual(first[8], second[8])
 
+    def test_host_policy_routes_only_exact_portable_commands(self):
+        for command, extra, expected in ((None, {}, 'b'), ('echo targeted', {}, 'b'),
+                ('echo targeted && echo unknown', {}, 'a'),
+                ('echo targeted', {'REMOTE_CI_NEEDS': 'macos'}, 'a')):
+            with self.subTest(command=command, extra=extra):
+                self.hosts = Path(tempfile.mkdtemp(dir=self.temp.name))
+                self.env['FAKE_HOSTS'] = str(self.hosts)
+                self.host('a', 'v1', 100)
+                self.host('b', 'v1', 0)
+                policy = Path(self.temp.name) / 'routing.json'
+                policy.write_text(json.dumps({'version': 1, 'projects': {'fixture': {
+                    'default_needs': ['macos'],
+                    'commands': {'echo full': [], 'echo targeted': []}}}}))
+                (Path(self.temp.name) / 'config').write_text(
+                    'CI_ROUTE_POLICY="%s"\nCI_ROUTE_RUNNERS="a=a-route:unit:macos b=b-route:unit"\n' % policy)
+                args = ('--summary', '--force')
+                if command is not None:
+                    args += ('--run', command)
+                result = self.check(*args, **extra)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(self.read(expected, 'run.args'))
+                self.assertEqual(self.read('a' if expected == 'b' else 'b', 'run.args'), '')
+
     def test_no_move_from_v1_source_or_when_disabled(self):
         for scheduler, env in (('v1', {}), ('v2', {'REMOTE_CI_MOVE': '0'})):
             with self.subTest(scheduler=scheduler, env=env):
@@ -504,6 +534,7 @@ class Client(unittest.TestCase):
         a = self.host('a', 'v2', 0)
         hook = a / 'ci/projects/fixture/repo.git/hooks/pre-receive'
         hook.write_text('#!/bin/sh\ncat >/dev/null\nsleep 40 & child=$!; echo "$child" >"$HOME/pipe-child"; wait "$child"\n')
+        (self.repo / '.remote-ci.conf').write_text(self.conf.replace('REMOTE_CI_WAIT_TIMEOUT=30', 'REMOTE_CI_WAIT_TIMEOUT=8'))
         start = time.monotonic()
         # A PIPE is intentional: descendants must not keep the agent's read blocked.
         result = subprocess.run(['/bin/bash', str(KIT / 'bin/remote-ci'), 'check', '--run', 'echo targeted'],

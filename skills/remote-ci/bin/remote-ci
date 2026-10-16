@@ -45,6 +45,22 @@ if [ "$cmd" = fail ] || [ "$cmd" = blame ]; then
     [[ "$target" =~ ^[0-9a-f]{7,40}$ ]] || exit 1
   fi
 fi
+worktree=0 summary=0 force=0 command=""
+check_args=("$@")  # A pool move resubmits with the same flags.
+if [ "$cmd" = check ]; then
+target=HEAD
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --force) force=1 ;;
+  --worktree) worktree=1 ;;
+  --summary) summary=1 ;;
+  --run) [ $# -ge 2 ] || { usage >&2; exit 2; }; command=$2; shift ;;
+  -h | --help) usage; exit 0 ;;
+  *) target=$1 ;;
+  esac
+  shift
+done
+fi
 root=$(git rev-parse --show-toplevel 2>/dev/null) || { [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: not in a git repository" >&2; exit 2; }
 # land pins this to the main checkout; normal calls use this repo's config.
 conf=${REMOTE_CI_CONF:-$root/.remote-ci.conf}
@@ -87,6 +103,20 @@ bounded() {
 transport() {
   if [ "$submit_bounded" = 1 ]; then bounded "$@"; else "$@"; fi
 }
+# Optional host policy enables automatic pooling only for reviewed projects.
+# Exact command rules may add needs; explicit project/environment needs survive.
+if [ -n "${CI_ROUTE_POLICY:-}" ] && [ -n "${CI_ROUTE_RUNNERS:-}" ]; then
+  policy_command=""
+  [ "$cmd" != check ] || policy_command=${command:-${REMOTE_CI_CHECK:-pnpm run check}}
+  route_needs=$(python3 "$kit/bin/route_policy.py" "$CI_ROUTE_POLICY" "$REMOTE_CI_NAME" "$policy_command")
+  policy_rc=$?
+  case "$policy_rc" in
+    0) CI_RUNNERS=${CI_RUNNERS:-$CI_ROUTE_RUNNERS}
+       REMOTE_CI_NEEDS="${REMOTE_CI_NEEDS:-} $route_needs" ;;
+    10) ;; # Unlisted projects retain their existing route.
+    *) echo 'remote-ci: invalid host routing policy; refusing routing' >&2; exit 74 ;;
+  esac
+fi
 base=(-o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 # A clean environment like an ssh session: the lane's DATABASE_URL, NODE_ENV and PATH must not reach the run.
 local_sh() { env -i HOME="$HOME" USER="$user" LOGNAME="$user" SHELL=/bin/bash PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash -c "cd ~ && $*"; }
@@ -346,19 +376,6 @@ status)
   ;;
 esac
 
-worktree=0 summary=0 force=0 command="" target=HEAD
-check_args=("$@")  # A pool move resubmits with the same flags.
-while [ $# -gt 0 ]; do
-  case "$1" in
-  --force) force=1 ;;
-  --worktree) worktree=1 ;;
-  --summary) summary=1 ;;
-  --run) command=$2; shift ;;
-  -h | --help) usage; exit 0 ;;
-  *) target=$1 ;;
-  esac
-  shift
-done
 cd "$root" || exit 2
 # A bare check on a dirty tree means "check what I have": include uncommitted files,
 # otherwise HEAD's cached pass hides the edits.
