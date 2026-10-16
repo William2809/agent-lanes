@@ -44,6 +44,27 @@ class Resources(unittest.TestCase):
                     else:
                         self.assertEqual(published['v2']['group'], 123)
 
+    def test_legacy_group_survives_descendant_observation_but_not_phase_replacement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            queue = r.Queue(temp)
+            phase = dict(group=123, generation=7, phase='check', deadline=500,
+                         tree_marker='/fixture/tree', members={'123': 'birth'})
+            observed = dict(phase, members={'123': 'birth', '124': 'child-birth'})
+            for mutation in ({}, {'generation': 8}, {'group': 124},
+                             {'phase': 'cleanup'}, {'deadline': 600},
+                             {'tree_marker': '/other/tree'},
+                             {'members': {'123': 'reused-pid-birth'}}):
+                with self.subTest(mutation=mutation):
+                    with queue.transaction() as data:
+                        data['jobs'] = {'v2': dict(version=2, state='running', workers=1,
+                            lease_generation=7, process=phase,
+                            groups={'123': dict(observed, **mutation)})}
+                    row = json.loads((Path(temp)/'queue.json').read_text())['jobs']['v2']
+                    if mutation:
+                        self.assertNotIn('group', row)
+                    else:
+                        self.assertEqual(row['group'], 123)
+
     def test_v2_status_reports_active_cooldown_and_expiry(self):
         limits = dict(LIMITS, MAX_JOB_MB=8192, CLEANUP_QUARANTINE_S=600)
         metrics = dict(METRICS, load=0, available_mb=32000)

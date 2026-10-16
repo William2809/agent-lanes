@@ -313,10 +313,17 @@ class Queue:
                     continue
                 phase = row.get('process') or {}
                 group = phase.get('group')
+                registered = row.get('groups', {}).get(str(group), {})
+                # Observation adds descendants to groups independently of process.
+                # Compare immutable phase identity, never the changing member set.
+                identity = ('group', 'generation', 'phase', 'deadline', 'tree_marker')
+                leader = phase.get('members', {}).get(str(group))
                 if (row.get('state') == 'running' and not row.get('cancel') and
                         row.get('workers', 0) > 0 and type(group) is int and group > 0 and
                         phase.get('generation') == row.get('lease_generation') and
-                        row.get('groups', {}).get(str(group)) == phase):
+                        leader is not None and
+                        registered.get('members', {}).get(str(group)) == leader and
+                        all(registered.get(key) == phase.get(key) for key in identity)):
                     row['group'] = group
                 else:
                     row.pop('group', None)
