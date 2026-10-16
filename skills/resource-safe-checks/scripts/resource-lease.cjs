@@ -15,10 +15,35 @@ function localAllowed() {
     return !existsSync(policy) || JSON.parse(readFileSync(policy, 'utf8')).execution === 'local-queue';
   } catch { return false; }
 }
+// Linux procps derives lstart from a drifting boot time: the same process can read a few seconds apart.
+function sameStart(now, recorded) {
+  const a = now.trim(), b = String(recorded).trim();
+  if (a === b) return true;
+  if (process.platform !== 'linux') return false;
+  const delta = Math.abs(Date.parse(a) - Date.parse(b));
+  return Number.isFinite(delta) && delta <= 5000;
+}
+function linuxBirth(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) throw new Error('invalid process owner');
+  const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+  const separator = stat.lastIndexOf(') ');
+  if (separator < 2) throw new Error('invalid process stat');
+  const fields = stat.slice(separator + 2).trim().split(/\s+/);
+  const birth = fields[19];
+  if (!/^[1-9]\d*$/.test(birth || '')) throw new Error('invalid process birth');
+  return birth;
+}
+function sameOwner(row) {
+  if (process.platform === 'linux' && row.version === 2) {
+    return typeof row.owner_birth === 'string' && /^[1-9]\d*$/.test(row.owner_birth)
+      && linuxBirth(row.owner) === row.owner_birth;
+  }
+  return sameStart(ps('lstart=', row.owner), row.start);
+}
 function readGrant(token) {
   const row = JSON.parse(readFileSync(join(homedir(), '.local/state/agent-ci/queue.json'), 'utf8')).jobs[token];
   if (!row || !Number.isInteger(row.workers) || row.workers < 1) return null;
-  if (ps('lstart=', row.owner) !== String(row.start).trim() || ps('stat=', row.owner).startsWith('Z')) return null;
+  if (!sameOwner(row) || ps('stat=', row.owner).startsWith('Z')) return null;
   return row;
 }
 function matchesGroup(row) {
