@@ -76,9 +76,16 @@ def run(queue, token, phase, seconds, marker, command):
             if row['state'] != 'running' or row.get('cancel'):
                 return 74
             generation, memory = row['lease_generation'], row['memory_mb']
-            if row.get('job_deadline') and phase not in ('cleanup', 'maintenance'):
-                seconds = min(seconds, int(row['job_deadline'] - time.time()))
+            if phase not in ('cleanup', 'maintenance'):
+                # Queue time and earlier phases consume the same job budget.
+                # Fast-lane jobs may have an additional, shorter service limit.
+                deadlines = [row[key] for key in ('deadline', 'job_deadline') if row.get(key)]
+                if deadlines:
+                    seconds = min(seconds, int(min(deadlines) - time.time()))
                 if seconds <= 0:
+                    if marker:
+                        Path(marker).write_text('74')
+                    print('== phase stopped phase=%s reason=job-deadline rc=74' % phase, flush=True)
                     return 74
         child = subprocess.Popen([sys.executable, '-c',
             'import os,sys,subprocess,signal,time; fd=int(sys.argv[1]); result=int(sys.argv[2]); '
