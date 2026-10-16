@@ -269,7 +269,9 @@ class SchedulerRunner(unittest.TestCase):
         self.assertEqual(self.count(), 1)
         (self.home/'release').touch()
         self.assert_result(first, 'first', 0)
-        self.assertEqual(prune.wait(timeout=60), 0)
+        prune_rc = prune.wait(timeout=60)
+        prune_log = self.ci/'logs/prune.log'
+        self.assertEqual(prune_rc, 0, prune_log.read_text() if prune_log.exists() else str(self.rows()))
         self.assert_result(later, 'later', 0, project='other')
         rows = list(self.rows().values())
         before = next(r for r in rows if r.get('run_id') == 'first')

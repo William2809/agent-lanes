@@ -32,6 +32,8 @@ pg_profile_configure() {
   esac
 }
 pg_profile_ensure() {
+  # Host profiles apply only to projects that request a database.
+  [ -n "${REMOTE_CI_POSTGRES:-}" ] || return 0
   local existing_sync="" current_boot="" compact_boot="" rebuild_reason=unclean
   [ "${REMOTE_CI_PG_PROFILE:?Postgres profile not resolved}" != durable ] || return 0
   if [ "$REMOTE_CI_PG_PROFILE" = disposable ]; then
