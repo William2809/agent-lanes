@@ -50,7 +50,7 @@ def main():
         if single_fast or (not model['profile_known'] and not single['profile_known']):
             workers, model = 1, single
     floor = max(memory_floor, limits['WORKER_MB'] * workers,
-                0 if model['profile_known'] else 4096)
+                0 if model['memory_known'] else 4096)
     leases = os.environ.get('SCHEDULER_LEASES', '').split()
     if os.environ.get('SCHEDULER_EXCLUSIVE', '0') == '1':
         leases.append('exclusive-host')

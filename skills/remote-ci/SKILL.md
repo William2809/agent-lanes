@@ -537,19 +537,23 @@ The reader consumes the real nested receipts under `receipts/PROJECT/`, at most
 never persisted in profiles or telemetry.
 
 Five complete, uncached successful observations after the latest failed,
-killed or incomplete terminal run establish a known profile. Its estimate is
+killed or incomplete terminal run establish a runtime-known profile. Its estimate is
 1.25 times the largest of the last 20 successful whole-job service durations
 (checkout through cleanup, excluding queue wait). A one-second check with a
 15-minute setup is therefore not classified as short. Fast admission requires
 the estimate and complete worker/memory request to fit the reserve. Unknown
 profiles initially use one worker and at least 4096 MB; database jobs add
-2048 MB. Once the single-worker profile is known, short jobs keep that small
+2048 MB. After one complete, uncached successful whole-job observation since
+the latest failure, memory may instead use the measured peak with 25% headroom
+plus 256 MB. The host worker floor and explicit project floor still apply, and
+all earlier observed peaks, including failures, remain lower bounds. A later
+failure revokes this reduced-floor eligibility until the next complete success.
+This memory confidence does not establish fast status. Once the single-worker
+runtime profile is known, short jobs keep that small
 allocation when it fits the fast reserve. Longer jobs may train the requested
 worker count as normal work with conservative memory floors; single-worker
-history never makes a multiworker profile known. Failed run memory peaks remain
-lower bounds. Measured memory is the largest peak times
-1.25 plus 256 MB, bounded below by project and host worker floors. Context changes
-start a new profile and may require five new observations.
+history never makes a multiworker profile known. Context changes start a new
+profile and require new exact-profile observations.
 
 Normal work is ordered by accumulated worker-seconds per project with a
 300-second aging threshold. Aged jobs cannot be perpetually displaced by short

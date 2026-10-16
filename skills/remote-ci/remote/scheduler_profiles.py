@@ -149,11 +149,13 @@ def read_model(root, project, profile, memory_floor_mb, min_samples=5, fast_limi
     successes = [row for row in rows[last_failure + 1:] if row['success']]
     durations = [row['duration'] for row in successes[-20:]]
     memory = [row['peak'] for row in rows if row['peak'] is not None]
+    memory_known = bool(successes)
     known = len(successes) >= min_samples
     predicted_s = max(durations) * 1.25 if known and durations else None
     predicted_mb = int(math.ceil(max([memory_floor_mb] +
                                      [peak / 1048576 * 1.25 + 256 for peak in memory])))
-    return dict(profile=profile, profile_known=known, predicted_s=predicted_s,
+    return dict(profile=profile, profile_known=known, memory_known=memory_known,
+                predicted_s=predicted_s,
                 predicted_mb=predicted_mb, samples=len(successes), estimate_scope='job',
                 source='receipts' if rows else 'unknown')
 
@@ -185,11 +187,11 @@ def authorize(request, root, limits):
         model = read_model(root, project, profile, floor,
                            fast_limit_s=limits.get('FAST_SECONDS', 60))
     else:
-        model = dict(profile=None, profile_known=False, predicted_s=None,
+        model = dict(profile=None, profile_known=False, memory_known=False, predicted_s=None,
                      predicted_mb=floor, samples=0, estimate_scope='job', source='unknown')
 
     memory = max(requested, model['predicted_mb'] + service,
-                 floor + service, 4096 + service if not model['profile_known'] else 0)
+                 floor + service, 4096 + service if not model['memory_known'] else 0)
     if memory > maximum:
         raise ValueError('authorized memory exceeds maximum job budget')
     result.update(model)

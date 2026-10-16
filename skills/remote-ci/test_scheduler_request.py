@@ -42,10 +42,10 @@ class SchedulerRequest(unittest.TestCase):
         self.limits = dict(MAX_WORKERS=4, WORKER_MB=1024, MAX_JOB_MB=16384,
                            FAST_LANE=1, FAST_SECONDS=60, FAST_WORKERS=1, FAST_MEMORY_MB=2048)
 
-    def add_history(self, workers, service=20, peak_mb=100, database=False):
+    def add_history(self, workers, service=20, peak_mb=100, database=False, count=5):
         profile = self.profiles.key('project', self.digest, self.context,
                                     workers, database)
-        for index in range(5):
+        for index in range(count):
             started = 100 + index * 100
             row = dict(project='project', scheduler_profile=profile,
                        started_at=started, ended_at=started + 5 + service,
@@ -88,6 +88,20 @@ class SchedulerRequest(unittest.TestCase):
         self.assertEqual(request['workers'], 1)
         self.assertEqual(request['profile'], expected)
         self.assertFalse(request['profile_known'])
+        self.assertFalse(request['memory_known'])
+        self.assertEqual(request['memory_mb'], 4096)
+
+    def test_one_or_two_successes_reduce_memory_but_remain_normal_lane(self):
+        for count in (1, 2):
+            with self.subTest(count=count):
+                for path in self.receipts.iterdir():
+                    path.unlink()
+                self.add_history(1, count=count)
+                request = self.build(workers=1)
+                self.assertTrue(request['memory_known'])
+                self.assertFalse(request['profile_known'])
+                self.assertIsNone(request['predicted_s'])
+                self.assertEqual(request['memory_mb'], 1024)
 
     def test_known_parallel_profile_is_used_when_single_is_unproven(self):
         parallel = self.add_history(3, service=40)
@@ -111,6 +125,7 @@ class SchedulerRequest(unittest.TestCase):
         self.assertEqual(request['workers'], 3)
         self.assertEqual(request['profile'], expected)
         self.assertFalse(request['profile_known'])
+        self.assertFalse(request['memory_known'])
         self.assertGreaterEqual(request['memory_mb'], 4096)
 
     def test_database_overhead_can_make_single_worker_ineligible(self):
@@ -120,6 +135,7 @@ class SchedulerRequest(unittest.TestCase):
         self.assertEqual(request['workers'], 2)
         self.assertEqual(request['profile'], expected)
         self.assertFalse(request['profile_known'])
+        self.assertFalse(request['memory_known'])
         self.assertGreaterEqual(request['memory_mb'], 6144)
 
 
