@@ -46,7 +46,7 @@ def main():
     if action == 'recover-file':
         import scheduler_legacy
         path = Path(sys.argv[2]).resolve()
-        root = Path.home()/'ci'
+        root = (Path.home()/'ci').resolve()
         if not path.is_relative_to(root/'projects'):
             return 74
         with queue.transaction() as data:
