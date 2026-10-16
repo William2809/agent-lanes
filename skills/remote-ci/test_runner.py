@@ -1021,9 +1021,9 @@ class ClientFixture(unittest.TestCase):
         self.kit = self.home / 'kit'
         shutil.copytree(KIT / 'remote', self.kit / 'remote')
         isolate_corepack(self.kit / 'remote', self.home)
-        (self.kit / 'bin').mkdir()
+        # The client also calls its bounded-transport and routing helpers.
+        shutil.copytree(KIT / 'bin', self.kit / 'bin')
         self.client = self.kit / 'bin/remote-ci'
-        shutil.copyfile(KIT / 'bin/remote-ci', self.client)
         config = self.home / 'config'
         config.write_text('REMOTE_CI_HOST=fixture\nREMOTE_CI_DIRECT_HOST=fixture-direct\n')
         (self.root / '.remote-ci.conf').write_text('REMOTE_CI_NAME=fixture\nREMOTE_CI_WAIT_TIMEOUT=100\n')

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import signal
+import shutil
 import sys
 import time
 import unittest
@@ -14,7 +15,7 @@ if os.environ.get('CIQUEUE_BASELINE_KIT'):
     fixtures.KIT = Path(os.environ['CIQUEUE_BASELINE_KIT'])
 
 
-@unittest.skipUnless(sys.platform == 'darwin', 'runner uses macOS time -l')
+@unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'runner supports macOS and Linux')
 class SchedulerRunner(unittest.TestCase):
     git = fixtures.Runner.git
     configure = fixtures.Runner.configure
@@ -28,6 +29,10 @@ class SchedulerRunner(unittest.TestCase):
 
     def setUp(self):
         fixtures.Runner.setUp(self)
+        # The isolated HOME must expose the installed Node to the real lease reader.
+        node = shutil.which('node')
+        self.assertIsNotNone(node, 'scheduler integration requires the runner Node installation')
+        (self.home/'tool-versions/node').symlink_to(node)
         settings = self.home / '.config/agent-lanes/config'
         settings.write_text('AGENT_CI_MAX_JOBS=2\nAGENT_CI_MAX_WORKERS=4\nAGENT_CI_SCHEDULER=v2\n')
         sampler = self.bin/'resources.py'
@@ -106,6 +111,10 @@ class SchedulerRunner(unittest.TestCase):
             'psql() { cat >/dev/null; case "$*" in *pg_database_size*) echo 4096;; esac; return 0; }\n'
             'dropdb() { return 0; }\ncreatedb() { printf "%s\\n" "$@" >>"$HOME/created"; }\n'
             'acquire_guard() { echo BAD_LATE_LOCK; return 1; }\n')
+        # Database calls are fake; cache identity must also avoid a real PG16 installation.
+        postgres = self.home/'tool-versions/postgres'
+        postgres.write_text('#!/bin/sh\n[ "$1" = --version ] || exit 97\nprintf "postgres (fixture) 16\\n"\n')
+        postgres.chmod(0o755)
         (self.home/'release').touch()
         self.assert_result(self.start('database'), 'database', 0)
         self.assertNotIn('BAD_LATE_LOCK', self.log('database'))
@@ -181,6 +190,7 @@ class SchedulerRunner(unittest.TestCase):
         self.assert_result(active, 'active', 74)
         self.assertNotIn('process', self.rows()[token])
         self.assertNotIn('workers', self.rows()[token])
+        self.assertFalse((self.dir/'results/active.cleanup').exists())
 
     def test_fast_parent_cannot_leave_live_descendant_after_release(self):
         """Follow-up 6: retain a birth-bound group leader until descendants die."""
@@ -340,7 +350,7 @@ class SchedulerRunner(unittest.TestCase):
         self.assertFalse(lost.get('groups'))
 
 
-@unittest.skipUnless(sys.platform == 'darwin', 'runner uses macOS time -l')
+@unittest.skipUnless(sys.platform in ('darwin', 'linux'), 'runner supports macOS and Linux')
 class SchedulerV1Cache(unittest.TestCase):
     git = fixtures.Runner.git
     configure = fixtures.Runner.configure

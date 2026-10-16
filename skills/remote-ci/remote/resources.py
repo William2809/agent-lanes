@@ -299,8 +299,12 @@ def cleanup_events(queue, tokens):
 def live(row, procs, quarantine=None):
     if row.get('version') == 2:
         owner = procs.get(row.get('owner'), {})
-        owner_live = (owner and owner.get('start') == row.get('start') and
-                      (not row.get('owner_birth') or owner.get('birth') == row['owner_birth']))
+        # Kernel birth identity is authoritative. Linux/WSL ps lstart is
+        # reconstructed from a drifting boot-time wall clock and can change
+        # for a living PID; comparing it as well would lose a healthy queue.
+        owner_live = bool(owner) and (
+            owner.get('birth') == row['owner_birth'] if row.get('owner_birth')
+            else owner.get('start') == row.get('start'))
         return bool(owner_live or row.get('process') or row.get('groups'))
     if supervised(row, procs):
         row.pop('quarantine_since', None)
