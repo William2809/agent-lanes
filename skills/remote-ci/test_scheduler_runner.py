@@ -256,6 +256,8 @@ class SchedulerRunner(unittest.TestCase):
 
     def test_prune_waits_for_host_lease_and_runs_alone(self):
         """Follow-up 4/7: maintenance uses host exclusion through the ledger."""
+        # A host-wide disposable profile must not invent a database dependency.
+        self.env['REMOTE_CI_PG_PROFILE'] = 'disposable'
         self.add_project('other')
         first = self.start('first')
         self.wait_for(lambda: self.count() == 1)
