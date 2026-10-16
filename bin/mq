@@ -28,12 +28,21 @@ copy_cleanup() {
   fi
   [ -z "${MQ_ATTEMPT_COPY:-}" ] || "$MQ_SOURCE_ROOT/bin/ctrash" "$MQ_ATTEMPT_COPY" >/dev/null
 }
+# remote-ci snapshots and runs its whole kit (scheduler_*.py, pool.py, cache.py…): bundle every tracked
+# file there, read from the source checkout, so a new kit file never goes missing (rc 74, 2026-10-16).
+mini_kit_files() (
+  _src=${MQ_SOURCE_ROOT:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}
+  git -C "$_src" ls-files -- skills/remote-ci/bin skills/remote-ci/remote 2>/dev/null | grep . ||
+    { cd "$_src" && find skills/remote-ci/bin skills/remote-ci/remote ! -type d ! -name '*.bak' ! -name '*.pyc' ! -path '*/__pycache__/*'; }
+)
 files="bin/mq bin/mq-lock.py bin/mq-guard.py bin/mq-diagnostics.py bin/ctrash bin/diskguard
 skills/agent-workers/scripts/state.sh skills/agent-workers/scripts/run-record.sh skills/agent-workers/scripts/batches.sh
 skills/wt-dev/bin/land skills/wt-dev/bin/wt-dev skills/wt-dev/bin/wtdev_db.py skills/wt-dev/bin/migcheck
 skills/remote-ci/bin/remote-ci skills/remote-ci/bin/fail-summary.py skills/remote-ci/bin/blame.py
 skills/remote-ci/remote/lib.sh skills/remote-ci/remote/prune.sh skills/remote-ci/remote/run.sh
 skills/remote-ci/remote/setup.sh skills/remote-ci/remote/status.sh skills/remote-ci/remote/resources.py"
+# Required files above fail fast when missing; the rest of the kit rides along.
+files=$(printf '%s\n' $files $(mini_kit_files) | awk '!seen[$0]++')
 tool_revision() (
   # An archive below an unrelated checkout must not inherit that checkout's revision.
   if _top=$(git -C "$MQ_TOOL_ROOT" rev-parse --show-toplevel 2>/dev/null) &&
@@ -81,6 +90,9 @@ PY
     # Non-Git installs (unknown) retain the best-effort source hash and mode check.
     [ "$MQ_TOOL_REV" != unknown ] || return 0
     for f in $files; do
+      # A link's blob is its target path, but tar -h copies the content (kit remote/ctrash.sh);
+      # bundle_hashes already compared that content through the link.
+      [ ! -L "$MQ_TOOL_ROOT/$f" ] || continue
       _blob=$(git -C "$MQ_TOOL_ROOT" rev-parse "$MQ_TOOL_REV:$f" 2>/dev/null) || return 1
       _hash=$(git -C "$MQ_TOOL_ROOT" hash-object --no-filters "$MQ_COPY/$f" 2>/dev/null) || return 1
       [ "$_blob" = "$_hash" ] || return 1

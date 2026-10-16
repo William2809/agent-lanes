@@ -15,8 +15,10 @@ scheduler_admit() {
   resource_owned=1
   echo "== resources queued scheduler=v2"
   allocation=$(python3 "$runner_dir/resources.py" acquire --token "$resource_token" --owner "$$" \
-    --deadline "$wait_deadline" --mode "$resource_mode" --request-file "$request"); resource_rc=$?
+    --deadline "$wait_deadline" --mode "$resource_mode" --request-file "$request" \
+    ${first_submitted:+--submitted "$first_submitted"}); resource_rc=$?
   # 78 means a followed execution passed. It is not a grant to execute.
+  # 79: a pool client withdrew this queued run to move it to another runner. Nothing ran.
   [ "$resource_rc" != 78 ] || finish 0
   [ "$resource_rc" = 0 ] || finish "$resource_rc"
   read -r resource_workers resource_memory slot resource_predicted scheduler_job_deadline scheduler_lane <<<"$allocation"

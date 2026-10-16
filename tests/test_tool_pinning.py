@@ -126,6 +126,27 @@ echo "LANDED fixture"
         self.assertFalse(bundle.exists(), 'requirement 2: remove the bundle on exit')
         self.assertEqual(list(self.tmp.glob('mq.*')), [])
 
+    def test_bundle_carries_every_kit_file(self):
+        # Regression 2026-10-16: remote-ci ran remote/scheduler_submit.py, absent from the
+        # hand-kept list, so every land preflight exited 74. Boundary: a kit file that no
+        # list names, beside an editor backup and bytecode that must stay out.
+        remote = self.tools / 'skills/remote-ci/remote'
+        (remote / 'new_kit_helper.py').write_text('print("kit")\n')
+        (remote / 'run.sh.bak').write_text('old\n')
+        (remote / '__pycache__').mkdir(exist_ok=True)
+        (remote / '__pycache__/x.cpython-312.pyc').write_bytes(b'\0')
+        for name in ('scheduler_submit.py', 'cache.py'):
+            self.assertTrue((remote / name).exists(), name)
+        self.f.commit(self.f.lanes['b'], 'b.txt', 'b\n')
+        self.f.run(self.mq, 'add', 'b')
+        p, bundle = self.start_gated()
+        kit = bundle / 'skills/remote-ci/remote'
+        for name in ('scheduler_submit.py', 'cache.py', 'new_kit_helper.py'):
+            self.assertTrue((kit / name).is_file(), name)
+        self.assertTrue((bundle / 'skills/remote-ci/bin/pool.py').is_file())
+        self.assertFalse((kit / 'run.sh.bak').exists())
+        self.assertFalse((kit / '__pycache__').exists())
+
     def test_path_helpers_use_startup_bundle(self):
         # Requirement 1; boundary: land and its remote-ci client change before landing.
         self.f.commit(self.f.lanes['b'], 'b.txt', 'b\n')

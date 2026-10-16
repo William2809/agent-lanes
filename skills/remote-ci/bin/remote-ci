@@ -55,7 +55,8 @@ chmod 600 "$conf_snapshot"
 cp "$conf" "$conf_snapshot"
 conf=$conf_snapshot
 kit_snapshot=""
-trap 'rm -f "$conf_snapshot" ${kit_snapshot:+"$kit_snapshot/"*.sh "$kit_snapshot/"*.py}; [ -z "$kit_snapshot" ] || rmdir "$kit_snapshot"' EXIT
+move_file=""
+trap 'rm -f "$conf_snapshot" ${move_file:+"$move_file" "$move_file.new"} ${kit_snapshot:+"$kit_snapshot/"*.sh "$kit_snapshot/"*.py}; [ -z "$kit_snapshot" ] || rmdir "$kit_snapshot"' EXIT
 env_needs=${REMOTE_CI_NEEDS:-}  # Per-command needs (e.g. mrun) add to the project's conf.
 # shellcheck disable=SC1090
 . "$conf"
@@ -68,6 +69,24 @@ case "${REMOTE_CI_SLOTS:-1}" in *[!0-9]* | "" | 0*) [ "$cmd" != fail ] && [ "$cm
 : "${REMOTE_CI_WAIT_TIMEOUT:=10800}"
 case "$REMOTE_CI_WAIT_TIMEOUT" in *[!0-9]* | "" | 0*) echo 'remote-ci: REMOTE_CI_WAIT_TIMEOUT must be a positive integer' >&2; exit 2 ;; esac
 
+# Start the check budget before runner selection and transport setup.
+submit_bounded=0
+submitted_at=$(date +%s)
+wait_deadline=$((submitted_at + REMOTE_CI_WAIT_TIMEOUT))
+case "${REMOTE_CI_MOVE_SUBMITTED:-}:${REMOTE_CI_MOVE_DEADLINE:-}" in
+  *[!0-9:]* | :* | *:) ;;
+  *) submitted_at=$REMOTE_CI_MOVE_SUBMITTED wait_deadline=$REMOTE_CI_MOVE_DEADLINE ;;
+esac
+first_submitted=$submitted_at
+[ "$cmd" != check ] || submit_bounded=1
+bounded() {
+  local left=$((wait_deadline - $(date +%s)))
+  [ "$left" -gt 0 ] || { echo "lost-run: submission passed the wait deadline" >&2; return 74; }
+  python3 "$kit/bin/client_process.py" "$left" "$@"
+}
+transport() {
+  if [ "$submit_bounded" = 1 ]; then bounded "$@"; else "$@"; fi
+}
 base=(-o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 # A clean environment like an ssh session: the lane's DATABASE_URL, NODE_ENV and PATH must not reach the run.
 local_sh() { env -i HOME="$HOME" USER="$user" LOGNAME="$user" SHELL=/bin/bash PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash -c "cd ~ && $*"; }
@@ -100,7 +119,7 @@ if [ "${CI_RUNNERS+x}" = x ]; then
   fi
   # Follow-ups read the logs on the runner that ran the sha (or the project's last check).
   case "$cmd" in fail | blame) pool_args+=(--lookup "$target") ;; log | status | info) pool_args+=(--lookup latest) ;; esac
-  selection=$(python3 "$kit/bin/pool.py" "${pool_args[@]}") || exit 3
+  selection=$(transport python3 "$kit/bin/pool.py" "${pool_args[@]}") || exit 3
   read -r runner_name runner_route assignment_generation runner_pick <<<"$selection"
   ssh_cmd=(ssh "${base[@]}" "$runner_route")
   git_url="$runner_route:ci/projects/$REMOTE_CI_NAME/repo.git"
@@ -113,12 +132,12 @@ elif [ "${REMOTE_CI_HOST:-}" = local ]; then
   git_url="$HOME/ci/projects/$REMOTE_CI_NAME/repo.git"
   git_ssh=ssh
   route=local
-elif [ -n "$router" ] && ssh "${base[@]}" ${alias_opt[@]+"${alias_opt[@]}"} "$user@$router" true 2>/dev/null; then
+elif [ -n "$router" ] && transport ssh "${base[@]}" ${alias_opt[@]+"${alias_opt[@]}"} "$user@$router" true 2>/dev/null; then
   ssh_cmd=(ssh "${base[@]}" ${alias_opt[@]+"${alias_opt[@]}"} "$user@$router")
   git_url="ssh://$user@$router/~/ci/projects/$REMOTE_CI_NAME/repo.git"
   git_ssh="ssh ${base[*]} ${alias_opt[*]-}"
   route="direct $router"
-elif [ -n "${REMOTE_CI_HOST:-}" ] && ssh "${base[@]}" "$REMOTE_CI_HOST" true 2>/dev/null; then
+elif [ -n "${REMOTE_CI_HOST:-}" ] && transport ssh "${base[@]}" "$REMOTE_CI_HOST" true 2>/dev/null; then
   ssh_cmd=(ssh "${base[@]}" "$REMOTE_CI_HOST")
   git_url="$REMOTE_CI_HOST:ci/projects/$REMOTE_CI_NAME/repo.git"
   git_ssh="ssh ${base[*]}"
@@ -129,7 +148,11 @@ else
   echo "remote-ci: runner unreachable" >&2
   exit 3
 fi
-remote() { "${ssh_cmd[@]}" "$@" 2>&1 | grep -v '^Pseudo-terminal'; return "${PIPESTATUS[0]}"; }
+remote() {
+  if [ "$submit_bounded" = 1 ] && [ "$route" != local ]; then bounded "${ssh_cmd[@]}" "$@" 2>&1 | grep -v '^Pseudo-terminal'
+  else "${ssh_cmd[@]}" "$@" 2>&1 | grep -v '^Pseudo-terminal'; fi
+  return "${PIPESTATUS[0]}"
+}
 p="~/ci/projects/$REMOTE_CI_NAME"
 
 # One client deadline covers submission, queue, all commands and cleanup.
@@ -324,6 +347,7 @@ status)
 esac
 
 worktree=0 summary=0 force=0 command="" target=HEAD
+check_args=("$@")  # A pool move resubmits with the same flags.
 while [ $# -gt 0 ]; do
   case "$1" in
   --force) force=1 ;;
@@ -338,11 +362,14 @@ done
 cd "$root" || exit 2
 # A bare check on a dirty tree means "check what I have": include uncommitted files,
 # otherwise HEAD's cached pass hides the edits.
-if [ "$worktree" = 0 ] && [ "$target" = HEAD ] && [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+if [ -z "${REMOTE_CI_MOVE_SHA:-}" ] && [ "$worktree" = 0 ] && [ "$target" = HEAD ] && [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
   echo "remote-ci: uncommitted changes found; checking them too (--worktree)."
   worktree=1
 fi
-if [ "$worktree" = 1 ]; then
+if [ -n "${REMOTE_CI_MOVE_SHA:-}" ]; then
+  # A pool move checks the first submission's commit, never a new worktree snapshot.
+  sha=$(git rev-parse --verify --quiet "$REMOTE_CI_MOVE_SHA^{commit}") || exit 2
+elif [ "$worktree" = 1 ]; then
   # Snapshot tracked and untracked (not ignored) files through a throwaway index.
   index=$(mktemp)
   GIT_INDEX_FILE=$index git read-tree HEAD
@@ -355,7 +382,6 @@ fi
 # Pool: remember the runner for this sha, so fail/blame/log follow-ups read the same logs.
 [ -z "$runner_name" ] || python3 "$kit/bin/pool.py" --project "$REMOTE_CI_NAME" --runner "$runner_name" --record "$sha" || exit 3
 # A pass identifies code, project settings and the runner scripts that run it (the host kit when installed).
-wait_deadline=$(( $(date +%s) + REMOTE_CI_WAIT_TIMEOUT ))
 probe_runner || exit 74
 # Read only the host flag. V1 must not run metadata helpers or open V2 state.
 scheduler_probe='for task_cfg in "$HOME/.config/agent-lanes/config" "$HOME/.config/agent-lanes/config"; do
@@ -366,7 +392,8 @@ case "$submission_scheduler" in v1|v2) ;; *) echo "remote-ci: invalid host sched
 snapshot_kit || exit 74
 if [ -n "$host_kit" ]; then kit_rev=$host_kit; else kit_rev=$(kit_hash "$kit_snapshot") || exit 74; fi
 if [ "$submission_scheduler" = v2 ]; then
-  submission_metadata=$(REMOTE_CI_TASK="${REMOTE_CI_TASK:-}" python3 "$kit/remote/scheduler_submit.py" "$root" "$target") || exit 74
+  if [ -n "${REMOTE_CI_MOVE_METADATA:-}" ]; then submission_metadata=$REMOTE_CI_MOVE_METADATA
+  else submission_metadata=$(REMOTE_CI_TASK="${REMOTE_CI_TASK:-}" python3 "$kit/remote/scheduler_submit.py" "$root" "$target") || exit 74; fi
 fi
 nonce=$(openssl rand -hex 12) || { echo "remote-ci: cannot create run ID" >&2; exit 74; }
 case "$nonce" in *[!0-9a-f]* | "") echo "remote-ci: invalid random run ID" >&2; exit 74 ;; esac
@@ -384,7 +411,7 @@ key_script="set -a; . $p/runs/$run/bin/lib.sh; load_project $REMOTE_CI_NAME $p/r
   CACHE_TREE=$(git rev-parse "$sha^{tree}") CACHE_CONFIG=$(git hash-object "$conf") CACHE_KIT=$kit_rev \
   CACHE_MODE=$cache_mode CACHE_COMMAND=\"\$(printf '%s' '$encoded' | platform_decode)\" \
   python3 $p/runs/$run/bin/cache.py execution-key --env-file $p/runs/$run/env.local"
-tree=$("${ssh_cmd[@]}" "bash -c $(printf %q "$key_script")") || exit 74
+tree=$(remote "bash -c $(printf %q "$key_script")") || exit 74
 case "$tree" in ''|*[!0-9a-f]*) echo 'remote-ci: execution identity unavailable' >&2; exit 74 ;; esac
 [ "${#tree}" = 64 ] || exit 74
 pass_script="for pending in ~/ci/projects/*/results/*.cleanup; do
@@ -404,7 +431,7 @@ fi
 # One ref per run, so parallel callers never overwrite each other's commit while queued.
 # With a host kit, the push carries this client's protocol for the runner's pre-receive floor.
 push_options=(); [ -z "$host_kit" ] || push_options=(-o "remote-ci=$protocol")
-GIT_SSH_COMMAND="$git_ssh" git push -q --force ${push_options[@]+"${push_options[@]}"} "$git_url" "$sha:refs/heads/run/$run" || exit 74
+GIT_SSH_COMMAND="$git_ssh" bounded git push -q --force ${push_options[@]+"${push_options[@]}"} "$git_url" "$sha:refs/heads/run/$run" || exit 74
 echo "remote-ci: $REMOTE_CI_NAME ${sha:0:8} on the runner via $route (log $p/logs/$run.log)"
 resource_mode=runner; [ "$route" != local ] || resource_mode=local
 if [ "$submission_scheduler" = v2 ]; then
@@ -415,7 +442,38 @@ encoded=$(printf '%s' "$command" | base64)
 launch_gate='[ ! -f ~/ci/freeze ] || { echo "remote-ci: runner frozen after submission; resubmit"; exit 75; }'
 launch_gate="$launch_gate; [ \"\$($scheduler_probe)\" = '$submission_scheduler' ] || { echo 'remote-ci: scheduler changed after submission; resubmit'; exit 75; }"
 [ -z "$host_kit" ] || launch_gate="$launch_gate; [ \"\$(cat ~/ci/kit/VERSION 2>/dev/null)\" = '$host_kit' ] || { echo 'remote-ci: runner kit changed after submission; resubmit'; exit 75; }"
-remote "$launch_gate; nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$encoded' $force '$resource_mode' '$assignment_generation' </dev/null >/dev/null 2>&1 &" || exit 74
+remote "$launch_gate; nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$encoded' $force '$resource_mode' '$assignment_generation' '$first_submitted' </dev/null >/dev/null 2>&1 &" || exit 74
+submit_bounded=0
+# Pool: a v2 run still queued after REMOTE_CI_MOVE_AFTER seconds may move once to another ready runner.
+mover=""
+move_after=${REMOTE_CI_MOVE_AFTER:-60}
+case "$move_after" in ''|*[!0-9]*) move_after=60 ;; esac
+if [ -n "$runner_name" ] && [ -z "$requested_runner" ] && [ "${REMOTE_CI_MOVE:-1}" != 0 ] && [ "$submission_scheduler" = v2 ] &&
+   move_file=$(mktemp); then
+  perl -e 'setpgrp(0,0); exec @ARGV' python3 "$kit/bin/pool_move.py" --project "$REMOTE_CI_NAME" --source "$runner_name" \
+    --run "$run" --after "$move_after" --gap "${REMOTE_CI_MOVE_GAP:-5}" --out "$move_file" </dev/null >/dev/null 2>&1 &
+  mover=$!
+fi
+# The source run exits 79 only after a withdraw: resubmit the same snapshot to the named runner.
+finish_check() {
+  local rc=$1 dest=""
+  if [ -n "$mover" ]; then
+    kill -TERM -"$mover" 2>/dev/null || kill -TERM "$mover" 2>/dev/null
+    wait "$mover" 2>/dev/null
+    dest=$(cat "$move_file" 2>/dev/null)
+    rm -f "$move_file" "$move_file.new"
+  fi
+  if [ "$rc" = 79 ]; then
+    case "$dest" in ''|*[!A-Za-z0-9_]*) echo "lost-run: run $run was withdrawn without a destination (log $p/logs/$run.log)"; exit 74 ;; esac
+    echo "remote-ci: moved $run from $runner_name to $dest after $(( $(date +%s) - submitted_at ))s queued"
+    REMOTE_CI_RUNNER=$dest REMOTE_CI_MOVE=0 REMOTE_CI_CONF=$conf_snapshot REMOTE_CI_MOVE_SHA=$sha \
+      REMOTE_CI_MOVE_SUBMITTED=$submitted_at REMOTE_CI_MOVE_DEADLINE=$wait_deadline REMOTE_CI_MOVE_METADATA="${submission_metadata:-}" \
+      /bin/bash "$kit/bin/remote-ci" check ${check_args[@]+"${check_args[@]}"}
+    exit $?
+  fi
+  [ "$rc" != 77 ] || echo "remote-ci: superseded"
+  exit "$rc"
+}
 # If this connection drops, the run still finishes and cleans up on the runner (see: remote-ci status).
 if [ "$summary" = 1 ]; then
   echo "remote-ci: full log on the runner at $p/logs/$run.log"
@@ -428,12 +486,13 @@ if [ "$summary" = 1 ]; then
       set -- $p/logs/\$followed.log \"\$log\"
     fi
     sed 's/\x1b\[[0-9;]*m//g' \"\$@\" |
-      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|lost-run:|== following|== cached:|== timing|== resources|runner cleanup pending:|== cleanup recovered:|maximum resident' |
+      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|lost-run:|== following|== moved to|== withdrawn|== cached:|== timing|== resources|runner cleanup pending:|== cleanup recovered:|maximum resident' |
       sed 's/^[^ :]*:[a-z:-]*: *//' | grep -v -E '^== (check-result|finished) rc=|^runner cleanup pending:' | awk '!seen[\$0]++' | head -60
     grep -h '^runner cleanup pending:' \"\$@\" | awk '!seen[\$0]++'
     grep -h -E '^== (check-result|finished) rc=' \"\$@\" | awk '!seen[\$0]++'
     exit \$(cat \$done)"
   rc=$?
+  [ -z "${mover:-}" ] && [ "$rc" != 79 ] || finish_check "$rc"
   [ "$rc" != 77 ] || echo "remote-ci: superseded"
   exit $rc
 fi
@@ -444,5 +503,6 @@ wait_remote "log=$p/logs/$run.log; done=$p/results/$run.exit
   await_file \"\$done\"
   sleep 1; exit \$(cat \$done)"
 rc=$?
+[ -z "${mover:-}" ] && [ "$rc" != 79 ] || finish_check "$rc"
 [ "$rc" != 77 ] || echo "remote-ci: superseded"
 exit "$rc"

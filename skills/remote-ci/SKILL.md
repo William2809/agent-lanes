@@ -37,6 +37,7 @@ This is the exit-code contract for `remote-ci check` and `remote/run.sh`.
 | `74` | Lost run, client deadline, submission/setup/checkout/database/wrapper failure, interrupted runner, unavailable cleanup guard, or failed result publication | Infrastructure; keep queued |
 | `75` | Runner, tree claim, slot, or template busy; wait expired | Retry; keep queued if retries expire |
 | `76` | Database cleanup failed, or an earlier cleanup is still pending | Keep queued; retry cleanup before checks |
+| `79` | Runner result only: a pool client withdrew the still-queued run and resubmitted it to another runner (see Multiple runner devices). `remote-ci check` never returns it; it reports the destination's result | None; read the destination's result |
 | Other nonzero codes | Legacy runner result or unclassified execution failure | Accept a legacy check verdict only with its result line; otherwise treat as infrastructure |
 
 Candidate commands normalize every nonzero exit to `1`, including raw codes
@@ -102,6 +103,24 @@ Each selected device then performs its own resource admission and optional v2
 fast prioritization. A job runs entirely on one device; running jobs do not
 migrate between hosts. Follow-up diagnostics use the runner that executed the
 commit. The pool never substitutes local execution when remote devices fail.
+
+A queued check can move once before it starts. When a scored check's v2 queue row
+is still unstarted after `REMOTE_CI_MOVE_AFTER` seconds (default 60), the client
+(`bin/pool_move.py`) looks for another enabled runner that meets the check's needs,
+has the project set up, and admits now on two probes about 5 seconds apart. The
+source then withdraws the row in one queue transaction (`resources.py withdraw
+--token T --generation G --to RUNNER`). A grant and a withdraw take the same queue
+lock: whichever commits first wins. A started, granted, cancelled, or followed row
+is never withdrawn. The withdrawn run executes nothing, releases its resources,
+logs `== moved to RUNNER`, and exits 79. Only then does the client resubmit the
+same commit (including a `--worktree` snapshot), config snapshot, command, and
+flags to that runner. It carries the first submission time (run.sh argument 9) and
+the total client deadline, and prints `remote-ci: moved RUN from SRC to DEST after
+Ns queued`. Follow-ups (`fail`, `log`, `info`) then read the destination. There is
+no second move. A v1 source or an older host kit refuses the withdraw, and the
+check stays queued where it is. `REMOTE_CI_MOVE=0` turns moves off; a check that
+names its runner (`REMOTE_CI_RUNNER`) never moves. `REMOTE_CI_MOVE_GAP` (seconds
+between the two probes, default 5) exists for test fixtures.
 
 When the pool is configured, host administration must name the device:
 `REMOTE_CI_RUNNER=mac remote-ci install-runner`, `freeze`, or `thaw`. To temporarily
@@ -494,6 +513,8 @@ External host load can still change.
 The versioned submission file is `runs/RUN/submission.json`. It contains
 `schema=agent-ci.submission/v1`, `protocol=2`, `lane`, `task`, `generation`, and
 `landing`. Positional argument 8 is unchanged and reserved for pool use.
+Positional argument 9 is a moved check's first submission time: queue age and the
+wait deadline count from it, and the queue row's `submitted_at` keeps it.
 The host builds `agent-ci.request/v1` from that file and the trusted run config.
 It adds project, sha, tree, mode, command digest, run ID, and requested resources.
 The queue row has `version=2`, protocol, host sequence, lease generation,

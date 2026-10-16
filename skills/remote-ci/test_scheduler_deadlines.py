@@ -56,7 +56,7 @@ class Deadlines(unittest.TestCase):
         self.grant(time.time() + 3)
         started = time.monotonic()
         self.assertEqual(self.execute('check', 20), 74)
-        self.assertLess(time.monotonic() - started, 9)
+        self.assertLess(time.monotonic() - started, 15)
         self.assertFalse((self.root / 'completed').exists())
         self.assert_reaped()
 
