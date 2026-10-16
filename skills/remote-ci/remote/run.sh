@@ -351,7 +351,7 @@ finish() {
   # stale pins on the previous job's dependency outputs.
   if [ "$cleanup_failed" = 0 ]; then
     if [ "$scheduler_version" = v2 ]; then
-      scheduler_cache_release || { rc=74; cleanup_failed=1; }
+      [ "$locked" != 1 ] || scheduler_cache_release || { rc=74; cleanup_failed=1; }
     else
       [ "$resource_owned" != 1 ] || cache release --token "$resource_token" || { rc=76; cleanup_failed=1; }
       # Early rejection and queue expiry never acquired capacity for a scan.
@@ -366,7 +366,7 @@ finish() {
       infra_exec cleanup git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null
       [ "$?" != 76 ] || cleanup_failed=1
     else
-      scheduler_exec cleanup git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null || cleanup_failed=1
+      [ "$locked" != 1 ] || scheduler_exec cleanup git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null || cleanup_failed=1
     fi
   fi
   [ ! -f "$dir/results/$run.infra-tree" ] || cleanup_failed=1

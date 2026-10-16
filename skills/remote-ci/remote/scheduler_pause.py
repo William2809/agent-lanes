@@ -41,7 +41,7 @@ def marker(ci):
 
 
 def envelope(ci, row):
-    return Path(ci) / 'projects' / row['project'] / 'runs' / row['run_id'] / 'resume.json'
+    return Path(ci).resolve() / 'projects' / row['project'] / 'runs' / row['run_id'] / 'resume.json'
 
 
 def digest(path):
