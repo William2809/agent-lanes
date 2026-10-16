@@ -13,7 +13,6 @@ if os.environ.get('CIQUEUE_BASELINE_KIT'):
     fixtures.KIT = Path(os.environ['CIQUEUE_BASELINE_KIT'])
 
 
-@unittest.skipUnless(sys.platform == 'darwin', 'runner uses macOS time -l')
 class FastDatabase(unittest.TestCase):
     configure = fixtures.Runner.configure
     git = fixtures.Runner.git
@@ -58,6 +57,7 @@ class FastDatabase(unittest.TestCase):
         profiles = self.bin / 'scheduler_profiles.py'
         source = profiles.read_text()
         trusted = source.replace('known = len(successes) >= min_samples', 'known = True')
+        trusted = trusted.replace('memory_known = bool(successes)', 'memory_known = True')
         trusted = trusted.replace(
             "predicted_s = max(durations) * 1.25 if known and durations else None",
             'predicted_s = 0.1')
@@ -147,6 +147,28 @@ class FastDatabase(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 15)
         self.assertTrue((self.home / 'hung-cache-started').exists())
         self.assertIn('phase stopped phase=check rc=74', self.log('hung-cache'))
+
+
+    def test_stuck_cleanup_ref_is_bounded_and_quarantined(self):
+        self.configure()
+        tools = self.ci / 'node/hung/bin'
+        tools.mkdir(parents=True)
+        git = tools / 'git'
+        git.write_text('#!/bin/bash\ncase " $* " in *" update-ref -d refs/heads/run/"*) touch "$HOME/hung-ref-started"; sleep 30;; esac\nexec /usr/bin/git "$@"\n')
+        git.chmod(git.stat().st_mode | stat.S_IXUSR)
+        with (self.dir / 'conf').open('a') as stream:
+            stream.write('REMOTE_CI_NODE=hung\nREMOTE_CI_TIMEOUT=3\n')
+        started = time.monotonic()
+        self.assert_result(self.start('hung-ref', command='touch "$HOME/check-complete"'), 'hung-ref', 76)
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertTrue((self.home / 'check-complete').exists())
+        self.assertTrue((self.home / 'hung-ref-started').exists())
+        self.assertTrue((self.dir / 'results/hung-ref.cleanup').exists())
+        ledger = json.loads((self.home / '.local/state/agent-ci/queue.json').read_text())
+        row = next(row for row in ledger['jobs'].values() if row.get('run_id') == 'hung-ref')
+        self.assertEqual(row['state'], 'quarantined')
+        self.assertFalse(row.get('process'))
+        self.assertFalse(row.get('groups'))
 
 
 if __name__ == '__main__':

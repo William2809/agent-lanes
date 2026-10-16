@@ -5,6 +5,57 @@
 set -u
 runner_dir=$(cd "$(dirname "$0")" && pwd)
 . "$runner_dir/lib.sh"
+infra_exec() {
+  local phase=$1 now remaining seconds timeout_code=74 allow=() recovery=(); shift
+  now=$(date +%s)
+  seconds=$REMOTE_CI_TIMEOUT
+  if [ "$phase" = cleanup ]; then
+    timeout_code=76
+  else
+    remaining=$((wait_deadline - now))
+    [ "$remaining" -ge "$seconds" ] || seconds=$remaining
+  fi
+  if [ -n "${scheduler_phase_deadline:-}" ] && [ $((scheduler_phase_deadline - now)) -lt "$seconds" ]; then
+    seconds=$((scheduler_phase_deadline - now))
+  fi
+  [ "$seconds" -gt 0 ] || return "$timeout_code"
+  [ ! -f "$dir/results/$run.infra-tree" ] || return 76
+  [ "${infra_allow_success_descendants:-0}" != 1 ] || allow=(--allow-success-descendants)
+  [ "${infra_legacy_recovery:-0}" != 1 ] || recovery=(--legacy-cleanup)
+  python3 "$runner_dir/bounded_process.py" --phase "$phase" --timeout "$seconds" \
+    --timeout-code "$timeout_code" --reap-code 76 --ownership "$dir/results/$run.infra-tree" \
+    --token "$resource_token" ${allow[@]+"${allow[@]}"} ${recovery[@]+"${recovery[@]}"} -- "$@"
+}
+infra_exec_service() { infra_allow_success_descendants=1 infra_exec "$@"; }
+bounded_wrap_database() {
+  local tool definition raw
+  for tool in psql pg_ctl dropdb createdb; do
+    raw=bounded_raw_$tool
+    definition=$(declare -f "$tool")
+    if [ -n "$definition" ]; then
+      eval "${definition/#$tool /$raw }"
+      export -f "$raw"
+    else
+      raw=$tool
+    fi
+    if [ "$tool" = pg_ctl ]; then
+      eval "$tool() { case \" \$* \" in *' start '*) infra_exec_service \"\${scheduler_phase_name:-database}\" /bin/bash -c '\"\$@\"' _ $raw \"\$@\" ;; *) infra_exec \"\${scheduler_phase_name:-database}\" /bin/bash -c '\"\$@\"' _ $raw \"\$@\" ;; esac; }"
+    else
+      eval "$tool() { infra_exec \"\${scheduler_phase_name:-database}\" /bin/bash -c '\"\$@\"' _ $raw \"\$@\"; }"
+    fi
+  done
+}
+bounded_stop_idle_postgres() {
+  local data major stop_rc
+  slots_active && return 0
+  for data in "$ci"/pg/*; do
+    [ -f "$data/PG_VERSION" ] || continue
+    major=$(basename "$data"); major=${major%-disposable}; major=${major%-minimal}
+    infra_exec cleanup "$(platform_pgbin "$major")/pg_ctl" -D "$data" stop -m fast >/dev/null 2>&1
+    stop_rc=$?
+    [ "$stop_rc" != 76 ] || return 76
+  done
+}
 if [ "${1:-}" = --cleanup ]; then
   cleanup_version=$(python3 "$runner_dir/resources.py" scheduler-version) || exit 74
   if [ "$cleanup_version" = v2 ]; then
@@ -38,6 +89,9 @@ if [ "${1:-}" = --cleanup ] || [ "${1:-}" = --cleanup-v2 ]; then
   pending=$2; dir=${pending%/results/*}; run=${pending##*/}; run=${run%.cleanup}; run=${run%.recovery}
   [ -f "$dir/runs/$run/conf" ] || exit 76
   load_project "${dir##*/}" "$dir/runs/$run/conf" || exit 76
+  wait_deadline=$(( $(date +%s) + 60 ))
+  scheduler_phase_deadline=$wait_deadline scheduler_phase_name=cleanup
+  [ "$cleanup_protocol" != --cleanup ] || bounded_wrap_database
   slot="" role="" database="" owner=""
   while IFS='=' read -r key value; do
     case "$key" in slot) slot=$value ;; role) role=$value ;; database) database=$value ;; pid) owner=$value ;; esac
@@ -60,9 +114,11 @@ if [ "${1:-}" = --cleanup ] || [ "${1:-}" = --cleanup-v2 ]; then
   # V1 recovery applies quarantine even when the ownership journal cannot reap.
   case "$owner" in ''|*[!0-9]*) ;; *) kill -0 "$owner" 2>/dev/null && exit 76 ;; esac
   python3 "$runner_dir/resources.py" reap --marker "$dir/results/$run.resource-stop" || true
-  python3 "$runner_dir/resources.py" release --token "$project-$run-$owner" || exit 76
+  resource_token="$project-$run-$owner"
+  python3 "$runner_dir/bounded_process.py" --reap-marker "$dir/results/$run.infra-tree" --token "$resource_token" || exit 76
   acquire_guard || exit 76
   trap 'release_guard' EXIT
+  infra_legacy_recovery=1
   trap 'exit 76' HUP INT TERM
   [ -f "$pending" ] || exit 0
   if [ -z "$owner" ]; then
@@ -96,9 +152,10 @@ if [ "${1:-}" = --cleanup ] || [ "${1:-}" = --cleanup-v2 ]; then
     [ "$claimed" != "$run" ] || rm -f "$claim" "${claim%.run}"
     rm -f "${claim%.run}.guard"
   done
-  python3 "$runner_dir/cache.py" release --token "$project-$run-$cache_owner" || exit 76
+  infra_exec cleanup python3 "$runner_dir/cache.py" release --token "$project-$run-$cache_owner" || exit 76
+  infra_exec cleanup git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" || exit 76
+  python3 "$runner_dir/resources.py" release --token "$resource_token" || exit 76
   if [ "$slotted" = 1 ]; then rm -f "$dir/slots/$slot.lock" "$dir/slots/$slot.run"; fi
-  git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" || exit 76
   rm -f "$pending" || exit 76
   echo "== cleanup recovered: $run"
   exit 0
@@ -147,6 +204,8 @@ cache() {
     "REMOTE_CI_ENV_REVISION=${REMOTE_CI_ENV_REVISION:-}" python3 "$runner_dir/cache.py")
   if [ "$scheduler_version" = v2 ] && [ "$locked" = 1 ] && [ "$resource_owned" = 1 ]; then
     scheduler_exec "${scheduler_phase_name:-check}" "${cache_command[@]}" "$@"
+  elif [ "$scheduler_version" = v1 ] && [ "$resource_owned" = 1 ]; then
+    infra_exec "${scheduler_phase_name:-check}" "${cache_command[@]}" "$@"
   else
     "${cache_command[@]}" "$@"
   fi
@@ -154,6 +213,8 @@ cache() {
 cache_delete() {
   if [ "$scheduler_version" = v2 ] && [ "$locked" = 1 ] && [ "$resource_owned" = 1 ]; then
     scheduler_exec "${scheduler_phase_name:-check}" /bin/bash "$runner_dir/prune.sh" --cache-delete "$1"
+  elif [ "$scheduler_version" = v1 ]; then
+    infra_exec "${scheduler_phase_name:-check}" /bin/bash "$runner_dir/prune.sh" --cache-delete "$1"
   else
     /bin/bash "$runner_dir/prune.sh" --cache-delete "$1"
   fi
@@ -248,15 +309,16 @@ finish() {
   receipt_phase cleanup
   scheduler_phase_deadline=$((cleanup_start + 60))
   scheduler_phase_name=cleanup
-  if [ -n "$install_lock" ] && [ "$(cat "$install_lock" 2>/dev/null)" = "$$" ]; then
+  [ ! -f "$dir/results/$run.infra-tree" ] || cleanup_failed=1
+  if [ "$cleanup_failed" = 0 ] && [ -n "$install_lock" ] && [ "$(cat "$install_lock" 2>/dev/null)" = "$$" ]; then
     cache_delete "$install_lock.child" || cleanup_failed=1
     cache_delete "$install_lock" || cleanup_failed=1
   fi
-  [ "$template_locked" = 1 ] && rm -f "$template_lock.child"
+  [ "$cleanup_failed" != 0 ] || { [ "$template_locked" = 1 ] && rm -f "$template_lock.child"; }
   release_drain
-  [ "$template_locked" = 1 ] && rm -f "$template_lock"
+  [ "$cleanup_failed" != 0 ] || { [ "$template_locked" = 1 ] && rm -f "$template_lock"; }
   # A queued/busy run has no resources and must never stop another run's Postgres.
-  if [ "$locked" = 1 ] && [ "$pg_started" = 1 ]; then
+  if [ "$cleanup_failed" = 0 ] && [ "$locked" = 1 ] && [ "$pg_started" = 1 ]; then
     clean_databases || { echo "Error: database cleanup failed"; cleanup_failed=1; }
   fi
   if [ "$pg_started" = 1 ]; then
@@ -270,7 +332,7 @@ finish() {
     if [ "$scheduler_version" = v2 ]; then
       scheduler_cache_release || { rc=74; cleanup_failed=1; }
     else
-      cache release --token "$resource_token" || rc=74
+      [ "$resource_owned" != 1 ] || cache release --token "$resource_token" || { rc=76; cleanup_failed=1; }
       # Early rejection and queue expiry never acquired capacity for a scan.
       # Preserve cache infrastructure errors (74) versus capacity errors (75).
       if [ "$scheduler_version" = v1 ] && [ "$resource_owned" = 1 ] && [ "$resource_memory" -gt 0 ]; then
@@ -278,6 +340,16 @@ finish() {
       fi
     fi
   fi
+  if [ "$cleanup_failed" = 0 ] && [ "$resource_owned" = 1 ]; then
+    if [ "$scheduler_version" = v1 ]; then
+      infra_exec cleanup git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null
+      [ "$?" != 76 ] || cleanup_failed=1
+    else
+      scheduler_exec cleanup git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null || cleanup_failed=1
+    fi
+  fi
+  [ ! -f "$dir/results/$run.infra-tree" ] || cleanup_failed=1
+  [ "$cleanup_failed" = 0 ] || rc=76
   if [ "$locked" = 1 ] && [ "$cleanup_failed" = 0 ]; then
     if [ "$scheduler_version" != v2 ] && [ "$slotted" = 1 ]; then
       if acquire_guard; then
@@ -288,17 +360,23 @@ finish() {
       fi
     fi
     if [ "$guard_owned" = 1 ]; then
-      stop_idle_postgres
+      if [ "$scheduler_version" = v2 ]; then stop_idle_postgres
+      else bounded_stop_idle_postgres || cleanup_failed=1; fi
+      [ ! -f "$dir/results/$run.infra-tree" ] || cleanup_failed=1
+      if [ "$cleanup_failed" = 1 ] && [ "$scheduler_version" != v2 ] && [ "$slotted" = 1 ]; then
+        platform_lock "$dir/slots/$slot.lock" $$ || true
+        printf '%s\n' "$run" >"$dir/slots/$slot.run"
+      fi
       release_guard
     fi
   fi
+  [ "$cleanup_failed" = 0 ] || rc=76
   if [ "$cleanup_failed" = 1 ]; then
     printf 'run=%s\nslot=%s\ndatabase=%s\nrole=%s\ncheck_rc=%s\npid=%s\n' \
       "$run" "$slot" "$REMOTE_CI_DB" "$role" "$check_rc" "$$" >"$dir/results/$run.cleanup"
     echo "runner cleanup pending: $run"
   fi
   [ "$cleanup_failed" = 0 ] || release_guard
-  [ "$cleanup_failed" = 0 ] && git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" 2>/dev/null
   if [ "$claim_owned" = 1 ] && [ "$cleanup_failed" = 0 ] && ! acquire_claim_guard "$scheduler_phase_deadline"; then
     echo "lost-run: run $run claim release guard unavailable after 60 seconds; claim retained"
     rc=74
@@ -391,6 +469,8 @@ pending_cleanup() {
 scheduler_version=$(python3 "$runner_dir/resources.py" scheduler-version) || finish 74
 if [ "$scheduler_version" = v2 ]; then
   . "$runner_dir/scheduler.sh" || finish 74
+else
+  bounded_wrap_database
 fi
 if [ "$scheduler_version" = v2 ] && [ -z "$command" ] && [ "$force" = 0 ] && [ "$cache_identity" = 1 ] && cache pass-valid --path "$dir/results/tree-$tree.pass" &&
    ! compgen -G "$ci/projects/*/results/*.cleanup" >/dev/null; then
@@ -549,7 +629,7 @@ fi  # v1 admission
 started=$(date +%s)
 echo "== $project run $run sha $sha slot $slot/$([ "$slotted" = 1 ] && echo "$REMOTE_CI_SLOTS" || echo exclusive) start $(date '+%F %T')"
 echo "== timing queue $((started - submitted))s"
-step() { echo "== $*"; "$@" || { finish 74; }; }
+step() { local step_rc; echo "== $*"; "$@"; step_rc=$?; [ "$step_rc" = 0 ] || { [ "$step_rc" = 76 ] && finish 76; finish 74; }; }
 phase() {
   local label=$1 start rc scheduler_phase_deadline; shift
   start=$(date +%s)
@@ -559,18 +639,24 @@ phase() {
   "$@"; rc=$?
   echo "== timing $label $(( $(date +%s) - start ))s"
   if [ "$rc" != 0 ]; then
-    case "$candidate_failed:$label:$rc" in 1:*) rc=1 ;; *:74|*:75) ;; 0:checkout:*|0:database:*) rc=74 ;; esac
+    case "$candidate_failed:$label:$rc" in 1:*) rc=1 ;; *:74|*:75|*:76) ;; 0:checkout:*|0:database:*) rc=74 ;; esac
     finish "$rc"
   fi
 }
 supervised() {
-  local rc timing_available=0
+  local rc timing_available=0 supervised_seconds=$REMOTE_CI_TIMEOUT now
   if [ "$scheduler_version" = v2 ]; then
     # V2 keeps the receipt sampler; its pipe-gated child owns its descriptors.
     receipt timing-unavailable
     scheduler_exec check "$@"
     return $?
   fi
+  now=$(date +%s)
+  [ $((wait_deadline - now)) -ge "$supervised_seconds" ] || supervised_seconds=$((wait_deadline - now))
+  if [ -n "${scheduler_phase_deadline:-}" ] && [ $((scheduler_phase_deadline - now)) -lt "$supervised_seconds" ]; then
+    supervised_seconds=$((scheduler_phase_deadline - now))
+  fi
+  [ "$supervised_seconds" -gt 0 ] || return 74
   # time opens -o before exec. Give it an already-open descriptor, or run bare.
   if [ "$receipt_bsd_time" = 1 ] && { exec 9>"$dir/results/$run.time"; } 2>/dev/null; then
     timing_available=1
@@ -589,7 +675,7 @@ supervised() {
   }
   : >"$dir/results/$run.resource-stop"
   perl -e 'setpgrp(0,0); exec @ARGV' python3 "$runner_dir/resources.py" watch \
-    --group "$child" --token "$resource_token" --run-id "$run" --timeout "$REMOTE_CI_TIMEOUT" --memory "$resource_memory" \
+    --group "$child" --token "$resource_token" --run-id "$run" --timeout "$supervised_seconds" --memory "$resource_memory" \
     --marker "$dir/results/$run.resource-stop" &
   watchdog=$!
   wait "$child"; rc=$?
@@ -641,13 +727,13 @@ checkout() {
     cd "$work" || return
     return 0
   fi
-  [ -d "$work/.git" ] || git init -q "$work" || return
+  [ -d "$work/.git" ] || infra_exec checkout git init -q "$work" || return
   cd "$work" || return
-  step git fetch -q "$dir/repo.git" "+refs/heads/run/$run:refs/remote-ci/run"
+  step infra_exec checkout git fetch -q "$dir/repo.git" "+refs/heads/run/$run:refs/remote-ci/run"
   # A CI slot never holds real work: discard edits a previous run left behind (formatters, codegen).
-  step git checkout -q -f --detach "$sha"
-  [ "$(git rev-parse HEAD)" = "$sha" ] || return 1
-  step git clean -fdq
+  step infra_exec checkout git checkout -q -f --detach "$sha"
+  [ "$(infra_exec checkout git rev-parse HEAD)" = "$sha" ] || return 1
+  step infra_exec checkout git clean -fdq
 }
 phase checkout checkout
 [ "$scheduler_version" != v2 ] || scheduler_wrap_database

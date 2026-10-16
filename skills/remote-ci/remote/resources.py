@@ -227,19 +227,27 @@ def supervised(row, procs):
 
 
 def cleanup_live(row, procs, quarantine=None):
-    if row.get('tree_marker'):
-        try:
-            tree = Tree.load(row['tree_marker'])
-            members = tree.observe(procs)
-            if not members:
-                return False
-            if set(members) - tree.uncertain:
-                row.pop('quarantine_since', None)
-                return True  # Verified surviving descendants do not expire.
-        except (OSError, ValueError, KeyError, TypeError, OverflowError):
-            pass  # A lost journal and unreadable identities share one bound.
+    markers = [row[key] for key in ('tree_marker', 'infra_tree_marker') if row.get(key)]
+    if markers:
+        uncertain = False
+        for marker in markers:
+            try:
+                tree = Tree.load(marker)
+                members = tree.observe(procs)
+                if set(members) - tree.uncertain:
+                    row.pop('quarantine_since', None)
+                    row.pop('quarantine_expired', None)
+                    return True  # Verified surviving descendants do not expire.
+                uncertain = uncertain or bool(members)
+            except (OSError, ValueError, KeyError, TypeError, OverflowError):
+                uncertain = True  # A lost journal and unreadable identities share one bound.
+        if not uncertain:
+            row.pop('quarantine_since', None)
+            row.pop('quarantine_expired', None)
+            return False
         if supervised(row, procs):
             row.pop('quarantine_since', None)
+            row.pop('quarantine_expired', None)
             return True
         if quarantine is None:
             quarantine = policy('runner')['CLEANUP_QUARANTINE_S']
@@ -351,7 +359,8 @@ class Queue:
                     scheduler.complete(data, token, result, time.time(), quarantine)
                     released = row.get('result')
             else:
-                retained = bool(row.get('tree_marker') and cleanup_live(row, processes()))
+                retained = bool((row.get('tree_marker') or row.get('infra_tree_marker')) and
+                                cleanup_live(row, processes()))
                 report_peak = 'peak_rss_mb' in row and not row.get('peak_reported')
                 if report_peak:
                     row['peak_reported'] = True
@@ -380,9 +389,33 @@ class Queue:
         with self.transaction() as data:
             data['jobs'][token].update(fields)
 
+    def register_infra_tree(self, token, marker, allow_missing=False):
+        with self.transaction() as data:
+            row = data['jobs'].get(token)
+            if row is None and allow_missing:
+                return False  # Legacy recovery holds the host guard and project quarantine.
+            if not row or row.get('version') == 2 or not row.get('workers'):
+                raise ValueError('infrastructure command needs an admitted V1 grant')
+            current = row.get('infra_tree_marker')
+            if current and current != marker:
+                raise ValueError('infrastructure ownership already registered')
+            row['infra_tree_marker'] = marker
+            return True
+
+    def clear_infra_tree(self, token, marker, allow_missing=False):
+        with self.transaction() as data:
+            row = data['jobs'].get(token)
+            if row is None and allow_missing:
+                return
+            if not row or row.get('infra_tree_marker') != marker:
+                raise ValueError('infrastructure ownership identity changed')
+            row.pop('infra_tree_marker')
+
 
 
 def unused_reservation(row, procs):
+    if row.get('infra_tree_marker'):
+        return row['memory_mb']  # Never credit an unverified infrastructure tree.
     group = job_group(row)
     if procs is None or not group:
         return row['memory_mb']
