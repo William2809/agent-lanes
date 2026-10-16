@@ -304,6 +304,22 @@ class Queue:
             data = json.loads(path.read_text()) if path.exists() else dict(sequence=0, jobs={})
             before = json.dumps(data, sort_keys=True)
             yield data
+            # Existing project guards read the v1 top-level group. Publish that
+            # view with the same atomic ledger update as its v2 phase record.
+            # It grants nothing independently and must disappear on cancellation,
+            # phase reap, generation mismatch or terminal state.
+            for row in data['jobs'].values():
+                if row.get('version') != 2:
+                    continue
+                phase = row.get('process') or {}
+                group = phase.get('group')
+                if (row.get('state') == 'running' and not row.get('cancel') and
+                        row.get('workers', 0) > 0 and type(group) is int and group > 0 and
+                        phase.get('generation') == row.get('lease_generation') and
+                        row.get('groups', {}).get(str(group)) == phase):
+                    row['group'] = group
+                else:
+                    row.pop('group', None)
             if json.dumps(data, sort_keys=True) != before:
                 new = path.with_suffix('.json.new')
                 new.write_text(json.dumps(data, sort_keys=True) + '\n')

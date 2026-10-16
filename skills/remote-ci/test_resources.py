@@ -24,6 +24,26 @@ LIMITS = dict(MAX_JOBS=1, MAX_WORKERS=2, CPU_RESERVE=2, MEM_RESERVE_MB=2048, WOR
 
 
 class Resources(unittest.TestCase):
+    def test_legacy_group_projection_revokes_stale_v2_admission(self):
+        with tempfile.TemporaryDirectory() as temp:
+            queue = r.Queue(temp)
+            phase = dict(group=123, generation=7, members={'123': 'birth'})
+            valid = dict(version=2, state='running', workers=1, lease_generation=7,
+                         process=phase, groups={'123': phase})
+            for mutation in ({}, {'state': 'queued'}, {'state': 'finished'},
+                             {'cancel': True}, {'workers': 0}, {'lease_generation': 8},
+                             {'process': None}, {'groups': {}}):
+                with self.subTest(mutation=mutation):
+                    with queue.transaction() as data:
+                        data['jobs'] = {'v2': dict(valid, group=999, **mutation),
+                                        'v1': dict(group=456, workers=1)}
+                    published = json.loads((Path(temp)/'queue.json').read_text())['jobs']
+                    self.assertEqual(published['v1']['group'], 456)
+                    if mutation:
+                        self.assertNotIn('group', published['v2'])
+                    else:
+                        self.assertEqual(published['v2']['group'], 123)
+
     def test_v2_status_reports_active_cooldown_and_expiry(self):
         limits = dict(LIMITS, MAX_JOB_MB=8192, CLEANUP_QUARANTINE_S=600)
         metrics = dict(METRICS, load=0, available_mb=32000)

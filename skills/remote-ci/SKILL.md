@@ -71,6 +71,42 @@ are printed separately, always last, even with a custom summary filter.
 
 The merge queue includes `fail` lines in bounce prompts and splits full-check trains only for a unique highest real `blame` overlap. Its diagnostic calls stop after 45 seconds; output stays redacted and bounded.
 
+## Multiple runner devices
+
+Configure the pool on the development machine in `~/.config/agent-lanes/config`.
+Routes are SSH aliases; capabilities describe what each runner can execute:
+
+```sh
+CI_RUNNERS='mac=runner-mac:macos linux=runner-linux:linux'
+# Optional policy estimates, in seconds per job (default 300):
+CI_RUNNER_mac_EXPECTED_SECONDS=300
+CI_RUNNER_linux_EXPECTED_SECONDS=300
+```
+
+Install the runner kit and set up each project on every compatible device:
+`remote-ci setup mac` and `remote-ci setup linux`. Keep per-host resource budgets on
+those execution hosts. After setup, ordinary `safe-check` / `remote-ci check`
+submissions select a runner automatically. Add more registry entries for more
+remote devices. Leave `CI_RUNNERS` unset to keep the existing single-runner route.
+
+The pool filters enabled runners by project `REMOTE_CI_NEEDS` and per-command
+requirements, probes them concurrently, and prefers a ready response. Otherwise
+it compares approximate queue delay, CPU load, pressure, cooldown and cache
+warmth. Queue-delay estimates use configured job duration until measured ETA is
+available. This is a routing heuristic, not a global optimal schedule. A project
+with `REMOTE_CI_NEEDS=macos` stays on a compatible Mac; leave needs empty only for
+checks verified portable. A reachable runner without that project set up is
+ineligible.
+
+Each selected device then performs its own resource admission and optional v2
+fast prioritization. A job runs entirely on one device; running jobs do not
+migrate between hosts. Follow-up diagnostics use the runner that executed the
+commit. The pool never substitutes local execution when remote devices fail.
+
+When the pool is configured, host administration must name the device:
+`REMOTE_CI_RUNNER=mac remote-ci install-runner`, `freeze`, or `thaw`. To temporarily
+exclude a runner, set `CI_RUNNER_linux_ENABLED=0` on the submitting machine.
+
 ## Lifecycle
 
 1. Route: configured direct route → configured fallback SSH route → exit 3. `REMOTE_CI_HOST=local` in the config skips both:
