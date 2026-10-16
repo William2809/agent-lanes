@@ -116,16 +116,50 @@ class AdmissionTests(unittest.TestCase):
    state=Path(tmp)/'.local/state/agent-ci';state.mkdir(parents=True)
    token=uuid.uuid4().hex
    owner_start=subprocess.check_output(['ps','-o','lstart=','-p',str(os.getpid())],text=True).strip()
+   owner_birth=Path(f'/proc/{os.getpid()}/stat').read_text().rpartition(') ')[2].split()[19] if sys.platform.startswith('linux') else None
    node='const l=require(process.argv[1]);process.stdout.write(JSON.stringify(l.allocation() !== null));'
    env=dict(os.environ,HOME=tmp,AGENT_CI_TOKEN=token,CI='1',AGENT_CI_ADMITTED='1')
-   def row(group,start=owner_start+'    '):
-    path=state/'queue.json';new=state/'queue.json.new';new.write_text(json.dumps({'jobs':{token:{'owner':os.getpid(),'start':start,'workers':1,'group':group}}}));new.replace(path)
+   def row(group,start=owner_start+'    ',**fields):
+    record={'owner':os.getpid(),'start':start,'workers':1,'group':group};record.update(fields)
+    path=state/'queue.json';new=state/'queue.json.new';new.write_text(json.dumps({'jobs':{token:record}}));new.replace(path)
    row(999999)
    result=subprocess.run(['node','-e',node,str(helper)],env=env,text=True,capture_output=True,timeout=30,start_new_session=True)
    self.assertEqual(result.stdout,'false')
    child=subprocess.Popen(['node','-e',node,str(helper)],env=env,text=True,stdout=subprocess.PIPE,start_new_session=True)
    row(child.pid)
    self.assertEqual(child.communicate(timeout=30)[0],'true');self.assertEqual(child.returncode,0)
+   import datetime
+   shifted=lambda seconds:(datetime.datetime.strptime(' '.join(owner_start.split()),'%a %b %d %H:%M:%S %Y')+datetime.timedelta(seconds=seconds)).strftime('%a %b %d %H:%M:%S %Y')
+   drift='true' if sys.platform.startswith('linux') else 'false'
+   for seconds,expected in ((1,drift),(-2,drift),(60,'false')):
+    child=subprocess.Popen(['node','-e',node,str(helper)],env=env,text=True,stdout=subprocess.PIPE,start_new_session=True)
+    row(child.pid,shifted(seconds))
+    self.assertEqual(child.communicate(timeout=30)[0],expected,seconds)
+   if sys.platform.startswith('linux'):
+    # V2 trusts exact kernel start ticks, never the drifting display timestamp.
+    child=subprocess.Popen(['node','-e',node,str(helper)],env=env,text=True,stdout=subprocess.PIPE,start_new_session=True)
+    row(child.pid,shifted(60),version=2,owner_birth=owner_birth)
+    self.assertEqual(child.communicate(timeout=30)[0],'true')
+    for identity in (str(int(owner_birth)+1),'malformed',None):
+     child=subprocess.Popen(['node','-e',node,str(helper)],env=env,text=True,stdout=subprocess.PIPE,start_new_session=True)
+     fields={'version':2}
+     if identity is not None: fields['owner_birth']=identity
+     row(child.pid,owner_start,**fields)
+     self.assertEqual(child.communicate(timeout=30)[0],'false',identity)
+    child=subprocess.Popen(['node','-e',node,str(helper)],env=env,text=True,stdout=subprocess.PIPE,start_new_session=True)
+    row(child.pid,version=2,owner=999999,owner_birth=owner_birth)
+    self.assertEqual(child.communicate(timeout=30)[0],'false')
+    for invalid_owner in (0,-1,'bad'):
+     child=subprocess.Popen(['node','-e',node,str(helper)],env=env,text=True,stdout=subprocess.PIPE,start_new_session=True)
+     row(child.pid,version=2,owner=invalid_owner,owner_birth=owner_birth)
+     self.assertEqual(child.communicate(timeout=30)[0],'false',invalid_owner)
+    zombie=subprocess.Popen(['/bin/sh','-c','exit 0']);time.sleep(.05)
+    try:
+     zombie_birth=Path(f'/proc/{zombie.pid}/stat').read_text().rpartition(') ')[2].split()[19]
+     child=subprocess.Popen(['node','-e',node,str(helper)],env=env,text=True,stdout=subprocess.PIPE,start_new_session=True)
+     row(child.pid,version=2,owner=zombie.pid,owner_birth=zombie_birth)
+     self.assertEqual(child.communicate(timeout=30)[0],'false')
+    finally: zombie.wait(timeout=30)
    row(os.getpgid(0),'stale owner')
    result=subprocess.run(['node','-e',node,str(helper)],env=env,text=True,capture_output=True,timeout=30)
    self.assertEqual(result.stdout,'false')
