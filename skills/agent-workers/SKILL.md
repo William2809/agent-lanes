@@ -1,6 +1,6 @@
 ---
 name: agent-workers
-description: Delegate bounded tasks to Codex worker agents in lanes, track them, and verify their output before landing. Use when the user asks for workers, subagents, parallel agents or a second opinion, or when the project's AGENTS.md says to use them.
+description: Delegate bounded tasks to worker agents (Codex, Cursor CLI, opencode, pi or omp) in lanes, track them, and verify their output before landing. Use when the user asks for workers, subagents, parallel agents or a second opinion, or when the project's AGENTS.md says to use them.
 ---
 
 # Agent workers
@@ -19,6 +19,8 @@ Models live in presets (`ao-model ls`; see the model-presets skill). Default rol
 | `build-max` | Persistent hard failures, after `build-hard` stalled |
 | `review` | Independent read-only review of HIGH-risk work and shared UI |
 | `review-light` | Quick read-only second look |
+
+A preset's optional 6th column picks the harness (`codex` by default; `cursor`, `opencode`, `pi`, `omp`); see the model-presets skill. Every harness gets the same `wk`, `batches`, `wk -r` and `mq` behavior.
 
 Start at the lowest preset that fits. Prefer a reviewer from a different model family than the builder when you can, and give every review a specific question.
 
@@ -41,7 +43,7 @@ A good brief: the goal in one line, the exact files or paths in scope, the accep
 
 `batches pause [NAME…]` pauses named workers, or all running workers when no names are given. `batches resume [NAME…]` continues named workers, or all paused workers, from their recorded directories. State lives in `~/.claude/state/paused-workers.tsv`. Resume keeps a timestamped backup and leaves failed launches queued.
 
-- `diskguard check` tries `wt-dev drop-caches` in each repo and re-measures on first crossing WARN or before PAUSE; only stopped, unused `.next` caches are removed, and only its own paused workers resume at RESUME.
+- `diskguard check` tries `wt-dev drop-caches` in each repo and re-measures on first crossing WARN or before PAUSE; only build caches of stopped, unused lanes are removed (`.next` by default, or the framework's caches and `WT_DEV_CACHE` paths), and only its own paused workers resume at RESUME.
 - `lanes` dims an earlier worker death once the queue owns the lane or it has landed; unowned deaths, failed fixers, parked/stalled work, stalled queues and disk alerts still need you.
 - `batches`: what needs you: running / DIED / STALLED workers and lanes with work to land. Exit 3 = attention.
 - `remote-ci fail [SHA|latest]` prints a bounded, redacted red-check summary; `remote-ci blame SHA LANE...` ranks actual failing-file/directory/package overlaps as suspect hints.
@@ -78,3 +80,5 @@ Use `wk -w/-d -o` → review → `wtcommit` → `mq add` for builds, reviews and
 Every result you read is re-read on each later turn. Keep worker reports to 15 lines with details in a file, view screenshots as one contact sheet (`shot-sheet`), and let workers summarise large files for you.
 
 **Tag every new launch** with `-t FEATURE:REASON` (required unless `WK_ALLOW_UNTAGGED=1`; `wk NAME -r` retains its resume syntax). REASON = `new`, `rework` after owner feedback, `bounce`, `review`, `review-fix`, `other`, e.g. `wk archive-replace -w -o apps/web/archive -t archive:rework`. Tags go to `~/.claude/state/worker-tags.tsv`; `mq` tags its own bounce fixes. They let `loop-stats` count rebuild rounds per feature.
+
+Each attempt writes `<log>.run` (launch spec), `<log>.last` (final agent message), and `<log>.exit` (`rc` and end time). The registered `.pid` stays the real worker PID. Readers use these records first and accept legacy logs for one release.

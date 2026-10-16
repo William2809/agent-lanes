@@ -6,9 +6,21 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlin
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { createHash } from "node:crypto"
+// The repo's own ctrash, so the tests need nothing on PATH (install.sh links it next to ui-shots).
+const CTRASH = fileURLToPath(new URL("../../bin/ctrash", import.meta.url))
 import { syncBuiltinESMExports } from "node:module"
 import { fileURLToPath } from "node:url"
 import { cacheDirectory, authenticatedState, authCounts } from "./bin/auth-cache.mjs"
+const runnerHome = process.env.HOME
+// Keep ctrash's journal and dated-directory sweeps private to this test process.
+// Retain this temporary HOME as the fixture's trash journal, including on Linux.
+process.env.HOME = mkdtempSync(join(tmpdir(), "auth-cache-home-"))
+function trashFixture(dir) {
+  // Review P1: cleanup must never log or sweep in the runner's shared HOME.
+  assert.notEqual(process.env.HOME, runnerHome, "cleanup inherited runner HOME")
+  execFileSync(CTRASH, [dir], { stdio: "ignore" })
+  assert.ok(existsSync(join(process.env.HOME, ".claude-trash")))
+}
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 test("cache rejects checkout paths and symlink aliases before creating files", () => {
@@ -26,7 +38,7 @@ test("cache rejects checkout paths and symlink aliases before creating files", (
       }
     }
     assert.equal(cacheDirectory(join(realpathSync(dir), "outside", "auth")), join(realpathSync(dir), "outside", "auth"))
-  } finally { execFileSync("ctrash", [dir], { stdio: "ignore" }) }
+  } finally { trashFixture(dir) }
 })
 
 test("login lease recovers after SIGKILL and twenty waiters validate concurrently", { timeout: 30000 }, async t => {
@@ -94,7 +106,7 @@ try {
   } finally {
     for (const child of children) child.kill("SIGKILL")
     while (children.size) await pause(10)
-    execFileSync("ctrash", [dir], { stdio: "ignore" })
+    trashFixture(dir)
   }
 })
 
@@ -202,6 +214,6 @@ test("unexpected helper exits and missing grants fail without unleased publicati
     }
     for (const child of children) child.kill("SIGKILL")
     while (children.size) await pause(10)
-    execFileSync("ctrash", [dir], { stdio: "ignore" })
+    trashFixture(dir)
   }
 })

@@ -1,0 +1,27 @@
+// session: the Claude session that launched it (lead_session in <log>.run, or its scratch folder).
+export type Worker = { name: string; status: string; origin?: string; session?: string; detail?: string; log?: string; runId?: string; repo?: string }
+// log is the stable launch path; recordLog is the archived transcript path, if any.
+export type RunRecord = Worker & {
+  log: string; runId: string; repo: string; dir: string; started: number; rc?: number; ended?: number; recordLog?: string
+  // <recordLog>.delivered is exactly this run ID and a newline: a session received the report.
+  delivered?: boolean
+  // This session read this attempt through a successful `batches report NAME`.
+  read?: boolean
+  // Unclaimed only: its lead is open but names no receipt-writing mod, so it may have the report.
+  leadOpen?: boolean
+  // owner=mq: the merge queue launched it and reads its report.
+  owner?: string
+}
+// at: when the event happened (the exit time for an exit). FLOOR's at: newest evicted event.
+export type Delivery = { key: string; started: number; at?: number }
+// live: current sessions of running Claude clients; receiptSessions: sessions whose mod writes receipts.
+export type Collection = { batches: { repo: string; text: string }[]; runs: RunRecord[]; live?: string[]; receiptSessions?: string[] }
+// unclaimed: finished runs whose report no session received (origin set to its label).
+export type Summary = { workers: Worker[]; finished: number; checkedAt: number; error?: string; unclaimed?: RunRecord[] }
+export type Context = { tokens: number; window: number; percent: number; history: number[]; delta: number; limit5h?: number }
+
+declare module 'claude-code' {
+  interface PluginState {
+    workers: { summary: Summary | null; detail: string | null; context: Context | null; isCollapsed: boolean; isNudged: boolean }
+  }
+}

@@ -1,21 +1,44 @@
 #!/bin/bash
 # ABOUTME: Idempotent runner setup for one remote-ci project; rebuilds whatever is missing.
 # ABOUTME: Shared: Node per version, Postgres cluster per major (localhost only). Per project: repo, env.
+# Usage: setup.sh <project> [<seconds left>]   (a check passes its remaining total wait)
 set -euo pipefail
-. "$(dirname "$0")/lib.sh"
-load_project "$1"
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib.sh"
+# A run's snapshot (runs/<id>/bin) carries its own config, like run.sh; the shared copy uses the project's.
+if [ -f "$here/../conf" ]; then load_project "$1" "$here/../conf"; else load_project "$1"; fi
+# Named Linux bootstrap also provisions the baseline tools for future projects.
+if [ "$platform_os" = Linux ] && [ "${REMOTE_CI_BOOTSTRAP:-0}" = 1 ]; then
+  : "${REMOTE_CI_NODE:=22.14.0}" "${REMOTE_CI_PNPM:=10.6.5}" "${REMOTE_CI_POSTGRES:=18}"
+  pgbin=$(platform_pgbin "$REMOTE_CI_POSTGRES")
+  pg_profile_configure
+  export PATH="$pgbin:$ci/node/$REMOTE_CI_NODE/bin:$PATH"
+fi
+deadline=""
+case "${2:-}" in "") ;; *[!0-9-]*) echo "setup: bad wait budget $2" >&2; exit 2 ;; *) deadline=$(( $(date +%s) + $2 )) ;; esac
 mkdir -p "$ci"/{node,pg} "$dir"/{logs,results}
 # Setup changes shared toolchains/cluster auth, so exclude active slot runners.
-until ! lock_live "$ci/lock" && /usr/bin/shlock -f "$ci/lock" -p $$; do sleep 1; done
-trap 'rm -f "$ci/lock"' EXIT
+past_deadline() {
+  if [ -n "$deadline" ] && [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "lost-run: setup waited for the runner past the total deadline"; exit 74
+  fi
+}
+setup_lock() {
+  until ! lock_live "$ci/lock" && platform_lock "$ci/lock" $$; do past_deadline; sleep 1; done
+}
+setup_lock
+trap '[ "$(cat "$ci/lock" 2>/dev/null)" != $$ ] || rm -f "$ci/lock"' EXIT
 while slots_active; do
-  rm -f "$ci/lock"; sleep 1
-  until ! lock_live "$ci/lock" && /usr/bin/shlock -f "$ci/lock" -p $$; do sleep 1; done
+  rm -f "$ci/lock"; past_deadline; sleep 1
+  setup_lock
 done
+
+. "$here/platform-setup.sh"
+linux_packages
 
 if [ -n "${REMOTE_CI_NODE:-}" ] && [ ! -x "$ci/node/$REMOTE_CI_NODE/bin/node" ]; then
   tmp=$(mktemp -d)
-  file=node-v$REMOTE_CI_NODE-darwin-arm64.tar.gz
+  file=node-v$REMOTE_CI_NODE-$(python3 "$here/platform_info.py" node).tar.gz
   curl -fsSL -o "$tmp/$file" "https://nodejs.org/dist/v$REMOTE_CI_NODE/$file"
   curl -fsSL -o "$tmp/SHASUMS256.txt" "https://nodejs.org/dist/v$REMOTE_CI_NODE/SHASUMS256.txt"
   (cd "$tmp" && grep " $file\$" SHASUMS256.txt | shasum -a 256 -c - >/dev/null)
@@ -29,8 +52,14 @@ if [ -n "${REMOTE_CI_PNPM:-}" ]; then
   corepack prepare "pnpm@$REMOTE_CI_PNPM" --activate >/dev/null
 fi
 
+if [ "$platform_os" = Linux ] && [ "${REMOTE_CI_BOOTSTRAP:-0}" = 1 ]; then
+  ln -sfn "$REMOTE_CI_NODE" "$ci/node/default.new"
+  python3 -c 'import os,sys; os.replace(sys.argv[1], sys.argv[2])' "$ci/node/default.new" "$ci/node/default"
+fi
+
 if [ -n "${REMOTE_CI_POSTGRES:-}" ]; then
-  [ -x "$pgbin/postgres" ] || HOMEBREW_NO_AUTO_UPDATE=1 /opt/homebrew/bin/brew install "postgresql@$REMOTE_CI_POSTGRES"
+  [ -x "$pgbin/postgres" ] || HOMEBREW_NO_AUTO_UPDATE=1 brew install "postgresql@$REMOTE_CI_POSTGRES"
+  pg_profile_ensure
   if [ ! -f "$pgdata/PG_VERSION" ]; then
     umask 077
     openssl rand -hex 24 >"$pgdata.pass"
@@ -38,22 +67,33 @@ if [ -n "${REMOTE_CI_POSTGRES:-}" ]; then
     initdb -D "$pgdata" -U ci --pwfile="$pgdata.pass" --auth=scram-sha-256 \
       --encoding=UTF8 --locale=C >/dev/null
     printf "port = %s\nlisten_addresses = 'localhost'\nmax_connections = 200\n" "$pgport" >>"$pgdata/postgresql.conf"
+    platform_pg_config >>"$pgdata/postgresql.conf"
   fi
   umask 077
   : >"$ci/pgpass"
   for pass in "$ci"/pg/*.pass; do
     major=$(basename "$pass" .pass)
-    printf '127.0.0.1:%s:*:ci:%s\n' $((5400 + major)) "$(cat "$pass")" >>"$ci/pgpass"
+    offset=5400
+    case "$major" in *-minimal) offset=5600; major=${major%-minimal} ;; *-disposable) offset=5500; major=${major%-disposable} ;; esac
+    printf '127.0.0.1:%s:*:ci:%s\n' $((offset + major)) "$(cat "$pass")" >>"$ci/pgpass"
   done
 fi
 
 [ -d "$dir/repo.git" ] || git init -q --bare "$dir/repo.git"
+# Clients send their runner protocol as a push option; the hook refuses clients older than ~/ci/kit.
+git -C "$dir/repo.git" config receive.advertisePushOptions true
+if [ -f "$here/pre-receive.sh" ]; then
+  cp "$here/pre-receive.sh" "$dir/repo.git/hooks/pre-receive.new"
+  chmod 755 "$dir/repo.git/hooks/pre-receive.new"
+  mv -f "$dir/repo.git/hooks/pre-receive.new" "$dir/repo.git/hooks/pre-receive"
+fi
 if [ ! -d "$dir/work/.git" ]; then
   git init -q "$dir/work"
   git -C "$dir/work" remote add origin "$dir/repo.git"
 fi
 # Daily cleanup at 04:00 for every project (one agent for the whole runner).
 # Keep an existing prune agent under whatever label it was installed with; new ones get a neutral label.
+if [ "$platform_os" = Darwin ]; then
 mkdir -p "$HOME/Library/LaunchAgents"
 plist=""
 for candidate in "$HOME"/Library/LaunchAgents/*remote-ci.prune.plist; do
@@ -75,6 +115,7 @@ if [ ! -f "$plist" ]; then
 </dict></plist>
 PLIST
   launchctl bootstrap "gui/$(id -u)" "$plist"
+fi
 fi
 touch "$dir/.ready"
 echo "remote-ci setup ok: $project${REMOTE_CI_NODE:+, node $REMOTE_CI_NODE}${REMOTE_CI_PNPM:+, pnpm $REMOTE_CI_PNPM}${REMOTE_CI_POSTGRES:+, postgres $REMOTE_CI_POSTGRES on :$pgport}"

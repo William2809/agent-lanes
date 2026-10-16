@@ -1,0 +1,6 @@
+{
+  "name": "guards",
+  "version": "0.1.1",
+  "description": "Blocks rm, pattern kills, untagged or listed-model subagents, AI commit trailers, force pushes and pushes to main/staging",
+  "types": "./types/index.d.ts"
+}

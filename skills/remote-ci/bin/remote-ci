@@ -1,6 +1,6 @@
 #!/bin/bash
 # ABOUTME: Runs a project's heavy checks on a separate runner machine so the dev machine stays cool (any project with .remote-ci.conf).
-# ABOUTME: Route: direct link (e.g. Thunderbolt bridge) → named SSH host (e.g. over Tailscale) → exit 3 (caller falls back to local). See ../SKILL.md.
+# ABOUTME: Route: direct link (e.g. Thunderbolt bridge) → named SSH host (e.g. over Tailscale) → exit 3 (defer; never silently run locally). See ../SKILL.md.
 set -uo pipefail
 kit=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 # Machine-specific settings live outside the repo: ${AGENT_LANES_CONFIG:-~/.config/agent-lanes/config}.
@@ -10,6 +10,8 @@ kit=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}
 # shellcheck disable=SC1090
 [ -f "$cfg" ] && . "$cfg"
+lanes_cfg=${AGENT_LANES_CONFIG:-$HOME/.config/agent-lanes/config}
+[ "$lanes_cfg" = "$cfg" ] || [ ! -f "$lanes_cfg" ] || . "$lanes_cfg"
 user=${REMOTE_CI_USER:-$(id -un)}
 usage() {
   cat <<'USAGE'
@@ -19,14 +21,19 @@ remote-ci blame SHA LANE...                                            rank fail
 remote-ci status                                                       lock, runs, disk, Postgres
 remote-ci log [-C n] <regex>                                           grep the latest run's log (no colors)
 remote-ci info                                                         one-line route, ssh command, ports, paths (cheap lookup)
-remote-ci setup                                                        prepare the runner for this project
+remote-ci setup [runner]                                               prepare a named runner for this project
 remote-ci init                                                         add .remote-ci.conf + pre-push hook here
-Exit codes: check result, 3 = runner unreachable, 75 = busy (all slots unavailable).
+remote-ci freeze [reason] | thaw                                       hold new checks on the runner (running ones finish) / resume
+remote-ci install-runner                                               freeze, wait for running checks, install this master kit as the host kit, thaw
+Exit codes: see ../SKILL.md (check, infrastructure, busy, cleanup).
 USAGE
 }
 cmd=${1:-}; shift || true
 [ "$cmd" = init ] && exec bash "$kit/bin/remote-ci-init" "$@"
-case "$cmd" in check | fail | blame | status | setup | info | log) ;; *) usage; exit 2 ;; esac
+case "$cmd" in check | fail | blame | status | setup | info | log | freeze | thaw | install-runner) ;; *) usage; exit 2 ;; esac
+# Runner protocol this client speaks. A runner with a host kit (~/ci/kit, see install-runner) refuses pushes
+# from older clients (remote/pre-receive.sh), so one admission protocol runs on the runner at a time.
+protocol=2
 
 tail_flag=""
 if [ "$cmd" = fail ] && [ "${1:-}" = --tail ]; then tail_flag=--tail; shift; fi
@@ -39,14 +46,17 @@ if [ "$cmd" = fail ] || [ "$cmd" = blame ]; then
   fi
 fi
 root=$(git rev-parse --show-toplevel 2>/dev/null) || { [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: not in a git repository" >&2; exit 2; }
-conf=$root/.remote-ci.conf
-[ -f "$conf" ] || { [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: no .remote-ci.conf in $root (run: remote-ci init)" >&2; exit 2; }
+# land pins this to the main checkout; normal calls use this repo's config.
+conf=${REMOTE_CI_CONF:-$root/.remote-ci.conf}
+[ -f "$conf" ] || { [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: no config at $conf (run: remote-ci init)" >&2; exit 2; }
 # Keep the settings used for cache identity and execution identical while queued.
 conf_snapshot=$(mktemp)
 chmod 600 "$conf_snapshot"
 cp "$conf" "$conf_snapshot"
 conf=$conf_snapshot
-trap 'rm -f "$conf_snapshot"' EXIT
+kit_snapshot=""
+trap 'rm -f "$conf_snapshot" ${kit_snapshot:+"$kit_snapshot/"*.sh "$kit_snapshot/"*.py}; [ -z "$kit_snapshot" ] || rmdir "$kit_snapshot"' EXIT
+env_needs=${REMOTE_CI_NEEDS:-}  # Per-command needs (e.g. mrun) add to the project's conf.
 # shellcheck disable=SC1090
 . "$conf"
 if [ "$cmd" = fail ] || [ "$cmd" = blame ]; then
@@ -55,14 +65,49 @@ fi
 : "${REMOTE_CI_NAME:?set REMOTE_CI_NAME in .remote-ci.conf}"
 case "$REMOTE_CI_NAME" in *[!a-zA-Z0-9_.-]*|''|.|..) echo 'remote-ci: unsafe project name' >&2; exit 2 ;; esac
 case "${REMOTE_CI_SLOTS:-1}" in *[!0-9]* | "" | 0*) [ "$cmd" != fail ] && [ "$cmd" != blame ] || exit 1; echo "remote-ci: REMOTE_CI_SLOTS must be a positive integer" >&2; exit 2 ;; esac
+: "${REMOTE_CI_WAIT_TIMEOUT:=10800}"
+case "$REMOTE_CI_WAIT_TIMEOUT" in *[!0-9]* | "" | 0*) echo 'remote-ci: REMOTE_CI_WAIT_TIMEOUT must be a positive integer' >&2; exit 2 ;; esac
 
 base=(-o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 # A clean environment like an ssh session: the lane's DATABASE_URL, NODE_ENV and PATH must not reach the run.
 local_sh() { env -i HOME="$HOME" USER="$user" LOGNAME="$user" SHELL=/bin/bash PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash -c "cd ~ && $*"; }
+assignment_generation=""
+runner_name=""
+requested_runner=${REMOTE_CI_RUNNER:-""}
+if [ "$cmd" = setup ] && [ $# -gt 0 ]; then requested_runner=$1; shift; fi
+if [ -n "$requested_runner" ] && [ -z "${CI_RUNNERS:-}" ]; then
+  echo 'remote-ci: named setup requires CI_RUNNERS' >&2; exit 3
+fi
 router=""
 [ "${REMOTE_CI_HOST:-}" = local ] || router=${REMOTE_CI_DIRECT_HOST:-$(ipconfig getoption bridge0 router 2>/dev/null)}
 alias_opt=(); [ -n "${REMOTE_CI_HOSTKEY_ALIAS:-}" ] && alias_opt=(-o "HostKeyAlias=$REMOTE_CI_HOSTKEY_ALIAS")
-if [ "${REMOTE_CI_HOST:-}" = local ]; then
+if [ "${CI_RUNNERS+x}" = x ]; then
+  # Host-wide admin must never act on a scored runner, and the project's needs do not apply to it.
+  case "$cmd" in freeze | thaw | install-runner)
+    [ -n "$requested_runner" ] || { echo "remote-ci: CI_RUNNERS is set; name the runner: REMOTE_CI_RUNNER=<name> remote-ci $cmd" >&2; exit 2; }
+    REMOTE_CI_NEEDS="" env_needs="" ;;
+  esac
+  REMOTE_CI_NEEDS="${REMOTE_CI_NEEDS:-} $env_needs"
+  export CI_RUNNERS REMOTE_CI_NEEDS
+  for policy_key in ${!CI_RUNNER_@}; do export "$policy_key"; done
+  pool_args=(--project "$REMOTE_CI_NAME")
+  [ -z "$requested_runner" ] || pool_args+=(--runner "$requested_runner")
+  # Setup and admin need only a reachable host, not the project or an open queue.
+  case "$cmd" in setup | freeze | thaw | install-runner) pool_args+=(--setup) ;; esac
+  if [ "$cmd" = check ]; then
+    assignment_job=$(openssl rand -hex 16) || exit 3
+    pool_args+=(--job "$assignment_job")
+  fi
+  # Follow-ups read the logs on the runner that ran the sha (or the project's last check).
+  case "$cmd" in fail | blame) pool_args+=(--lookup "$target") ;; log | status | info) pool_args+=(--lookup latest) ;; esac
+  selection=$(python3 "$kit/bin/pool.py" "${pool_args[@]}") || exit 3
+  read -r runner_name runner_route assignment_generation runner_pick <<<"$selection"
+  ssh_cmd=(ssh "${base[@]}" "$runner_route")
+  git_url="$runner_route:ci/projects/$REMOTE_CI_NAME/repo.git"
+  git_ssh="ssh ${base[*]}"
+  route="pool $runner_name${runner_pick:+ ($runner_pick)}"
+elif [ "${REMOTE_CI_HOST:-}" = local ]; then
+  python3 "$kit/remote/resources.py" local-allowed || exit 3
   [ "$user" = "$(id -un)" ] || { echo "remote-ci: REMOTE_CI_HOST=local runs as you; unset REMOTE_CI_USER" >&2; exit 2; }
   ssh_cmd=(local_sh)
   git_url="$HOME/ci/projects/$REMOTE_CI_NAME/repo.git"
@@ -87,14 +132,108 @@ fi
 remote() { "${ssh_cmd[@]}" "$@" 2>&1 | grep -v '^Pseudo-terminal'; return "${PIPESTATUS[0]}"; }
 p="~/ci/projects/$REMOTE_CI_NAME"
 
+# One client deadline covers submission, queue, all commands and cleanup.
+# A local watchdog also bounds a live SSH connection that stops returning data.
+wait_remote() {
+  local remaining payload wait_child wait_watchdog rc
+  remaining=$((wait_deadline - $(date +%s)))
+  if [ "$remaining" -le 0 ]; then
+    echo "lost-run: run $run total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds (log $p/logs/$run.log)"
+    return 74
+  fi
+  payload="deadline=\$(( \$(date +%s) + $remaining ))
+    await_file() {
+      while [ ! -f \"\$1\" ]; do
+        if [ \"\$(date +%s)\" -ge \"\$deadline\" ]; then
+          echo 'lost-run: run $run total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds (log $p/logs/$run.log)'
+          exit 74
+        fi
+        sleep 1
+      done
+    }
+    $1"
+  if [ "$route" = local ]; then
+    perl -e 'setpgrp(0,0); exec @ARGV' env -i HOME="$HOME" USER="$user" LOGNAME="$user" SHELL=/bin/bash PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash -c "cd ~ && $payload" &
+  else
+    perl -e 'setpgrp(0,0); exec @ARGV' "${ssh_cmd[@]}" "$payload" &
+  fi
+  wait_child=$!
+  perl -e 'setpgrp(0,0); exec @ARGV' /bin/bash -c '
+    while [ "$(date +%s)" -lt "$1" ]; do
+      kill -0 "$2" 2>/dev/null || exit 0
+      sleep 1
+    done
+    kill -TERM -"$2" 2>/dev/null
+    sleep 1; kill -KILL -"$2" 2>/dev/null
+  ' _ "$wait_deadline" "$wait_child" &
+  wait_watchdog=$!
+  wait "$wait_child" 2>/dev/null; rc=$?
+  kill -TERM -"$wait_watchdog" 2>/dev/null || kill -TERM "$wait_watchdog" 2>/dev/null
+  wait "$wait_watchdog" 2>/dev/null
+  if [ "$rc" != 0 ] && [ "$rc" != 74 ] && [ "$(date +%s)" -ge "$wait_deadline" ]; then
+    echo "lost-run: run $run total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds (log $p/logs/$run.log)"
+    return 74
+  fi
+  return "$rc"
+}
+
+snapshot_kit() {
+  [ -z "$kit_snapshot" ] || return 0
+  kit_snapshot=$(mktemp -d) || return 1
+  cp "$kit/remote/"*.sh "$kit/remote/"*.py "$kit_snapshot/"
+}
+# Short content hash of a directory's runner scripts (names and blobs).
+kit_hash() {
+  # The manifest is a byte-ordered protocol, independent of the caller's locale.
+  (export LC_ALL=C; cd "$1" && for script in *; do
+    printf '%s\n' "$script"
+    git hash-object "$script" || exit 74
+  done | git hash-object --stdin | cut -c1-8)
+}
+# Host kit version on the runner (empty: the runner has none and this client ships its scripts).
+# While ~/ci/freeze exists (maintenance), wait within the total deadline; running checks are not touched.
+host_kit=""
+probe_runner() {
+  local state announced=0
+  while :; do
+    state=$(remote 'if [ -f ~/ci/freeze ]; then echo "frozen $(head -1 ~/ci/freeze | cut -c1-120)"; elif [ -f ~/ci/kit/VERSION ]; then echo "kit $(cat ~/ci/kit/VERSION)"; else echo nokit; fi') || return 74
+    case "$state" in
+    frozen*)
+      [ "$announced" = 1 ] || echo "remote-ci: runner frozen for maintenance (${state#frozen }); waiting"
+      announced=1
+      if [ "$(date +%s)" -ge "$wait_deadline" ]; then
+        echo "lost-run: runner stayed frozen past the total wait of $REMOTE_CI_WAIT_TIMEOUT seconds"; return 74
+      fi
+      sleep 15 ;;
+    kit\ *) host_kit=${state#kit }; return 0 ;;
+    nokit) host_kit=""; return 0 ;;
+    *) echo "remote-ci: unexpected runner state: $state"; return 74 ;;
+    esac
+  done
+}
 sync_kit() {
+  snapshot_kit || return 1
   local run_dir=""
-  [ -n "${1:-}" ] && run_dir="$p/runs/$1"
-  # Runner scripts and this project's config travel on every call, so changes apply at once.
-  tar -C "$kit/remote" -cf - . | remote 'mkdir -p ~/ci/bin; tmp=$(mktemp -d ~/ci/bin/.sync.XXXXXX) && tar -C "$tmp" -xf - && for f in "$tmp"/*; do mv -f "$f" ~/ci/bin/; done; rmdir "$tmp"' || return 1
+  if [ -n "${1:-}" ]; then
+    run_dir="$p/runs/$1"
+    remote "umask 077; mkdir -p $p/runs && mkdir $run_dir 2>/dev/null" || {
+      echo "remote-ci: cannot reserve run directory $run_dir"; return 1;
+    }
+  fi
+  # Without a host kit, runner scripts travel on every call, so changes apply at once. With one, every run
+  # copies the host kit (installed from master), whatever this client's checkout contains.
+  if [ -z "$host_kit" ]; then
+    tar -C "$kit_snapshot" -cf - . | remote 'mkdir -p ~/ci/bin; tmp=$(mktemp -d ~/ci/bin/.sync.XXXXXX) && tar -C "$tmp" -xf - && for f in "$tmp"/*; do mv -f "$f" ~/ci/bin/; done; rmdir "$tmp"' || return 1
+  fi
   remote "mkdir -p $p; tmp=\$(mktemp $p/.conf.XXXXXX) && chmod 600 \"\$tmp\" && cat >\"\$tmp\" && mv -f \"\$tmp\" $p/conf" <"$conf" || return 1
+  if [ -n "$run_dir" ] && [ -n "$host_kit" ]; then
+    remote "mkdir -p $run_dir/bin && chmod 700 $run_dir && k=\$(cd ~/ci/kit && pwd -P) && [ \"\$(cat \$k/VERSION)\" = '$host_kit' ] && cp -p \$k/*.sh \$k/*.py $run_dir/bin/" || {
+      echo "remote-ci: the runner kit changed during submission; resubmit"; return 1;
+    }
+  elif [ -n "$run_dir" ]; then
+    tar -C "$kit_snapshot" -cf - . | remote "mkdir -p $run_dir/bin && chmod 700 $run_dir && tar -C $run_dir/bin -xf -" || return 1
+  fi
   if [ -n "$run_dir" ]; then
-    tar -C "$kit/remote" -cf - . | remote "mkdir -p $run_dir/bin && chmod 700 $run_dir && tar -C $run_dir/bin -xf -" || return 1
     remote "umask 077; cat >$run_dir/conf; if [ -f $p/env.local ]; then cp $p/env.local $run_dir/env.local; fi" <"$conf" || return 1
   fi
   if [ -n "${REMOTE_CI_ENV_KEYS:-}" ] && [ -f "$root/.env" ]; then
@@ -116,8 +255,57 @@ blame)
   printf '%s\n' "$failure" | python3 "$kit/bin/blame.py" "$root" "$target" "$@"
   exit $? ;;
 setup)
-  sync_kit && remote "bash ~/ci/bin/setup.sh $REMOTE_CI_NAME"
+  wait_deadline=$(( $(date +%s) + REMOTE_CI_WAIT_TIMEOUT ))
+  probe_runner || exit 74
+  setup_script='~/ci/bin/setup.sh'; [ -z "$host_kit" ] || setup_script='~/ci/kit/setup.sh'
+  sync_kit && remote "REMOTE_CI_BOOTSTRAP=1 bash $setup_script $REMOTE_CI_NAME"
   exit $?
+  ;;
+freeze)
+  printf '%s (%s, %s)\n' "${*:-maintenance}" "$(id -un)@$(hostname -s)" "$(date '+%F %T')" |
+    remote 'mkdir -p ~/ci/logs && cat >~/ci/freeze.new && mv -f ~/ci/freeze.new ~/ci/freeze' || exit 74
+  echo "remote-ci: runner frozen; new checks wait, running ones finish (resume: remote-ci thaw)"
+  exit 0
+  ;;
+thaw)
+  remote 'if [ -f ~/ci/freeze ]; then mkdir -p ~/ci/logs && mv -f ~/ci/freeze ~/ci/logs/freeze.last; fi' || exit 74
+  echo "remote-ci: runner thawed; waiting checks continue"
+  exit 0
+  ;;
+install-runner)
+  # Only reviewed code becomes the host kit: a clean master checkout of this kit.
+  branch=$(git -C "$kit" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ "$branch" = master ] || { echo "remote-ci: install-runner runs only from a master checkout (this kit is on ${branch:-no branch})" >&2; exit 2; }
+  [ -z "$(git -C "$kit" status --porcelain -- remote)" ] || { echo "remote-ci: $kit/remote has uncommitted changes" >&2; exit 2; }
+  source_rev=$(git -C "$kit" rev-parse --short=12 HEAD) || exit 74
+  snapshot_kit || exit 74
+  rev=$(kit_hash "$kit_snapshot") || exit 74
+  froze=0
+  if ! remote 'test -f ~/ci/freeze'; then
+    printf 'install-runner %s (%s)\n' "$rev" "$(date '+%F %T')" | remote 'mkdir -p ~/ci/logs && cat >~/ci/freeze' || exit 74
+    froze=1
+  fi
+  stage=$(remote 'mkdir -p ~/ci/kits && mktemp -d ~/ci/kits/.stage.XXXXXX') || exit 74
+  tar -C "$kit_snapshot" -cf - . | remote "tar -C $stage -xf -" || exit 74
+  # Running and queued checks finish on the kit they started with; new ones wait for the thaw.
+  announced=0 drain_deadline=$(( $(date +%s) + ${REMOTE_CI_INSTALL_WAIT:-10800} ))
+  while :; do
+    active=$(remote "bash $stage/install-kit.sh count") || { echo "remote-ci: cannot count live runs; the runner stays frozen (remote-ci thaw)" >&2; exit 74; }
+    [ "$active" = 0 ] && break
+    if [ "$(date +%s)" -ge "$drain_deadline" ]; then
+      echo "remote-ci: $active run(s) still live after the install wait; nothing installed; the runner stays frozen (remote-ci thaw)" >&2; exit 75
+    fi
+    [ "$announced" = 1 ] || echo "remote-ci: runner frozen; waiting for $active running or queued check(s) to finish"
+    announced=1
+    sleep 10
+  done
+  remote "bash $stage/install-kit.sh install $stage $rev $protocol $source_rev" || { echo "remote-ci: install failed; the runner stays frozen (remote-ci thaw)" >&2; exit 74; }
+  if [ "$froze" = 1 ]; then
+    remote 'mv -f ~/ci/freeze ~/ci/logs/freeze.last' || exit 74
+  else
+    echo "remote-ci: the runner was frozen before this install; it stays frozen (remote-ci thaw)"
+  fi
+  exit 0
   ;;
 info)
   echo "route=$route ssh='${ssh_cmd[*]}' project=$p db_port=${REMOTE_CI_POSTGRES:+$((5400 + REMOTE_CI_POSTGRES))} node=${REMOTE_CI_NODE:-system} check='${REMOTE_CI_CHECK:-pnpm run check}' logs=$p/logs"
@@ -126,11 +314,11 @@ info)
 log)
   ctx=2; [ "${1:-}" = -C ] && { ctx=$2; shift 2; }
   pattern=$(printf '%s' "${1:-== finished}" | base64)
-  remote "f=\$(ls -t $p/logs/*.log | head -1); echo \"\$f\"; sed 's/\x1b\[[0-9;]*m//g' \"\$f\" | grep -E -C $ctx \"\$(echo $pattern | base64 -D)\" | head -120"
+  remote "f=\$(ls -t $p/logs/*.log | head -1); echo \"\$f\"; sed 's/\x1b\[[0-9;]*m//g' \"\$f\" | grep -E -C $ctx \"\$(echo $pattern | base64 -d)\" | head -120"
   exit $?
   ;;
 status)
-  remote "bash ~/ci/bin/status.sh $REMOTE_CI_NAME '$route' ${REMOTE_CI_SLOTS:-1}"
+  remote "s=~/ci/kit/status.sh; [ -f \$s ] || s=~/ci/bin/status.sh; bash \$s $REMOTE_CI_NAME '$route' ${REMOTE_CI_SLOTS:-1} ${REMOTE_CI_EXCLUSIVE:-0}"
   exit $?
   ;;
 esac
@@ -164,34 +352,97 @@ if [ "$worktree" = 1 ]; then
 else
   sha=$(git rev-parse "$target^{commit}") || exit 2
 fi
-# A pass is keyed on the code and this project's remote-ci settings together.
-tree=$(git rev-parse "$sha^{tree}")-$(git hash-object "$conf" | cut -c1-8)
-if [ "$force" = 0 ] && [ -z "$command" ] && remote "test -f $p/results/tree-$tree.pass"; then
+# Pool: remember the runner for this sha, so fail/blame/log follow-ups read the same logs.
+[ -z "$runner_name" ] || python3 "$kit/bin/pool.py" --project "$REMOTE_CI_NAME" --runner "$runner_name" --record "$sha" || exit 3
+# A pass identifies code, project settings and the runner scripts that run it (the host kit when installed).
+wait_deadline=$(( $(date +%s) + REMOTE_CI_WAIT_TIMEOUT ))
+probe_runner || exit 74
+# Read only the host flag. V1 must not run metadata helpers or open V2 state.
+scheduler_probe='for task_cfg in "$HOME/.config/agent-lanes/config" "$HOME/.config/agent-lanes/config"; do
+  [ ! -f "$task_cfg" ] || . "$task_cfg" >/dev/null 2>&1 || exit 74
+  done; printf "%s" "${AGENT_CI_SCHEDULER:-v1}"'
+submission_scheduler=$(remote "$scheduler_probe") || exit 74
+case "$submission_scheduler" in v1|v2) ;; *) echo "remote-ci: invalid host scheduler" >&2; exit 74 ;; esac
+snapshot_kit || exit 74
+if [ -n "$host_kit" ]; then kit_rev=$host_kit; else kit_rev=$(kit_hash "$kit_snapshot") || exit 74; fi
+if [ "$submission_scheduler" = v2 ]; then
+  submission_metadata=$(REMOTE_CI_TASK="${REMOTE_CI_TASK:-}" python3 "$kit/remote/scheduler_submit.py" "$root" "$target") || exit 74
+fi
+nonce=$(openssl rand -hex 12) || { echo "remote-ci: cannot create run ID" >&2; exit 74; }
+case "$nonce" in *[!0-9a-f]* | "") echo "remote-ci: invalid random run ID" >&2; exit 74 ;; esac
+[ "${#nonce}" = 24 ] || { echo "remote-ci: invalid random run ID" >&2; exit 74; }
+run=$(date +%Y%m%d-%H%M%S)-${sha:0:8}-$$-$nonce
+sync_kit "$run" || exit 74
+# First-time setup runs this run's own scripts and config (the ones its pass key hashes), within the total wait.
+remote "test -f $p/.ready" || wait_remote "bash $p/runs/$run/bin/setup.sh $REMOTE_CI_NAME \$((deadline - \$(date +%s)))" || exit 74
+# Actual platform/tools/services must match before accepting a result.
+encoded=$(printf '%s' "${command:-${REMOTE_CI_CHECK:-pnpm run check}}" | base64 | tr -d '\n')
+cache_mode=full; [ -z "$command" ] || cache_mode=targeted
+if remote "test -f $p/runs/$run/bin/cache.py"; then
+# The login shell can be zsh (macOS): lib.sh needs BASH_SOURCE and a no-match glob is fatal there.
+key_script="set -a; . $p/runs/$run/bin/lib.sh; load_project $REMOTE_CI_NAME $p/runs/$run/conf || exit; \
+  CACHE_TREE=$(git rev-parse "$sha^{tree}") CACHE_CONFIG=$(git hash-object "$conf") CACHE_KIT=$kit_rev \
+  CACHE_MODE=$cache_mode CACHE_COMMAND=\"\$(printf '%s' '$encoded' | platform_decode)\" \
+  python3 $p/runs/$run/bin/cache.py execution-key --env-file $p/runs/$run/env.local"
+tree=$("${ssh_cmd[@]}" "bash -c $(printf %q "$key_script")") || exit 74
+case "$tree" in ''|*[!0-9a-f]*) echo 'remote-ci: execution identity unavailable' >&2; exit 74 ;; esac
+[ "${#tree}" = 64 ] || exit 74
+pass_script="for pending in ~/ci/projects/*/results/*.cleanup; do
+  [ ! -f \"\$pending\" ] || exit 76
+  done; python3 $p/runs/$run/bin/cache.py pass-valid --path $p/results/tree-$tree.pass"
+if [ "$force" = 0 ] && [ -z "$command" ] && remote "bash -c $(printf %q "$pass_script")"; then
+  remote "printf '0\\n' >$p/results/$run.exit.new && mv $p/results/$run.exit.new $p/results/$run.exit &&
+    python3 $p/runs/$run/bin/cache.py register --key run-$REMOTE_CI_NAME-$run --kind run --path $p/runs/$run" || exit 74
   echo "remote-ci: this exact code already passed on the runner ($route); skipping."
   exit 0
 fi
-run=$(date +%Y%m%d-%H%M%S)-${sha:0:8}-$$
-sync_kit "$run" || exit 1
-remote "test -f $p/.ready" || remote "bash ~/ci/bin/setup.sh $REMOTE_CI_NAME" || exit 1
+else
+  # An older host kit cannot prove execution identity. Run without result reuse.
+  tree=uncached-$nonce
+  echo 'remote-ci: host cache identity unavailable; result reuse disabled'
+fi
 # One ref per run, so parallel callers never overwrite each other's commit while queued.
-GIT_SSH_COMMAND="$git_ssh" git push -q --force "$git_url" "$sha:refs/heads/run/$run" || exit 1
+# With a host kit, the push carries this client's protocol for the runner's pre-receive floor.
+push_options=(); [ -z "$host_kit" ] || push_options=(-o "remote-ci=$protocol")
+GIT_SSH_COMMAND="$git_ssh" git push -q --force ${push_options[@]+"${push_options[@]}"} "$git_url" "$sha:refs/heads/run/$run" || exit 74
 echo "remote-ci: $REMOTE_CI_NAME ${sha:0:8} on the runner via $route (log $p/logs/$run.log)"
+resource_mode=runner; [ "$route" != local ] || resource_mode=local
+if [ "$submission_scheduler" = v2 ]; then
+  printf '%s\n' "$submission_metadata" |
+    remote "umask 077; cat >$p/runs/$run/submission.json.new && mv $p/runs/$run/submission.json.new $p/runs/$run/submission.json" || exit 74
+fi
 encoded=$(printf '%s' "$command" | base64)
-remote "nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$encoded' $force </dev/null >/dev/null 2>&1 &" || exit 1
+launch_gate='[ ! -f ~/ci/freeze ] || { echo "remote-ci: runner frozen after submission; resubmit"; exit 75; }'
+launch_gate="$launch_gate; [ \"\$($scheduler_probe)\" = '$submission_scheduler' ] || { echo 'remote-ci: scheduler changed after submission; resubmit'; exit 75; }"
+[ -z "$host_kit" ] || launch_gate="$launch_gate; [ \"\$(cat ~/ci/kit/VERSION 2>/dev/null)\" = '$host_kit' ] || { echo 'remote-ci: runner kit changed after submission; resubmit'; exit 75; }"
+remote "$launch_gate; nohup bash $p/runs/$run/bin/run.sh $REMOTE_CI_NAME $sha $tree $run '$encoded' $force '$resource_mode' '$assignment_generation' </dev/null >/dev/null 2>&1 &" || exit 74
 # If this connection drops, the run still finishes and cleans up on the runner (see: remote-ci status).
 if [ "$summary" = 1 ]; then
-  remote "done=$p/results/$run.exit
-    while [ ! -f \$done ]; do sleep 2; done
-    sed 's/\x1b\[[0-9;]*m//g' $p/logs/$run.log |
-      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|== timing|== finished|maximum resident' |
-      sed 's/^[^ :]*:[a-z:-]*: *//' | awk '!seen[\$0]++' | head -60
+  echo "remote-ci: full log on the runner at $p/logs/$run.log"
+  wait_remote "done=$p/results/$run.exit
+    await_file \"\$done\"
+    log=$p/logs/$run.log
+    followed=\$(sed -n 's/^== following run \([a-zA-Z0-9_.-][a-zA-Z0-9_.-]*\) sha .*/\1/p' \"\$log\" | head -1)
+    set -- \"\$log\"
+    if [ -n \"\$followed\" ] && [ -f $p/logs/\$followed.log ]; then
+      set -- $p/logs/\$followed.log \"\$log\"
+    fi
+    sed 's/\x1b\[[0-9;]*m//g' \"\$@\" |
+      grep -E '${REMOTE_CI_SUMMARY_PATTERN:-Test Files|Tests  |FAIL |error TS|ERR_|Failed:|✖|passed|failed|Error:}|timeout after|busy:|lost-run:|== following|== cached:|== timing|== resources|runner cleanup pending:|== cleanup recovered:|maximum resident' |
+      sed 's/^[^ :]*:[a-z:-]*: *//' | grep -v -E '^== (check-result|finished) rc=|^runner cleanup pending:' | awk '!seen[\$0]++' | head -60
+    grep -h '^runner cleanup pending:' \"\$@\" | awk '!seen[\$0]++'
+    grep -h -E '^== (check-result|finished) rc=' \"\$@\" | awk '!seen[\$0]++'
     exit \$(cat \$done)"
   rc=$?
-  echo "remote-ci: full log on the runner at $p/logs/$run.log"
+  [ "$rc" != 77 ] || echo "remote-ci: superseded"
   exit $rc
 fi
-remote "log=$p/logs/$run.log; done=$p/results/$run.exit
-  while [ ! -f \$log ]; do sleep 1; done
+wait_remote "log=$p/logs/$run.log; done=$p/results/$run.exit
+  await_file \"\$log\"
   tail -n +1 -f \$log & t=\$!
-  while [ ! -f \$done ]; do sleep 2; done
-  sleep 1; kill \$t; exit \$(cat \$done)"
+  trap 'kill \"\$t\" 2>/dev/null; wait \"\$t\" 2>/dev/null' EXIT HUP INT TERM
+  await_file \"\$done\"
+  sleep 1; exit \$(cat \$done)"
+rc=$?
+[ "$rc" != 77 ] || echo "remote-ci: superseded"
+exit "$rc"

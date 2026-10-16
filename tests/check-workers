@@ -1,0 +1,16 @@
+#!/bin/sh
+# Portable worker state/collector checks; --host requires the actual Claude hook engine.
+set -eu
+cd "$(dirname "$0")/.."
+if [ "${1:-}" = --host ]; then
+  command -v claude >/dev/null 2>&1 || { echo 'FAIL workers host integration: claude is unavailable' >&2; exit 1; }
+  claude plugin validate mods/workers
+  exec claude plugin test mods/workers
+fi
+[ -x node_modules/.bin/tsc ] || { echo 'FAIL workers portable: run npm ci first' >&2; exit 1; }
+build=$(mktemp -d "${TMPDIR:-/tmp}/workers-check.XXXXXX")
+# Keep the small emitted build for inspection; no cleanup of user files.
+node_modules/.bin/tsc -p mods/workers/tsconfig.portable.json --outDir "$build"
+WORKERS_BUILD="$build" node --test mods/workers/tests/portable.test.mjs
+python3 mods/workers/tests/records_test.py
+echo 'workers host integration: separate check (npm run test:workers:host)'

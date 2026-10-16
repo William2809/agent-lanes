@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Queued validation of private helpers and their mechanically renamed public form."""
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[1]
+SUITES = ['test_ci_reliability', 'test_ci_policy', 'test_resources', 'test_runner']
+
+
+def check(root, skill):
+    return subprocess.call([sys.executable, '-m', 'unittest', '-v', *SUITES],
+                           cwd=root / 'skills' / skill,
+                           env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['--ownership-only']:
+        SUITES = ['test_ci_reliability', 'test_resources']
+    elif sys.argv[1:]:
+        sys.exit('usage: check-ci-followup [--ownership-only]')
+    result = check(ROOT, 'remote-ci')
+    if result:
+        sys.exit(result)
+    with tempfile.TemporaryDirectory(prefix='ci-public-parity-') as temp:
+        public = Path(temp)
+        shutil.copytree(ROOT / 'skills/remote-ci', public / 'skills/remote-ci',
+                        ignore=shutil.ignore_patterns('__pycache__'))
+        (public / 'bin').mkdir()
+        shutil.copy2(ROOT / 'bin/safe-check', public / 'bin/safe-check')
+        for path in public.rglob('*'):
+            if not path.is_file():
+                continue
+            source = path.read_text()
+            for old, new in [('remote-ci', 'remote-ci'), ('REMOTE_CI_', 'REMOTE_CI_'),
+                             ('remote_ci', 'remote_ci'), ('agent-lanes', 'agent-lanes')]:
+                source = source.replace(old, new)
+            path.write_text(source)
+        # File names use the same rename contract as tools/export-public.
+        for folder in ('bin', 'templates'):
+            for path in list((public / 'skills/remote-ci' / folder).iterdir()):
+                if 'remote-ci' in path.name:
+                    path.rename(path.with_name(path.name.replace('remote-ci','remote-ci')))
+        result = check(public, 'remote-ci')
+    sys.exit(result)

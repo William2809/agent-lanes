@@ -11,11 +11,14 @@
 #   pointing at its copy; `rm` drops it. Clone failures remove the fresh worktree; --shared-db /
 #   WT_DEV_SHARED_DB=1 opts out. Remote databases stay shared with a warning. No DATABASE_URL means no database.
 #   Setups share max(1, logical CPUs / 2) slots across repos; WT_DEV_MAX_SETUPS overrides.
+#   Automatic ports start at WT_DEV_PORT_BASE (default 3001); --port and saved ports take precedence.
 #   wt-dev sleep-idle [--minutes N] [-n]   # sleep idle servers (default 30 min); -n previews
 #   `new` quietly sleeps idle servers first. `ls` shows sleeping; `start` wakes them.
 #   Sleeping drops the worktree's build caches (preset or WT_DEV_CACHE). drop-caches does it for every stopped worktree.
 #   wt-dev install <name> [--if-changed] [-n]   # (re)install deps; --if-changed skips unchanged lockfiles; -n prints
 #   wt-dev start|stop|log|path <name>      wt-dev ls      wt-dev rm <name>
+#   A lane's commands read the lane's own .wt-dev.conf (`new`: the one committed at --from).
+#   Lanes live in ~/worktrees/<repo folder name>; a second repo with the same folder name gets <name>-<hash>.
 set -euo pipefail
 
 die() { echo "wt-dev: $*" >&2; exit 1; }
@@ -23,19 +26,44 @@ repo=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die
 repo=$(cd "$repo/.." && pwd)
 repo_name=$(basename "$repo" | tr ' ' '-')
 helper="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/wtdev_db.py"
-# Optional per-repo settings (committed, sourced as shell): WT_DEV_APP, WT_DEV_CMD, WT_DEV_INSTALL,
-# WT_DEV_CACHE, WT_DEV_URL_VARS, WT_DEV_READY_TIMEOUT, WT_DEV_READY_ANY, WT_DEV_DB_VAR, WT_DEV_DB_CLONE, WT_DEV_DB_DROP.
-# shellcheck disable=SC1091
-[ -f "$repo/.wt-dev.conf" ] && . "$repo/.wt-dev.conf"
-dbvar=${WT_DEV_DB_VAR:-DATABASE_URL}
-root="$HOME/worktrees/$repo_name"
-state="$HOME/.cache/wt-dev/$repo_name"
+# claim NS: lanes and state under NS belong to this repo. The first repo keeps its folder name (existing
+# paths keep working); another repo with the same folder name uses NS-<hash of its path>.
+claim() {
+  local f="$HOME/.cache/wt-dev/$1/.repo" rc=0 i=0
+  [ "$(cat "$f" 2>/dev/null)" != "$repo" ] || return 0
+  # Check and write under a lock, so two repos never both take one folder.
+  mkdir -p "${f%/*}" || return 1
+  until mkdir "$f.lock" 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || die "claim lock $f.lock is stuck (remove it if no wt-dev runs)"; sleep 0.1
+  done
+  claim_locked "$1" "$f" || rc=1
+  rmdir "$f.lock"; return $rc
+}
+claim_locked() {
+  local d g owner=""
+  [ ! -f "$2" ] || owner=$(cat "$2")
+  [ "$owner" != "$repo" ] || return 0
+  # Claimed by a repo that no longer exists there (moved): its lanes may be ours now; check them as below.
+  [ -z "$owner" ] || [ ! -e "$owner" ] || return 1
+  # Unclaimed (made before claims existed): ours unless a lane there belongs to another repo.
+  for d in "$HOME/worktrees/$1"/*/; do
+    [ -e "$d.git" ] || continue
+    g=$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
+    [ "$(cd "$g/.." && pwd)" = "$repo" ] || return 1
+  done
+  printf '%s\n' "$repo" >"$2"
+}
+repo_id=$(printf '%s' "$repo" | shasum | cut -c1-12)
+ns=$repo_name
+claim "$ns" || { ns="$repo_name-${repo_id:0:8}"; claim "$ns" || die "lane folder $ns belongs to another repo"; }
+root="$HOME/worktrees/$ns"
+state="$HOME/.cache/wt-dev/$ns"
 mkdir -p "$root" "$state"
 
 cmd=${1:-}; shift || true
 name=""
 [[ "$cmd" =~ ^(new|start|stop|log|path|rm|install)$ ]] && { name=${1:-}; [ -n "$name" ] || die "$cmd needs a name"; shift; }
-from=HEAD; branch=""; port=""; app=""; install=1; shared_db=${WT_DEV_SHARED_DB:-0}
+from=HEAD; branch=""; port=""; app=""; install=1; shared_db=""
 minutes=30; dry_run=0; if_changed=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,9 +80,31 @@ done
 minutes=$((10#$minutes))
 [ -z "$name" ] || { [[ "$name" =~ ^[a-zA-Z0-9_.-]+$ ]] && [ "$name" != . ] && [ "$name" != .. ]; } || die "invalid worktree name"
 wt="$root/$name"
+# Optional settings (committed KEY=value data, never run as shell): WT_DEV_APP, WT_DEV_CMD, WT_DEV_INSTALL,
+# WT_DEV_CACHE, WT_DEV_URL_VARS, WT_DEV_READY_TIMEOUT, WT_DEV_READY_ANY, WT_DEV_DB_VAR, WT_DEV_DB_CLONE, WT_DEV_DB_DROP.
+# A lane's own file, so a lane can change and test it (land's install runs the stacked tip's); `new` reads
+# the file committed at --from, which the lane will hold. Repo-wide commands use the main checkout's. `path` reads none.
+# load_conf FILE|-: the helper parses literals only and prints shell-quoted assignments.
+load_conf() { local out; out=$(python3 "$helper" conf "$1") || exit 1; eval "$out"; }
+if [ "$cmd" = path ]; then :
+elif [ "$cmd" = new ]; then
+  if conf=$(git -C "$repo" show "$from:.wt-dev.conf" 2>/dev/null); then load_conf - <<<"$conf"; fi
+elif [ -n "$name" ] && [ -d "$wt" ]; then
+  [ ! -f "$wt/.wt-dev.conf" ] || load_conf "$wt/.wt-dev.conf"
+else
+  [ ! -f "$repo/.wt-dev.conf" ] || load_conf "$repo/.wt-dev.conf"
+fi
+dbvar=${WT_DEV_DB_VAR:-DATABASE_URL}
+shared_db=${shared_db:-${WT_DEV_SHARED_DB:-0}}
+# Marks a Postgres copy as this repo's lane; a database without it is never dropped by `new`.
+owner="wt-dev $repo_id $name"
 setup_slot=""
 release_setup() { [ -z "$setup_slot" ] || { rm -rf "$setup_slot"; setup_slot=""; }; }
-trap release_setup EXIT
+port_lock=""
+release_port() {
+  [ -z "$port_lock" ] || { python3 "$helper" release-port "$state/ports" "$port_lock" "$$"; port_lock=""; }
+}
+trap 'release_port; release_setup' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 # A short advisory guard serializes mkdir + PID publication + stale-slot moves.
@@ -139,7 +189,16 @@ detect_app() {
   [ -n "${WT_DEV_CMD:-}" ] && { echo .; return; }
   echo ""
 }
-free_port() { local p=3001; while lsof -iTCP:$p -sTCP:LISTEN >/dev/null 2>&1; do p=$((p+1)); done; echo $p; }
+reserve_port() {
+  python3 "$helper" reserve-port "$state/ports" "$1" "$$" || return 1
+  port_lock=$1; port=$1
+}
+port_listens() { nc -z -G 1 127.0.0.1 "$1" >/dev/null 2>&1 || nc -z -G 1 ::1 "$1" >/dev/null 2>&1; }
+free_port() {
+  local p=${WT_DEV_PORT_BASE:-3001}
+  # nc is ~ms; lsof took ~8 s per port on a busy Mac and stalled launches for minutes.
+  while port_listens "$p" || ! reserve_port "$p"; do p=$((p + 1)); done
+}
 # Per-worktree database helpers. URLs are never printed (they hold passwords).
 main_url() { grep -E "^(export )?$dbvar=" "$repo/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"; }
 db_of() { local u=${1%%\?*}; echo "${u##*/}"; }
@@ -159,6 +218,7 @@ hook_db() {
   out=$(cd "$wt" && WT_DEV_NAME=$name WT_DEV_WORKTREE=$wt WT_DEV_SOURCE_URL=$(main_url) sh -c "$WT_DEV_DB_CLONE") || { db_warning="WT_DEV_DB_CLONE failed"; return 1; }
   new=$(printf '%s\n' "$out" | tail -1)
   echo "hook" >"$state/$name.db"
+  printf '%s\n' "${WT_DEV_DB_DROP:-}" >"$state/$name.dbdrop"
   [ -n "$new" ] || { echo "database: copied by WT_DEV_DB_CLONE"; return 0; }
   (umask 077; printf '%s\n' "$new" >"$state/$name.dburl")
   printf '%s\n' "$new" | python3 "$helper" env-set "$repo/.env" "$wt/.env.wt-dev.new" "$dbvar" && rm -f "$wt/.env" && mv "$wt/.env.wt-dev.new" "$wt/.env" ||
@@ -181,18 +241,27 @@ own_db() {
   for tool in pg_dump psql createdb pg_restore; do
     command -v "$tool" >/dev/null || { db_warning="$tool missing"; return 1; }
   done
-  local src; src=$(db_of "$u"); local dst; dst="${src}_wt_$(echo "$name" | tr -c 'a-zA-Z0-9\n' '_' | tr 'A-Z' 'a-z')"
+  local src; src=$(db_of "$u"); local dst; dst=$(python3 "$helper" pgname "$src" "$name") || { db_warning="no database name"; return 1; }
+  [[ "$dst" =~ ^[A-Za-z0-9_.-]+$ ]] || { db_warning="database name $src needs plain characters (letters, digits, . _ -)"; return 1; }
   local admin; admin=$(with_db "$u" postgres)
-  # A same-named clone can only be a leftover: `new` already refused an existing worktree.
-  psql "$admin" -q -c "drop database if exists \"$dst\" with (force)" >/dev/null 2>&1
-  createdb --maintenance-db="$admin" "$dst" 2>/dev/null || { db_warning="createdb failed"; return 1; }
+  # A same-named database is dropped only when it carries this lane's owner mark (a leftover of it).
+  case "$(pg_owner "$admin" "$dst")" in
+    '') ;;
+    "x$owner") pg_run "$admin" psql __WT_DEV_PG_URL__ -q -c "drop database if exists \"$dst\" with (force)" >/dev/null 2>&1 ;;
+    '?') db_warning="could not list databases"; return 1 ;;
+    *) db_warning="database $dst exists and is not this lane's; not dropping it (drop it by hand if it is a leftover)"; return 1 ;;
+  esac
+  pg_run "$admin" createdb --maintenance-db=__WT_DEV_PG_URL__ "$dst" 2>/dev/null || { db_warning="createdb failed"; return 1; }
+  pg_run "$admin" psql __WT_DEV_PG_URL__ -q -c "comment on database \"$dst\" is '$owner'" >/dev/null 2>&1 || {
+    pg_run "$admin" psql __WT_DEV_PG_URL__ -q -c "drop database if exists \"$dst\" with (force)" >/dev/null 2>&1
+    db_warning="could not mark the database as this lane's"; return 1; }
   local clone; clone=$(with_db "$u" "$dst")
   local failed="" source_tables clone_tables
   local table_sql="select n.nspname, count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'p', 'f') and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' group by n.nspname order by n.nspname collate \"C\""
-  if ! pg_dump -Fc "$u" 2>/dev/null | pg_restore --exit-on-error -d "$clone" >/dev/null 2>&1; then
+  if ! pg_run "$u" pg_dump -Fc __WT_DEV_PG_URL__ 2>/dev/null | pg_run "$clone" pg_restore --exit-on-error -d __WT_DEV_PG_URL__ >/dev/null 2>&1; then
     failed="dump/restore failed"
-  elif ! source_tables=$(psql "$u" -Atqc "$table_sql" 2>/dev/null) ||
-       ! clone_tables=$(psql "$clone" -Atqc "$table_sql" 2>/dev/null); then
+  elif ! source_tables=$(pg_run "$u" psql __WT_DEV_PG_URL__ -Atqc "$table_sql" 2>/dev/null) ||
+       ! clone_tables=$(pg_run "$clone" psql __WT_DEV_PG_URL__ -Atqc "$table_sql" 2>/dev/null); then
     failed="clone table counts could not be verified"
   elif [ "$source_tables" != "$clone_tables" ]; then
     failed="clone table counts differ from source"
@@ -218,18 +287,38 @@ own_db() {
     fi
   fi
   if [ -n "$failed" ]; then
-    psql "$admin" -q -c "drop database if exists \"$dst\" with (force)" >/dev/null 2>&1 || failed="$failed; clone cleanup failed"
+    pg_run "$admin" psql __WT_DEV_PG_URL__ -q -c "drop database if exists \"$dst\" with (force)" >/dev/null 2>&1 || failed="$failed; clone cleanup failed"
     db_warning="$failed"; return 1
   fi
   echo "database: $dst (clone of $src)"
 }
+# pg_run URL CLIENT ARGS: keep credentials out of every process's argv.
+pg_run() { local url=$1; shift; WT_DEV_PG_URL=$url python3 "$helper" pg-exec "$@"; }
+# pg_owner ADMIN DB: "" (no such database), "x<comment>", or "?" (could not ask).
+pg_owner() {
+  pg_run "$1" psql __WT_DEV_PG_URL__ -Atqc "select 'x' || coalesce(shobj_description(oid, 'pg_database'), '') from pg_database where datname = '$2'" 2>/dev/null || echo '?'
+}
 drop_db() {
-  [ -f "$state/$name.db" ] || return 0; local u kind tok; u=$(main_url); read -r kind tok <"$state/$name.db" || true
+  [ -f "$state/$name.db" ] || return 0; local u kind tok
+  # What to drop was recorded at `new`: the lane's settings may have changed since. A lane made before
+  # that was recorded was made with the main checkout's settings.
+  if [ -f "$state/$name.dbvar" ]; then dbvar=$(cat "$state/$name.dbvar")
+  else dbvar=$(unset WT_DEV_DB_VAR; [ ! -f "$repo/.wt-dev.conf" ] || load_conf "$repo/.wt-dev.conf"; echo "${WT_DEV_DB_VAR:-DATABASE_URL}"); fi
+  if [ -f "$state/$name.dbdrop" ]; then WT_DEV_DB_DROP=$(cat "$state/$name.dbdrop")
+  else WT_DEV_DB_DROP=$(unset WT_DEV_DB_DROP; [ ! -f "$repo/.wt-dev.conf" ] || load_conf "$repo/.wt-dev.conf"; printf '%s' "${WT_DEV_DB_DROP:-}"); fi
+  u=$(main_url); read -r kind tok <"$state/$name.db" || true
   case "$kind" in
     sqlite|mysql) python3 "$helper" drop "$kind" "$repo" "$wt" "$tok" "$dbvar";;
     hook) [ -n "${WT_DEV_DB_DROP:-}" ] || return 0
       (cd "$repo" && WT_DEV_NAME=$name WT_DEV_WORKTREE=$wt WT_DEV_DB_URL=$(cat "$state/$name.dburl" 2>/dev/null) sh -c "$WT_DEV_DB_DROP") && echo "dropped database (WT_DEV_DB_DROP)";;
-    *) psql "$(with_db "$u" postgres)" -q -c "drop database if exists \"$kind\" with (force)" >/dev/null 2>&1 && echo "dropped database $kind";;
+    *) local admin; admin=$(with_db "$u" postgres)
+      # Another lane's mark: not ours to drop. No mark: a copy made before marks existed.
+      case "$(pg_owner "$admin" "$kind")" in
+        ''|x|"x$owner") ;;
+        '?') echo "not dropping database $kind: could not check whose it is (drop it by hand)"; return 0;;
+        *) echo "not dropping database $kind: it is marked as another lane's"; return 0;;
+      esac
+      pg_run "$admin" psql __WT_DEV_PG_URL__ -q -c "drop database if exists \"$kind\" with (force)" >/dev/null 2>&1 && echo "dropped database $kind";;
   esac
 }
 running() {
@@ -263,7 +352,12 @@ start() {
   else echo "no dev server: no known framework in $a (set WT_DEV_CMD in .wt-dev.conf)"; return 0; fi
   urls="${WT_DEV_URL_VARS:-BETTER_AUTH_URL NEXTAUTH_URL AUTH_URL} $urls"
   echo "$cache" > "$state/$name.cache"
-  [ -n "$port" ] || port=$( [ -f "$state/$name.port" ] && ! lsof -iTCP:"$(cat "$state/$name.port")" -sTCP:LISTEN >/dev/null 2>&1 && cat "$state/$name.port" || free_port )
+  if [ -n "$port" ]; then
+    reserve_port "$port" || die "port $port is reserved by another setup"
+  else
+    local saved; saved=$(cat "$state/$name.port" 2>/dev/null || true)
+    if [ -z "$saved" ] || lsof -iTCP:"$saved" -sTCP:LISTEN >/dev/null 2>&1 || ! reserve_port "$saved"; then free_port; fi
+  fi
   ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || die "port $port is already in use"
   echo "$port" > "$state/$name.port"
   local log="$state/$name.log"
@@ -304,6 +398,7 @@ start() {
     sleep 1; t=$((t + 1))
   done
   listener_ours "$port" || { tail -5 "$log"; die "dev server not listening on :$port after ${t}s (another process may hold the port; log: $log)"; }
+  release_port
   echo "ready: http://localhost:$port  (ui-shots --base http://localhost:$port)"
 }
 stop() {
@@ -318,6 +413,32 @@ stop() {
 
 clear_state() {
   rm -f "$state/$name".*  # small state files this tool wrote
+}
+dk() {  # dk SECONDS ARGS...: docker with a kill deadline, so a stuck daemon cannot hang rm
+  local t=$1 p w r; shift
+  docker "$@" & p=$!
+  # The watchdog's own sleep dies with it, so a quick call leaves nothing behind.
+  ( trap 'kill "$sp" 2>/dev/null; exit 0' TERM; sleep "$t" & sp=$!; wait "$sp" && kill -9 "$p" ) >/dev/null 2>&1 & w=$!
+  wait "$p"; r=$?; kill "$w" 2>/dev/null; wait "$w" 2>/dev/null; return "$r"
+}
+drop_pdf() {  # the worktree's own PDF renderer (wt-pdf up) dies with the worktree
+  command -v docker >/dev/null 2>&1 || return 0
+  # Only containers owned by this lane, removed by ID, never by a name match alone (a lane
+  # called renderer-1 would otherwise hit the shared renderer). Owned = wt-pdf's label for
+  # this lane, or (containers from before the label) the exact wt-pdf name, not managed by
+  # compose (no config-hash), and loading pages from this lane's own dev port.
+  local ids id meta port
+  ids=$(dk 10 ps -aq --filter "label=agent-lanes.wt-pdf=$ns/$name" 2>/dev/null) || return 0
+  port=$(cat "$state/$name.port" 2>/dev/null || true)
+  if [ -n "$port" ] && meta=$(dk 10 inspect "$ns-pdf-$name" --format \
+      '{{.Id}} {{index .Config.Labels "com.docker.compose.config-hash"}}{{index .Config.Labels "agent-lanes.wt-pdf"}}' 2>/dev/null); then
+    id=${meta%% *}
+    if [ "$meta" = "$id " ] && dk 10 inspect "$id" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null |
+        grep -qxF "PDF_APPLICATION_ORIGIN=http://host.docker.internal:$port"; then ids="$ids $id"; fi
+  fi
+  for id in $ids; do
+    dk 20 rm -f "$id" >/dev/null && echo "removed PDF renderer of $name (${id:0:12})"
+  done
 }
 server_tree() {
   ps -axo pid=,ppid= | awk -v root="$1" '
@@ -377,7 +498,7 @@ install_deps() {
   if [ "$if_changed" = 1 ] && [ "$(cat "$stamp" 2>/dev/null)" = "$sum" ] && deps_present; then return 0; fi
   : >"$log"
   while IFS= read -r c; do
-    (cd "$wt" && sh -c "$c") >>"$log" 2>&1 || { tail -5 "$log" >&2; echo "wt-dev: install failed: $c (log: $log)" >&2; return 1; }
+    (cd "$wt" && sh -c "$c") >>"$log" 2>&1 || { rc=$?; tail -5 "$log" >&2; echo "wt-dev: install failed: $c (log: $log)" >&2; return "$rc"; }
   done <<<"$cmds"
   echo "$sum" >"$stamp"
   echo "installed deps ($(printf '%s\n' "$cmds" | awk '{print $1}' | paste -sd, -))"
@@ -422,6 +543,7 @@ case "$cmd" in
     for f in "$repo"/.env "$repo"/.env.local "$repo"/apps/*/.env "$repo"/apps/*/.env.local; do
       [ -f "$f" ] || continue; rel=${f#"$repo/"}; ln -s "$f" "$wt/$rel"
     done
+    echo "$dbvar" >"$state/$name.dbvar"
     if [ "$shared_db" != 1 ] && ! own_db; then
       reason=${db_warning:-database clone failed}
       git -C "$repo" worktree remove --force "$wt" || reason="$reason; fresh worktree cleanup failed"
@@ -439,21 +561,38 @@ case "$cmd" in
   rm)
     stop
     if [ ! -d "$wt" ]; then  # already gone: clean leftovers, say so plainly
-      git -C "$repo" worktree prune; drop_db || true; clear_state; die "no worktree $name (not found; leftover state cleaned)"; fi
+      git -C "$repo" worktree prune; drop_db || true; drop_pdf || true; clear_state; die "no worktree $name (not found; leftover state cleaned)"; fi
     # An SQLite file copied into the worktree is held aside (it would block the removal if git
     # tracks its folder) and put back if git refuses; it is deleted only after a successful removal.
     hold=""; dbrel=""
     case "$(cat "$state/$name.db" 2>/dev/null)" in "sqlite rel:"*)
-      dbrel=$(cut -d: -f2- "$state/$name.db"); hold="$state/$name.dbhold"
+      dbrel=$(cut -d: -f2- "$state/$name.db")
       case "$dbrel" in /*|*..*) die "bad database state for $name";; esac
-      if [ -f "$wt/$dbrel" ] && [ ! -L "$wt/$dbrel" ]; then mkdir -p "$hold" && mv "$wt/$dbrel"* "$hold/"; else hold=""; fi;;
+      # Only the database and SQLite's own side files: anything else untracked makes git refuse below.
+      if [ -f "$wt/$dbrel" ] && [ ! -L "$wt/$dbrel" ]; then
+        hold=$(mktemp -d "$state/$name.dbhold.XXXXXX") || die "cannot hold $dbrel aside"
+        for f in "$wt/$dbrel" "$wt/$dbrel-wal" "$wt/$dbrel-shm" "$wt/$dbrel-journal"; do
+          if [ -f "$f" ] && [ ! -L "$f" ]; then mv "$f" "$hold/" || die "cannot hold database file; check $hold"; fi
+        done
+      else hold=""; fi;;
     esac
     if ! git -C "$repo" worktree remove "$wt"; then
-      [ -z "$hold" ] || mv "$hold"/* "$(dirname "$wt/$dbrel")/" && rmdir "$hold" 2>/dev/null
-      die "worktree has changes; commit or move them first (not forced)"
+      # Git can unregister the worktree, then fail its final rmdir because a process (a browser,
+      # a dev server) wrote files meanwhile. Nothing tracked is left, so trash the remnant.
+      real=$(cd "$wt" 2>/dev/null && pwd -P) || real=$wt
+      if git -C "$repo" worktree list --porcelain | grep -qxF -e "worktree $wt" -e "worktree $real"; then
+        if [ -n "$hold" ]; then
+          mv "$hold"/* "$(dirname "$wt/$dbrel")/" || die "database rollback failed; held files at $hold"
+          rmdir "$hold" || die "database rollback left files at $hold"
+        fi
+        die "worktree has changes; commit or move them first (not forced)"
+      fi
+      ctrash "$wt" >/dev/null || die "worktree unregistered but $wt could not be trashed"
+      echo "trashed leftover files in $wt"
     fi
-    if [ -n "$hold" ]; then rm -rf "$hold"; echo "dropped sqlite copy $(basename "$dbrel")"; rm -f "$state/$name.db"; fi
+    if [ -n "$hold" ]; then ctrash "$hold" >/dev/null || die "cannot trash held database at $hold"; echo "dropped sqlite copy $(basename "$dbrel")"; ctrash "$state/$name.db" >/dev/null; fi
     drop_db || true
+    drop_pdf || true
     clear_state; echo "removed $wt";;
   sleep-idle) sleep_idle;;
   drop-caches)  # build caches of every stopped/sleeping worktree in this repo

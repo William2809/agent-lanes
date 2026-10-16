@@ -51,7 +51,7 @@ The owner's viewport is only one state. At each checkpoint (about 5 accepted cha
 - `ui-shots` of the changed page(s) at the owner's pane width, a narrower desktop with panels open (~1280), the other theme, and a 390 glance (readable only); plus each sibling page in the same state when a shared component or token changed. Fix clipping or overlap before committing; mention anything you can't fix cheaply.
 - Focus, control semantics, warnings and complete numbers are preserved.
 
-## Astra (optional, async, read-only, preset `astrax`)
+## Second opinion (optional, async, read-only, preset `review`)
 
 Never per tweak (minutes per answer = stale advice). Use it at three points, one review in flight per topic, launched before you hand the turn back to the owner:
 - Before a consequential redesign: challenge removals, cross-role hierarchy and behavior assumptions.

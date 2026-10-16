@@ -1,17 +1,23 @@
 #!/bin/sh
 # ABOUTME: Commits a wt-dev worktree's changes by explicit path (never `git add -A`), skipping
-# ABOUTME: .reviews/ and the file-size baseline. Prints the short sha and file count, or the hook error tail.
+# ABOUTME: .reviews/, the file-size baseline and paths in .git/info/wt-local-only. Prints the short sha and file count, or the hook error tail.
 # Usage: wtcommit <worktree> "<message>"  |  wtcommit "<message>" (inside the worktree)     (run inside the repo)   -n = dry run (list files only)
 set -eu
 case "${1:-}" in -h|--help|help) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 0;; -*) [ "$1" = -n ] || { echo "wtcommit: unknown option $1" >&2; exit 2; };; esac
 [ "${1:-}" = "-n" ] && { dry=1; shift; } || dry=0
 name=${1:?usage: wtcommit [-n] <worktree> "<message>"}; msg=${2:-}
+# A worktree path works too: run from inside it and use its folder name.
+case "$name" in */*|.|..) [ -d "$name" ] && { cd "$name"; name=$(basename "$(pwd -P)"); };; esac
 # Run inside a worktree with only a message: commit that worktree.
 if [ $# -eq 1 ] && [ ! -d "$(wt-dev path "$name" 2>/dev/null)" ]; then
   top=$(git rev-parse --show-toplevel 2>/dev/null || true); msg=$name; name=$(basename "${top:-.}")
 fi
 wt=$(wt-dev path "$name"); [ -d "$wt" ] || { echo "no worktree $name" >&2; exit 1; }
 files=$(git -C "$wt" status --porcelain=v1 -uall | cut -c4- | sed 's/.* -> //' | grep -v -e '^\.reviews/' -e '^tools/file-size-baseline\.json$' || true)
+# Per-worktree local-only paths (never committed): one path per line in .git/info/wt-local-only.
+# --absolute-git-dir is this worktree's own gitdir; --git-path info/ resolves to the shared common dir.
+lo="$(git -C "$wt" rev-parse --absolute-git-dir)/info/wt-local-only"
+[ -s "$lo" ] && files=$(printf '%s\n' "$files" | grep -vxF -f "$lo" || true)
 [ -n "$files" ] || { echo "$name: nothing to commit"; exit 0; }
 if [ $dry -eq 1 ]; then printf '%s\n' "$files"; exit 0; fi
 [ -n "$msg" ] || { echo "message required" >&2; exit 2; }

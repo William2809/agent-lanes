@@ -158,14 +158,17 @@ def repo_lanes(main, bstat, reg, acked, show_old):
         mq = run(['sh', '-c', 'command -v mq'], cwd=main).strip()
         if mq:
             mq = os.path.realpath(mq)
-            env = dict(os.environ, MQ_COPY=mq)  # run in place: no temp copy left behind
-            for l in run(['sh', mq, 'waiting'], cwd=main, env=env).splitlines():
+            # mq makes and removes its own temp copy; an in-place MQ_COPY run lacked MQ_TOOL_ROOT.
+            for l in run(['sh', mq, 'waiting'], cwd=main).splitlines():
                 if ' waits on ' in l:
                     waiting.add(l.split()[0])
     alerts = []
     ready = sum(1 for q in queue if len(q) > 1 and q[1] == 'ready')
     if ready and not runner:
         alerts.append(f'QUEUE STALLED: {ready} ready, no runner (mq run)')
+        for detail in lines(os.path.join(mqdir, 'infra')):
+            if detail.startswith('runner cleanup pending: '):
+                alerts.append(detail.split(' rc=', 1)[0])
     disk = lines(os.path.join(STATE, 'diskguard'))
     if disk:
         f = disk[0].split()

@@ -117,6 +117,16 @@ def latest(logs, target, tail=False):
             continue
         if target != 'latest' and not any(s.startswith(target) for s in re.findall(r'\bsha ([0-9a-f]{40})\b', text)):
             continue
+        # Followers have no check output. Read the named owner's log for fail/blame.
+        followed = re.search(r'^== following run ([a-zA-Z0-9_.-]+) sha ', text, re.M)
+        if followed and parse(text)['failed']:
+            owner = Path(logs) / (followed[1] + '.log')
+            try:
+                owner_text = owner.read_text(errors='replace')
+                if parse(owner_text)['failed']:
+                    text, file = owner_text, owner
+            except OSError:
+                pass
         result = parse(text, str(file))
         if tail and result['failed']:
             # Last 80 lines only; bound each line before the redaction boundary.

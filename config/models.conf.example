@@ -1,5 +1,8 @@
 # Personal model presets. Copy to ~/.config/agent-lanes/models.conf. Same format as presets/models.conf;
 # a line with the same name overrides the default, new names add short aliases.
-# name     model          effort   sandbox(max)   route
-# fast     gpt-6.1-sol    low      full-access    codex
-# deep     gpt-6.1-sol    xhigh    full-access    codex
+# name     model                  effort   sandbox(max)   route   [harness: codex | cursor | opencode | pi | omp]
+# fast     gpt-6.1-sol            low      full-access    codex
+# deep     gpt-6.1-sol            xhigh    full-access    codex
+# pi-build openai-codex/gpt-5.5   medium   full-access    -       pi
+# oc-rev   openai/gpt-5.5         high     read-only      -       opencode
+# cu-build gpt-5                  medium   workspace-write -      cursor
