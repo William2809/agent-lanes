@@ -106,6 +106,7 @@ class ClientProcessTests(unittest.TestCase):
         supervisor.kill()
         supervisor.wait(timeout=60)
         self.wait_gone(orphan)
+        supervisor.communicate(timeout=60)
 
     def test_timeout_does_not_signal_unrelated_process_group(self):
         unrelated = subprocess.Popen(['sleep', '30'], start_new_session=True)
