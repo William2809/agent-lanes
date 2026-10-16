@@ -110,6 +110,34 @@ echo "LANDED fixture"
         self.assertEqual(self.f.queue(), [])
         self.assertEqual(list(self.tmp.glob('mq.*')), [])
 
+    def test_next_land_attempt_bundles_kit_file_added_mid_run(self):
+        # Regression 2026-10-17: a runner kept its start-time file list, so route_policy.py,
+        # committed while it ran, was missing from later attempts (rc 74). Boundary: the
+        # file appears during attempt one; attempt two must carry it.
+        self.f.run('wt-dev', 'new', 'c')
+        c = self.f.home / 'worktrees/demo/c'
+        self.f.commit(self.f.lanes['b'], 'b.txt', 'b\n')
+        self.f.commit(c, 'c.txt', 'c\n')
+        land = self.tools / 'skills/wt-dev/bin/land'
+        client = self.tools / 'skills/remote-ci/bin/remote-ci'
+        land.write_text('''#!/bin/sh
+remote-ci check
+added="$FIXTURE_ROOT/tools/skills/remote-ci/bin/added_mid_run.py"
+[ -f "$added" ] || printf 'print(1)\\n' >"$added"
+echo "LANDED fixture"
+''')
+        client.write_text('#!/bin/sh\nif [ -f "$MQ_TOOL_ROOT/skills/remote-ci/bin/added_mid_run.py" ]; '
+                          'then echo HAS; else echo MISSING; fi >>"$FIXTURE_ROOT/pinned.calls"\n')
+        for name, path in (('land', land), ('remote-ci', client)):
+            shim = self.f.shims / name
+            if shim.exists():
+                shim.replace(shim.with_name(name + '.held'))
+            shim.symlink_to(path)
+        self.f.run(self.mq, 'add', 'b', 'c')
+        result = self.f.run(self.mq, 'run', env={'MQ_TRAIN': '1'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.f.root / 'pinned.calls').read_text().splitlines(), ['MISSING', 'HAS'])
+
     def test_live_guard_update_cannot_change_running_queue(self):
         # Requirement 1; boundary: update after startup, before the first guard call.
         self.prepare_repair()

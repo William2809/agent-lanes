@@ -35,14 +35,16 @@ mini_kit_files() (
   git -C "$_src" ls-files -- skills/remote-ci/bin skills/remote-ci/remote 2>/dev/null | grep . ||
     { cd "$_src" && find skills/remote-ci/bin skills/remote-ci/remote ! -type d ! -name '*.bak' ! -name '*.pyc' ! -path '*/__pycache__/*'; }
 )
-files="bin/mq bin/mq-lock.py bin/mq-guard.py bin/mq-diagnostics.py bin/ctrash bin/diskguard
+base_files="bin/mq bin/mq-lock.py bin/mq-guard.py bin/mq-diagnostics.py bin/ctrash bin/diskguard
 skills/agent-workers/scripts/state.sh skills/agent-workers/scripts/run-record.sh skills/agent-workers/scripts/batches.sh
 skills/wt-dev/bin/land skills/wt-dev/bin/wt-dev skills/wt-dev/bin/wtdev_db.py skills/wt-dev/bin/migcheck
 skills/remote-ci/bin/remote-ci skills/remote-ci/bin/fail-summary.py skills/remote-ci/bin/blame.py
 skills/remote-ci/remote/lib.sh skills/remote-ci/remote/prune.sh skills/remote-ci/remote/run.sh
 skills/remote-ci/remote/setup.sh skills/remote-ci/remote/status.sh skills/remote-ci/remote/resources.py"
-# Required files above fail fast when missing; the rest of the kit rides along.
-files=$(printf '%s\n' $files $(mini_kit_files) | awk '!seen[$0]++')
+# Required files above fail fast when missing; the rest of the kit rides along. Each snapshot re-lists
+# the kit: a long runner must not keep its start-time list (route_policy.py, 2026-10-17).
+refresh_files() { files=$(printf '%s\n' $base_files $(mini_kit_files) | awk '!seen[$0]++'); }
+refresh_files
 tool_revision() (
   # An archive below an unrelated checkout must not inherit that checkout's revision.
   if _top=$(git -C "$MQ_TOOL_ROOT" rev-parse --show-toplevel 2>/dev/null) &&
@@ -75,6 +77,7 @@ if [ -z "${MQ_COPY:-}" ]; then
   copy_needed=1
 fi
 snapshot_tools() {
+  refresh_files
   for f in $files; do
     [ -r "$MQ_TOOL_ROOT/$f" ] || { echo "mq: missing tool $f" >&2; exit 1; }
   done
