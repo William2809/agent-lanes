@@ -97,11 +97,15 @@ def acquire_v2(queue, token, owner, deadline, limits, request, mode=None, submit
     import scheduler_legacy
     import scheduler_process
     import scheduler_events
+    import scheduler_pause
     telemetry_state = None
     if mode == 'runner':
         import scheduler_profiles
         request = scheduler_profiles.authorize(request, Path.home()/'ci', limits)
     registered = False
+    adopting = bool(request.pop('park_adopt', False))
+    park_nonce = request.pop('park_nonce', '')
+    envelope_hash = request.get('park_envelope', '')
     while True:
         recovering = bool(request.get('recovery_of'))
         if mode and not recovering and scheduler_version() != 'v2':
@@ -123,21 +127,34 @@ def acquire_v2(queue, token, owner, deadline, limits, request, mode=None, submit
                 return dict(result=74, state='lost')
             if recovering and data['jobs'].get(request['recovery_of'], {}).get('state') != 'quarantined':
                 return dict(result=74, state='lost')
-            if not registered and not recovering and (Path.home()/'ci/freeze').exists():
+            if not registered and not recovering and not adopting and (Path.home()/'ci/freeze').exists():
                 return dict(result=75, state='frozen')
             scheduler_legacy.import_cleanup(data, Path.home() / 'ci', now)
             if not registered:
                 if owner not in procs:
                     raise ValueError('resource queue owner lost')
-                scheduler.submit(data, token, owner, procs[owner]['start'], now, deadline, request)
-                data['jobs'][token]['owner_birth'] = procs[owner]['birth']
-                if submitted:  # A pool move keeps its first submission time (never in the future).
-                    data['jobs'][token]['submitted_at'] = min(now, submitted)
+                if adopting:
+                    adopted = scheduler_pause.adopt(data, token, owner, procs[owner]['start'],
+                                                    procs[owner]['birth'], envelope_hash,
+                                                    park_nonce, now)
+                    if adopted == 'expired':
+                        return dict(result=75, state='expired')
+                    if not adopted:
+                        return dict(result=scheduler_pause.PARKED, state='park-conflict')
+                else:
+                    scheduler.submit(data, token, owner, procs[owner]['start'], now, deadline, request)
+                    data['jobs'][token]['owner_birth'] = procs[owner]['birth']
+                    if submitted:  # A pool move keeps its first submission time (never in the future).
+                        data['jobs'][token]['submitted_at'] = min(now, submitted)
                 registered = True
+            if not adopting and envelope_hash and scheduler_pause.park(
+                    data, token, owner, procs[owner]['birth'], envelope_hash, now):
+                outcome = dict(result=scheduler_pause.PARKED, state='parked')
+            else:
+                outcome = None
             blocked = scheduler_legacy.blocker(Path.home() / 'ci', procs)
             scheduler.schedule(data, dict(metrics, legacy_blocker=blocked), limits, procs, now)
             row = data['jobs'][token]
-            outcome = None
             if row['state'] == 'running':
                 outcome = dict(workers=row['workers'], memory_mb=row['memory_mb'], slot=row['slot'],
                             predicted_mb=row.get('predicted_mb', row['memory_mb']),
@@ -723,7 +740,7 @@ def local_run(args, queue, limits):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['acquire', 'release', 'mark', 'watch', 'status', 'run', 'local-allowed', 'scheduler-version', 'cancel', 'verify', 'active-count', 'quarantined-projects', 'recover-pending', 'event', 'telemetry', 'reap', 'profile', 'withdraw'])
+    parser.add_argument('action', choices=['acquire', 'release', 'mark', 'watch', 'status', 'run', 'local-allowed', 'scheduler-version', 'cancel', 'verify', 'verify-resume', 'active-count', 'quarantined-projects', 'recover-pending', 'event', 'telemetry', 'reap', 'profile', 'withdraw'])
     parser.add_argument('--json', action='store_true', help='status is always JSON')
     parser.add_argument('--token')
     parser.add_argument('--run-id')
@@ -747,6 +764,9 @@ def main():
     parser.add_argument('--wait', type=int, default=10800)
     parser.add_argument('--command')
     parser.add_argument('--request-file')
+    parser.add_argument('--park-envelope')
+    parser.add_argument('--park-adopt', action='store_true')
+    parser.add_argument('--park-nonce')
     parser.add_argument('--result', type=int, default=74)
     parser.add_argument('--quarantine', action='store_true')
     parser.add_argument('--actual-memory', type=int)
@@ -827,15 +847,36 @@ def main():
                                 scheduler_process.members(record, procs) and
                                 procs.get(args.owner, {}).get('group') == record['group'] for record in records)):
                     raise ValueError('maintenance needs a live scheduler phase')
+        elif args.action == 'verify-resume':
+            import scheduler_process
+            procs = scheduler_process.snapshot()
+            with queue.transaction() as data:
+                row = data['jobs'].get(args.token, {})
+                owner = procs.get(args.owner, {})
+                if (row.get('state') != 'starting' or row.get('park_version') != 1 or
+                        row.get('resume_nonce') != args.park_nonce or row.get('resume_reaping') or
+                        row.get('resume_owner') != args.owner or
+                        not row.get('resume_owner_birth') or
+                        owner.get('birth') != row.get('resume_owner_birth')):
+                    raise ValueError('resume launcher identity changed')
         elif args.action == 'cancel':
+            terminal = None
             with queue.transaction() as data:
                 row = data['jobs'][args.token]
                 if (row.get('version') != 2 or row.get('protocol') != 2 or
-                        row.get('state') not in ('queued', 'following', 'running') or
+                        row.get('state') not in ('queued', 'following', 'running', 'parked', 'starting') or
                         (args.phase not in ('queued', 'admitted') and not row.get('groups')) or
                         row.get('lease_generation') != args.generation or row.get('phase') != args.phase):
                     raise ValueError('lease identity changed')
                 row['cancel'] = True
+                if row.get('state') == 'parked':
+                    import scheduler_pause
+                    scheduler_pause.terminalize_parked(data, args.token, 74, time.time())
+                    terminal = dict(row)
+            if terminal:
+                import scheduler_pause
+                import scheduler_process
+                scheduler_pause.audit(queue, Path.home()/'ci', scheduler_process.snapshot())
             import scheduler_process
             scheduler_process.reconcile(queue)
         elif args.action == 'release':
@@ -860,6 +901,9 @@ def main():
                 if scheduler_version() != 'v2':
                     raise ValueError('v2 disabled on host')
                 request = json.loads(Path(args.request_file).read_text())
+                if args.park_envelope and request.get('park_version') == 1:
+                    request.update(park_envelope=args.park_envelope,
+                                   park_adopt=args.park_adopt, park_nonce=args.park_nonce or '')
                 admitted = acquire_v2(queue, args.token, args.owner, args.deadline, policy(args.mode), request, args.mode, args.submitted)
                 import scheduler_withdraw
                 if admitted.get('result') == scheduler_withdraw.MOVED:

@@ -57,6 +57,9 @@ for spec in skills/session-stats/test_session_stats.py skills/loop-stats/test_lo
   suite=${spec##*/}; suite=${suite%.py}
   run "${spec%.py}" python_suite "${spec%/*}" "$suite" || status=1
 done
+if [ -f skills/ci-board/test_maintenance.py ]; then
+  run skills/ci-board/test_maintenance python_suite skills/ci-board test_maintenance || status=1
+fi
 # test_browser_tools.mjs needs a project with Playwright installed.
 run skills/ui-shots/test_auth_cache node --test skills/ui-shots/test_auth_cache.mjs || status=1
 run mods/workers/portable sh tests/check-workers || status=1

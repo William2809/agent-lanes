@@ -75,7 +75,7 @@ def submit(data, token, owner, start, now, deadline, request):
                landing=bool(request.get('landing')), blocker=None,
                cleanup_required=bool(request.get('cleanup_required')),
                requested={key: request[key] for key in ('slots', 'workers', 'memory_mb', 'leases')})
-    for key in ('predicted_mb', 'samples', 'source', 'profile_known', 'profile', 'predicted_s', 'estimate_scope'):
+    for key in ('predicted_mb', 'samples', 'source', 'profile_known', 'profile', 'predicted_s', 'estimate_scope', 'park_version', 'park_envelope'):
         if key in request:
             row[key] = request[key]
     if re.fullmatch(r'[a-zA-Z0-9_.-]{1,160}', request.get('run_id', '')):
@@ -228,6 +228,10 @@ def schedule(data, metrics, limits, procs, now):
         state = row['state']
         if state in TERMINAL or state == 'quarantined':
             continue
+        if state in ('parked', 'starting'):
+            # The pause controller owns result publication and launcher reaping.
+            # A starting row may still own a live pre-admission process tree.
+            continue
         if row.get('cancel') and not row.get('process') and not row.get('groups'):
             complete(data, token, 74, now, state == 'running' and needs_cleanup(row))
             continue
@@ -256,7 +260,7 @@ def schedule(data, metrics, limits, procs, now):
     pending = sorted((r for r in jobs.values() if r.get('state') == 'queued'),
                      key=lambda r: r['sequence'])
     active = {t: r for t, r in jobs.items() if r.get('workers') or r.get('state') == 'quarantined'}
-    if limits.get('FAST_LANE'):
+    if limits.get('FAST_LANE') and not data.get('paused'):
         import scheduler_fast
         scheduler_fast.admit(data, pending, active, metrics, limits, now, frozen)
         pending = []
@@ -277,6 +281,8 @@ def schedule(data, metrics, limits, procs, now):
             reason = dict(reason='pressure' if pressure else 'swap-recovery', holder=None)
         if metrics.get('legacy_blocker'):
             reason = metrics['legacy_blocker']
+        if data.get('paused'):
+            reason = dict(reason='maintenance', holder=None)
         if not reason and head and not row.get('recovery_of'):
             if now - head['submitted_at'] >= DRAIN_SECONDS:
                 reason = dict(reason='head-drain', holder=next(t for t, r in jobs.items() if r is head))

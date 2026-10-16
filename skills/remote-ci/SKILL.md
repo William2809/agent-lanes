@@ -22,6 +22,7 @@ also use `safe-check`; respect project policies that pause local testing. Nothin
 | `remote-ci status` / `remote-ci setup`       | State of the runner / idempotent setup for this project                |
 | `remote-ci init`                           | Add `.remote-ci.conf` and a pre-push hook to this repo                 |
 | `remote-ci freeze [reason]` / `thaw`      | Hold new checks on the runner (running ones finish) / resume them    |
+| `remote-ci pause [reason]` / `resume`      | V2: durably park supported queued checks / resume the same runs      |
 | `remote-ci install-runner`                 | From a clean master checkout: freeze, drain, install the host kit, thaw |
 
 ### Exit codes
@@ -253,6 +254,22 @@ Rollback: `remote-ci install-runner` from a checkout of the earlier master commi
 needs a temporary `master` branch there); never `mv` onto the `~/ci/kit` symlink (BSD `mv` moves into the
 directory it points to). Removing `~/ci/kit` returns to client-shipped scripts and drops the floor.
 `remote-ci freeze` / `thaw` alone pause intake for other maintenance (disk, Postgres, OS updates).
+
+`remote-ci pause` is the durable v2 upgrade path. It freezes intake, then parks only
+unstarted checks created by a kit with the same park protocol. Admission and parking
+share the queue lock. Running checks and cleanup recovery finish normally; v1,
+following, older, or uncertain queued checks remain drain blockers and are never
+killed or rewritten. A parked row retains its token, FIFO sequence, submission time,
+deadline, result path and source ref. Its mode-0600 resume envelope stays inside the
+mode-0700 run directory; the ledger contains only its digest, never the command.
+Installer audit accepts a parked row only after its old owner birth identity is gone,
+its pinned scripts and envelope validate, and it owns no capacity, process group,
+slot, or quarantined lease. `remote-ci resume` claims each row with a nonce and a new
+lease generation, appends to the original log, and launches its pinned run snapshot.
+Repeated resume cannot duplicate execution. The original deadline is never reset;
+an expired parked check publishes 75 without candidate execution. The resumed check
+uses its pinned compatible allocator, so allocator changes that cannot read the park
+protocol still require an ordinary drain. `freeze` remains the v1 intake-only tool.
 
 ## Layout on the runner
 

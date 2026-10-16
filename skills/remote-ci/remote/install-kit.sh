@@ -19,7 +19,7 @@ count)
     python3 "$(cd "$(dirname "$0")" && pwd)/resources.py" recover-pending
   fi
   # Include recorded orphan groups. A bare Python phase is not a bash runner.
-  lease_count=$(python3 "$(cd "$(dirname "$0")" && pwd)/resources.py" active-count)
+  lease_count=$(python3 "$(cd "$(dirname "$0")" && pwd)/scheduler_pause.py" audit)
   echo "$((shell_count + lease_count))"
   ;;
 install)
