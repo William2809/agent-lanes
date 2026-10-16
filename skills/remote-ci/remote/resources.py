@@ -92,7 +92,7 @@ def scheduler_sample():
     return metrics
 
 
-def acquire_v2(queue, token, owner, deadline, limits, request, mode=None):
+def acquire_v2(queue, token, owner, deadline, limits, request, mode=None, submitted=None):
     import scheduler
     import scheduler_legacy
     import scheduler_process
@@ -131,6 +131,8 @@ def acquire_v2(queue, token, owner, deadline, limits, request, mode=None):
                     raise ValueError('resource queue owner lost')
                 scheduler.submit(data, token, owner, procs[owner]['start'], now, deadline, request)
                 data['jobs'][token]['owner_birth'] = procs[owner]['birth']
+                if submitted:  # A pool move keeps its first submission time (never in the future).
+                    data['jobs'][token]['submitted_at'] = min(now, submitted)
                 registered = True
             blocked = scheduler_legacy.blocker(Path.home() / 'ci', procs)
             scheduler.schedule(data, dict(metrics, legacy_blocker=blocked), limits, procs, now)
@@ -721,7 +723,7 @@ def local_run(args, queue, limits):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['acquire', 'release', 'mark', 'watch', 'status', 'run', 'local-allowed', 'scheduler-version', 'cancel', 'verify', 'active-count', 'quarantined-projects', 'recover-pending', 'event', 'telemetry', 'reap', 'profile'])
+    parser.add_argument('action', choices=['acquire', 'release', 'mark', 'watch', 'status', 'run', 'local-allowed', 'scheduler-version', 'cancel', 'verify', 'active-count', 'quarantined-projects', 'recover-pending', 'event', 'telemetry', 'reap', 'profile', 'withdraw'])
     parser.add_argument('--json', action='store_true', help='status is always JSON')
     parser.add_argument('--token')
     parser.add_argument('--run-id')
@@ -749,6 +751,7 @@ def main():
     parser.add_argument('--quarantine', action='store_true')
     parser.add_argument('--actual-memory', type=int)
     parser.add_argument('--generation', type=int)
+    parser.add_argument('--to', help='withdraw: the pool runner the client moves the job to')
     parser.add_argument('--phase', choices=sorted(ci_telemetry.PHASES | {'queued', 'admitted', 'maintenance'}), default='unknown')
     args = parser.parse_args()
     try:
@@ -782,6 +785,17 @@ def main():
             print(scheduler_version())
             return 0
         queue = Queue()
+        if args.action == 'withdraw':
+            import scheduler_withdraw
+            try:
+                if scheduler_version() != 'v2' or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', args.to or ''):
+                    raise ValueError('withdraw needs scheduler v2 and a runner name')
+                with queue.transaction() as data:
+                    scheduler_withdraw.withdraw(data, args.token, args.generation, args.to, time.time())
+            except ValueError as error:
+                print('remote-ci: withdraw refused (%s)' % error, file=sys.stderr)
+                return 1
+            return 0
         if args.action == 'telemetry':
             print(json.dumps(ci_telemetry.summary(queue.root / 'telemetry'), sort_keys=True))
         elif args.action == 'event':
@@ -846,7 +860,13 @@ def main():
                 if scheduler_version() != 'v2':
                     raise ValueError('v2 disabled on host')
                 request = json.loads(Path(args.request_file).read_text())
-                admitted = acquire_v2(queue, args.token, args.owner, args.deadline, policy(args.mode), request, args.mode)
+                admitted = acquire_v2(queue, args.token, args.owner, args.deadline, policy(args.mode), request, args.mode, args.submitted)
+                import scheduler_withdraw
+                if admitted.get('result') == scheduler_withdraw.MOVED:
+                    with queue.transaction() as data:
+                        dest = data['jobs'].get(args.token, {}).get('moved_to')
+                    print('== moved to %s' % dest if dest else '== withdrawn', file=sys.stderr)
+                    return scheduler_withdraw.MOVED
                 if 'result' in admitted:
                     if admitted.get('follow_run'):
                         print('== following run %s sha %s (scheduler)' % (admitted['follow_run'], request['sha']), file=sys.stderr)

@@ -1,7 +1,7 @@
 #!/bin/bash
 # ABOUTME: Checks one exact commit in an isolated slot with optional install and database templates.
 # ABOUTME: Coordinates shared Postgres; REMOTE_CI_EXCLUSIVE=1 opts a project into the host-exclusive run.
-# Usage: run.sh <project> <commit> <tree> <run-id> [<base64 command>] [<force>]
+# Usage: run.sh <project> <commit> <tree> <run-id> [<base64 command>] [<force>] [<mode>] [<pool generation>] [<first submitted epoch>]
 set -u
 runner_dir=$(cd "$(dirname "$0")" && pwd)
 . "$runner_dir/lib.sh"
@@ -67,22 +67,26 @@ if [ "${1:-}" = --cleanup-v2 ]; then
     --generation "${AGENT_CI_LEASE_GENERATION:-0}" --owner "$$" --phase cleanup || exit 74
 fi
 clean_databases() {
-  local owner_filter=""
+  local owner_filter="" databases db
   [ "$slotted" = 1 ] && owner_filter="and datdba = (select oid from pg_roles where rolname = '$role')"
   if [ -n "${REMOTE_CI_DB_CLEAN:-}" ]; then
-    psql -d postgres -Atq -v pattern="$REMOTE_CI_DB_CLEAN" -v role="$role" <<SQL |
+    # Enumerate first: a psql|dropdb pipeline would run two infrastructure
+    # supervisors concurrently against the same V1 ownership journal.
+    databases=$(psql -d postgres -Atq -v pattern="$REMOTE_CI_DB_CLEAN" -v role="$role" <<SQL
 select datname from pg_database
 where datname like :'pattern' $owner_filter;
 SQL
-      # A test harness may mark its own clone source as a template; dropdb refuses templates.
-      while read -r db; do
-        dropdb --if-exists --force "$db" ||
-          { psql -d postgres -q -c "alter database \"$db\" is_template false" </dev/null && dropdb --if-exists --force "$db"; } || exit 1
-      done
-    [ "${PIPESTATUS[*]}" = "0 0" ] || return 1
+    ) || return 1
+    while IFS= read -r db; do
+      [ -n "$db" ] || continue
+      # A test harness may mark its own clone source as a template.
+      dropdb --if-exists --force "$db" ||
+        { psql -d postgres -q -c "alter database \"$db\" is_template false" </dev/null && dropdb --if-exists --force "$db"; } || return 1
+    done <<<"$databases"
   fi
   [ "$slotted" = 0 ] || dropdb --if-exists --force "$REMOTE_CI_DB"
 }
+
 # Recovery uses the failed run's settings, never the new candidate's settings.
 if [ "${1:-}" = --cleanup ] || [ "${1:-}" = --cleanup-v2 ]; then
   cleanup_protocol=$1
@@ -222,7 +226,9 @@ cache_delete() {
 log=$dir/logs/$run.log
 exec >"$log" 2>&1
 [ -z "$exclusive_notice" ] || echo "$exclusive_notice"
-submitted=$(date +%s)
+submitted=$(date +%s) first_submitted=""; launched=$submitted
+# A pool move (arg 9) keeps the first submission time: queue age and total wait survive it.
+case "${9:-}" in ''|*[!0-9]*) ;; *) [ "$9" -ge "$submitted" ] || { submitted=$9; first_submitted=$9; } ;; esac
 wait_deadline=$((submitted + REMOTE_CI_WAIT_TIMEOUT))
 child="" watchdog="" locked=0 slot=0 template_lock="" pg_started=0 guard_owned=0 template_locked=0 drain_owned=0
 install_lock=""
@@ -519,7 +525,7 @@ if [ "$cache_identity" = 1 ] && [ -z "$command" ] && [ "$force" = 0 ]; then
       break
     fi
     release_claim_guard
-    [ $(( $(date +%s) - submitted )) -lt 300 ] || busy_claim "tree claim metadata unavailable after 300 seconds"
+    [ $(( $(date +%s) - launched )) -lt 300 ] || busy_claim "tree claim metadata unavailable after 300 seconds"
     [ "$(date +%s)" -lt "$wait_deadline" ] || busy_claim "tree claim total wait exceeded $REMOTE_CI_WAIT_TIMEOUT seconds"
     if [ "$owner" = "$owner_pid" ] && [ -n "$followed" ] && [ "$owner_state" = 0 ]; then
       receipt cache tree follower following

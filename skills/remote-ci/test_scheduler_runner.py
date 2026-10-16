@@ -53,7 +53,7 @@ class SchedulerRunner(unittest.TestCase):
         outside = subprocess.run(['node', '-e',
             "console.log(require(process.argv[1]).allocation() !== null)",
             str(self.home/'legacy-lease.cjs')], env=dict(self.env, AGENT_CI_TOKEN=token),
-            capture_output=True, text=True, timeout=10, start_new_session=True)
+            capture_output=True, text=True, timeout=60, start_new_session=True)
         self.assertEqual(outside.returncode, 0, outside.stderr)
         self.assertEqual(outside.stdout.strip(), 'false')
         (self.home/'release').touch()

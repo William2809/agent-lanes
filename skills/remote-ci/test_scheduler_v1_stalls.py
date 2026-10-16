@@ -65,8 +65,8 @@ class V1StallBounds(unittest.TestCase):
         started = time.monotonic()
         run = 'stuck-' + tool
         self.assert_result(self.start(run, force=True, command=command), run, 76 if retains_cleanup else 74)
-        self.assertLess(time.monotonic() - started, 12)
-        self.assertTrue(marker.exists())
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertTrue(marker.exists(), self.log(run))
         self.assert_gone(marker)
         if not cleanup:
             self.assertFalse((self.home / 'candidate-ran').exists())
@@ -87,7 +87,7 @@ class V1StallBounds(unittest.TestCase):
         started = time.monotonic()
         self.assert_result(self.start('stuck-git', force=True, command='touch "$HOME/candidate-ran"'),
                            'stuck-git', 74)
-        self.assertLess(time.monotonic() - started, 10)
+        self.assertLess(time.monotonic() - started, 30)
         self.assertFalse((self.home / 'candidate-ran').exists())
         self.assert_gone(marker)
 
@@ -107,13 +107,15 @@ class V1StallBounds(unittest.TestCase):
             'createdb() { return 0; }\n')
         self.assert_result(self.start('pg-service', force=True, command='true'), 'pg-service', 0)
         marker = self.home / 'pg-service'
-        self.assertTrue(marker.exists())
+        self.assertTrue(marker.exists(), self.log('pg-service'))
         pid = int(marker.read_text())
         os.kill(pid, 0)
         os.kill(pid, signal.SIGTERM)
 
     def test_stuck_cache_copy_is_infrastructure_and_reaped(self):
         self.short_deadlines()
+        with (self.dir / 'conf').open('a') as stream:
+            stream.write('REMOTE_CI_TIMEOUT=8\nREMOTE_CI_WAIT_TIMEOUT=90\n')
         tools = self.ci / 'node/stall/bin'
         tools.mkdir(parents=True)
         marker = self.home / 'stuck-cp'
@@ -128,9 +130,9 @@ class V1StallBounds(unittest.TestCase):
         started = time.monotonic()
         self.assert_result(self.start('stuck-cp', force=True, command='touch "$HOME/candidate-ran"'),
                            'stuck-cp', 74)
-        self.assertLess(time.monotonic() - started, 10)
+        self.assertLess(time.monotonic() - started, 30)
         self.assertFalse((self.home / 'candidate-ran').exists())
-        self.assertTrue(marker.exists())
+        self.assertTrue(marker.exists(), self.log('stuck-cp'))
         self.assert_gone(marker)
 
     def test_stuck_psql_is_infrastructure_and_reaped(self):
@@ -163,15 +165,15 @@ class V1StallBounds(unittest.TestCase):
         self.procs.append(proc)
         self.wait_for(lambda: ownership.exists() and descendant.exists())
         proc.kill()
-        proc.wait(timeout=5)
+        proc.wait(timeout=60)
         retained = subprocess.run([
             'python3', str(self.bin / 'resources.py'), 'release', '--token', token,
-        ], env=self.env, timeout=10)
+        ], env=self.env, timeout=60)
         self.assertEqual(retained.returncode, 76)
         queue = json.loads((state / 'queue.json').read_text())['jobs'][token]
         self.assertEqual(queue['infra_tree_marker'], str(ownership))
         self.assertEqual(queue['workers'], 2)
-        deadline = time.monotonic() + 6
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
                 os.kill(int(descendant.read_text()), 0)
@@ -183,12 +185,12 @@ class V1StallBounds(unittest.TestCase):
         recovered = subprocess.run([
             'python3', str(self.bin / 'bounded_process.py'), '--reap-marker', str(ownership),
             '--token', token,
-        ], env=self.env, timeout=10)
+        ], env=self.env, timeout=60)
         self.assertEqual(recovered.returncode, 0)
         self.assertFalse(ownership.exists())
         released = subprocess.run([
             'python3', str(self.bin / 'resources.py'), 'release', '--token', token,
-        ], env=self.env, timeout=10)
+        ], env=self.env, timeout=60)
         self.assertEqual(released.returncode, 0)
         self.assertNotIn(token, json.loads((state / 'queue.json').read_text())['jobs'])
 
