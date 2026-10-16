@@ -24,6 +24,14 @@ LIMITS = dict(MAX_JOBS=1, MAX_WORKERS=2, CPU_RESERVE=2, MEM_RESERVE_MB=2048, WOR
 
 
 class Resources(unittest.TestCase):
+    def setUp(self):
+        # V1 fixtures must not inherit a real runner's v2 authority/config.
+        home = tempfile.TemporaryDirectory(prefix='resource-fixture-')
+        self.addCleanup(home.cleanup)
+        policy = patch.dict(os.environ, HOME=home.name, AGENT_CI_SCHEDULER='v1')
+        policy.start()
+        self.addCleanup(policy.stop)
+
     def test_legacy_group_projection_revokes_stale_v2_admission(self):
         with tempfile.TemporaryDirectory() as temp:
             queue = r.Queue(temp)
