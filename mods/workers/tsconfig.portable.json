@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "strict": true,
+    "skipLibCheck": true,
+    "rootDir": "."
+  },
+  "include": [
+    "hooks/parse.ts",
+    "hooks/weather.ts",
+    "types/index.d.ts"
+  ]
+}

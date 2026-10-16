@@ -12,3 +12,12 @@
 # CODEX_BIN=/path/to/codex
 # Codex profile used by `run-worker.sh --lead` (a proxy that lets a worker spawn other providers' subagents)
 # AGENT_LANES_LEAD_PROFILE=my-proxy
+
+# Shared host resource budget (set these on the machine executing checks).
+# Start with these conservative defaults.
+# AGENT_CI_MAX_JOBS=1
+# AGENT_CI_MAX_WORKERS=2
+# AGENT_CI_CPU_RESERVE=2
+# AGENT_CI_MEM_RESERVE_MB=2048
+# AGENT_CI_WORKER_MB=2048
+# Local mode always grants one worker; framework flags must respect AGENT_CI_WORKERS.

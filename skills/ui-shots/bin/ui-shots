@@ -13,7 +13,7 @@ const opt = {
   base: "http://localhost:3000", login: "", envFile: ".env", role: "",
   emailEnv: "", passwordEnv: "", emailSel: 'input[name="email"]',
   passwordSel: 'input[name="password"]', submitSel: 'button[type="submit"]',
-  widths: "1440,390", out: "", full: false, theme: "", wait: 1500, click: [], tag: "", console: false, noJs: false, cookies: [], evals: [], hover: [], focus: [],
+  widths: "1440,390", out: "", full: false, theme: "", wait: 1500, click: [], tag: "", console: false, noJs: false, cookies: [], evals: [], preEvals: [], hover: [], focus: [],
 }
 const paths = []
 for (let i = 0; i < args.length; i++) {
@@ -42,6 +42,7 @@ for (let i = 0; i < args.length; i++) {
     case "--no-js": opt.noJs = true; break
     case "--cookie": opt.cookies.push(next()); break
     case "--eval": opt.evals.push(next()); break
+    case "--pre-eval": opt.preEvals.push(next()); break
     case "--hover": opt.hover.push(next()); break
     case "--focus": opt.focus.push(next()); break
     case "--verbose": opt.console = true; opt.verbose = true; break
@@ -63,6 +64,7 @@ Credentials require localhost/127.0.0.1/[::1], unless --allow-remote or UI_SHOTS
 --cookie name=value sets a cookie on the base URL before loading (e.g. a remembered UI choice).
 --hover CSS / --focus CSS hover or keyboard-focus the first match just before the shot (cards, tooltips).
 --eval "js" prints the JSON value of a page expression after the clicks, per shot (e.g. measure overflow).
+--pre-eval "js" runs a page expression just before each shot (e.g. force an app theme attribute).
 --no-js logs in normally, then blocks the app's JS chunks: the server's streamed first paint, before hydration.`)
       process.exit(0)
     // A full URL sets the base (worktree ports) and keeps only its path.
@@ -162,6 +164,7 @@ try {
       const slug = p.replace(/^\//, "").replace(/[^a-zA-Z0-9=-]+/g, "_").slice(0, 80) || "root"
       const extra = opt.noJs ? "_nojs" : opt.hover.length || opt.focus.length ? "_hover" : opt.click.length ? "_" + opt.click.join("-").replace(/[^a-zA-Z0-9]+/g, "").slice(0, 40) : ""
       const file = join(out, `${opt.tag ? opt.tag + "_" : ""}${slug}${extra}_${width}.png`)
+      for (const expr of opt.preEvals) { await shooter.evaluate(expr); await shooter.waitForTimeout(300) }
       await shooter.screenshot({ path: file, fullPage: opt.full, caret: "initial" })
       console.log(file)
       for (const line of logs) console.log(redact(`  ${line}`, secrets))

@@ -1,0 +1,93 @@
+#!/bin/sh
+# mq-wait NAME [REPO [SUBMISSION]]: wait for one accepted submission, never an older name's success.
+exec python3 - "$@" <<'PYWAIT'
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+def error(message):
+    print(message, file=sys.stderr)
+    sys.exit(2)
+
+if not 2 <= len(sys.argv) <= 4:
+    error('usage: mq-wait NAME [REPO [SUBMISSION]]')
+name = sys.argv[1]
+if not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in ('.', '..'):
+    error('mq-wait: invalid lane name')
+if len(sys.argv) > 2:
+    repo = sys.argv[2]
+else:
+    result = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
+    repo = Path(result.stdout.strip() if result.returncode == 0 else os.getcwd()).name
+state = Path.home() / '.claude/state/mq' / repo
+
+def read(path):
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return ''
+
+def pointer():
+    return read(state / ('submission.' + name)).strip()
+
+submission = sys.argv[3] if len(sys.argv) > 3 else pointer()
+log = state / 'run.log'
+lines = read(log).splitlines()
+begin = len(lines)
+# Legacy rows have no ID. Never consult their historical success while still queued.
+rows = [row.split('\t') for row in read(state / 'queue').splitlines()]
+legacy_state = next((row[1] for row in rows if len(row) > 1 and row[0] == name), '')
+legacy_queued = bool(legacy_state)
+if not submission and legacy_state in ('parked', 'bounced'):
+    print(f'{legacy_state.upper()} {name}: legacy queue entry')
+    sys.exit(1)
+if not submission and not log.exists() and not legacy_queued:
+    error('mq-wait: no submission or run log')
+
+def member(line, prefix, suffix=''):
+    if not line.startswith(prefix) or suffix and not line.endswith(suffix):
+        return False
+    return name in line[len(prefix):len(line) - len(suffix) if suffix else None].split()
+
+def starts(line):
+    return (line == 'landing ' + name or member(line, 'landing train:') or
+            line.startswith(('PARKED ' + name + ':', 'PARKED ' + name + ' ', 'BOUNCED ' + name + ' ')))
+
+def terminal(line):
+    if line.startswith(name + ': LANDED '):
+        return 0
+    if ': LANDED ' in line and member(line.split(': LANDED ', 1)[0], 'train '):
+        return 0
+    if line.startswith(('PARKED ' + name + ':', 'PARKED ' + name + ' ', 'BOUNCED ' + name + ' ')):
+        return 1
+    return None
+
+while True:
+    if not submission:
+        submission = pointer()
+    if submission:
+        if not re.fullmatch(r'attempt\.[A-Za-z0-9]+', submission):
+            error('mq-wait: invalid submission ID')
+        record = read(state / 'submissions' / submission).rstrip('\n').split('\t', 2)
+        if len(record) != 3 or record[0] != name:
+            error('mq-wait: missing or mismatched submission record')
+        if record[1] != 'pending':
+            print(record[2])
+            sys.exit(0 if record[1] == 'landed' else 1)
+    else:
+        lines = read(log).splitlines()
+        eligible = lines[begin:] if legacy_queued else lines
+        starts_at = [i for i, line in enumerate(eligible) if starts(line)]
+        output = eligible[starts_at[-1]:] if starts_at else lines[begin:]
+        hits = [(line, terminal(line)) for line in output if terminal(line) is not None]
+        if hits:
+            print(hits[-1][0])
+            sys.exit(hits[-1][1])
+        if any(line.startswith('mq done:') for line in output):
+            print(next(line for line in output if line.startswith('mq done:')))
+            sys.exit(1)
+    time.sleep(float(os.environ.get('MQ_WAIT_POLL', '15')))
+PYWAIT

@@ -1,0 +1,39 @@
+#!/bin/bash
+# ABOUTME: Route heavy validation to the configured runner or a bounded local queue.
+set -uo pipefail
+tools=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+resources=$tools/skills/remote-ci/remote/resources.py
+[ -f "$resources" ] || resources=$tools/skills/remote-ci/remote/resources.py
+local_only=0
+case "${1:-}" in
+  --status) exec python3 "$resources" status --mode local ;;
+  --local) local_only=1; shift ;;
+esac
+command=""
+if [ "${1:-}" = --run ] && [ $# -eq 2 ]; then command=$2
+elif [ $# -ne 0 ]; then echo 'usage: safe-check [--local] [--run "command"] | --status' >&2; exit 2; fi
+root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+client=""
+if [ "$local_only" = 1 ] && { [ -f "$root/.remote-ci.conf" ] || [ -f "$root/.remote-ci.conf" ]; }; then
+  echo 'safe-check: configured projects cannot use --local; validation deferred' >&2; exit 3
+fi
+if [ "$local_only" = 0 ]; then
+  if [ -f "$root/.remote-ci.conf" ]; then
+    client=$tools/skills/remote-ci/bin/remote-ci
+    [ -x "$client" ] || client=$(command -v remote-ci || true)
+  elif [ -f "$root/.remote-ci.conf" ]; then
+    client=$tools/skills/remote-ci/bin/remote-ci
+    [ -x "$client" ] || client=$(command -v remote-ci || true)
+  fi
+fi
+if [ -n "$client" ]; then
+  if [ -n "$command" ]; then exec "$client" check --worktree --summary --run "$command"
+  else exec "$client" check --worktree --summary; fi
+fi
+if [ "$local_only" = 0 ] && { [ -f "$root/.remote-ci.conf" ] || [ -f "$root/.remote-ci.conf" ]; }; then
+  echo 'safe-check: configured runner client unavailable; validation deferred' >&2; exit 3
+fi
+[ -n "$command" ] || { echo 'safe-check: no runner config; provide --run "command" for the single-device queue' >&2; exit 2; }
+# Host policy also forbids local execution after a project config is removed.
+python3 "$resources" local-allowed || exit 3
+exec python3 "$resources" run --mode local --command "$command"

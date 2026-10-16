@@ -2,7 +2,7 @@
 
 Small shell tools for running **many AI coding agents in parallel on one repository** without them tripping over each other. One human decides, one AI lead plans and reviews, and many workers build in their own *lanes*.
 
-Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the lead and the [Codex CLI](https://github.com/openai/codex) for workers, on macOS. Lanes work with any git repository; per-lane dev servers and database copies know common web stacks (see [Supported stacks](#supported-stacks)). Each tool is a few hundred lines of shell or JavaScript, so it's easy to read and adapt.
+Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the lead, on macOS. Workers run on the [Codex CLI](https://github.com/openai/codex) by default, or on the Cursor CLI, opencode, pi or oh-my-pi (see [Supported harnesses](#supported-harnesses)). Lanes work with any git repository; per-lane dev servers and database copies know common web stacks (see [Supported stacks](#supported-stacks)). Each tool is a few hundred lines of shell, Python or JavaScript, so it's easy to read and adapt.
 
 ## The problem
 
@@ -14,6 +14,10 @@ Getting agents to write code is the easy part. With many parallel workers, the s
 - Pages that should look alike drift apart when one is copied from the other.
 
 ## How it works
+
+https://github.com/user-attachments/assets/d2d37c20-5c63-4178-bfee-073956655d3f
+
+<sub>One batch from brief to merge at real speed: 12 lanes, review by risk, an agent UI check, a red train split, a bounce and a guard park. Also in <a href="https://github.com/user-attachments/assets/e970ed06-9608-4ff4-88a4-24d8a33e9a2b">dark</a>.</sub>
 
 <a href="docs/standalone-light.webp">
 <picture>
@@ -39,8 +43,9 @@ Getting agents to write code is the easy part. With many parallel workers, the s
 |---|---|---|
 | **Lanes (path claims)** | `wk -o` | A build worker claims the paths it will edit. A launch that overlaps another live lane's claim or changes is refused: join that lane or wait. The claim ends when the lane lands. |
 | **One writer per lane** | `wk -d` | Workers commit their own work inside their worktree, so a second writing worker in the same tree is refused. Read-only reviewers can join any lane. |
-| **Merge queue** | `mq` | Lands ready lanes in **trains of up to 4** (`MQ_TRAIN`): rebase onto the tip → preflight → one full check for the train → fast-forward. A conflict bounces only the conflicting lane. When a train's check is red, the failure is matched to the lane whose files it names; the other lanes land first and the suspect is checked alone (no clear suspect: one lane at a time). A failure goes back to the lane's worker with the error, and the queue moves on. After two failed fix attempts a lane is parked for the lead. Every landed commit is exactly the one that passed. |
+| **Merge queue** | `mq` | Lands ready lanes in **trains of up to 4** (`MQ_TRAIN`): rebase onto the tip → preflight → one full check for the train → fast-forward. A conflict bounces only the conflicting lane. When a train's check is red, the failure is matched to the lane whose files it names; the other lanes land first and the suspect is checked alone (no clear suspect: one lane at a time). A failure goes back to the lane's worker with the error, and the queue moves on. After two failed fix attempts a lane is parked for the lead. A fix that changes or removes existing test lines or adds a skip, or changes check config, baselines or `package.json` scripts at all, is also parked for review (`bin/mq-guard.py`); `mq add` lands it after review. The landed tip is exactly the commit that passed the check (in a train, the check runs on the train's tip). |
 | **Own dev server and database per lane** | `wt-dev` | A git worktree with its own port and a copy of the local database (`createdb` + dump/restore; seconds for a small dev database), dropped on removal. Dev servers idle for 30 minutes are put to sleep when a new lane starts (or with `wt-dev sleep-idle`), and at most half the CPUs set up new lanes at once. |
+| **Shared compute budget** | `safe-check` | Route tests, builds, typechecks and browser suites through a host-wide FIFO queue: one heavy job by default, CPU/memory admission, bounded workers and process-group supervision. See [resource-safe-checks](skills/resource-safe-checks/SKILL.md). |
 | **Checks on a runner** | `remote-ci` | Full test suites run in their own checkout with a fresh database per run: on a second machine, so the dev machine stays responsive, or on the same machine (`REMOTE_CI_HOST=local`). Red runs give a short redacted failure summary that the queue passes to the fixer. |
 | **One attention view** | `lanes`, `batches` | One line per lane: worker state, queue state, dev server, uncommitted files. What needs you comes first. `batches` also shows why a worker died. |
 | **Disk guard** | `diskguard` | Warns on low disk space, pauses workers below 5 GB and resumes the ones it paused at 7 GB. `wk` refuses new launches below 15 GB. |
@@ -54,9 +59,9 @@ More detail and the reasoning: [docs/concepts.md](docs/concepts.md).
 
 ### 1. Prerequisites
 
-- macOS with `git` and `python3`, plus your project's own toolchain (Node, Python, Ruby, ...).
+- macOS with `git` (2.40 or later) and `python3`, plus your project's own toolchain (Node, Python, Ruby, ...).
 - Optional, for a dev server per lane: a framework `wt-dev` knows, or a dev command in `.wt-dev.conf` (see [Supported stacks](#supported-stacks)). Without one, lanes still get their own worktree, just no server.
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for the lead and the [Codex CLI](https://github.com/openai/codex), logged in, for workers.
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for the lead, and a logged-in worker CLI: the [Codex CLI](https://github.com/openai/codex) by default, or one of the [supported harnesses](#supported-harnesses).
 - Optional, for a database copy per lane: a `DATABASE_URL` on `localhost` in the repo's root `.env` and that database's client tools (PostgreSQL: `psql`, `createdb`, `pg_dump`, `pg_restore`; MySQL/MariaDB: `mysql`, `mysqldump`; SQLite: nothing). Without a `DATABASE_URL`, lanes have no database; a remote one stays shared.
 - For screenshots (`ui-shots`, `wt-compare`): Playwright installed in the project.
 - For the check runner: Homebrew on Apple Silicon (it installs PostgreSQL for test databases when you ask for one). The runner is this machine ([Standalone setup](#standalone-setup-one-machine)) or a second Mac you can SSH into ([Example setup](#example-setup-a-macbook-and-a-mac-mini)).
@@ -94,7 +99,7 @@ wk invoice-fix -w -o "apps/web/invoice" -m build-hard -t invoice:new -f brief.md
 - `-w` creates the worktree `invoice-fix` with its own dev server and database copy (`wt-dev ls` shows the port).
 - `-o` claims the paths the worker will edit. A later lane that overlaps them is refused; give that task to the lane's worker after it finishes (`wk NAME -r -` with the new task on stdin), or wait until the lane lands.
 - `-t invoice:new` tags the launch with a feature and a reason (`new`, `rework`, `bounce`, `review`, `review-fix`, `other`) so rework per feature can be counted.
-- `-m` picks a preset (`ao-model ls`). Reviewers use a read-only preset and can join any lane: `wk invoice-review -d invoice-fix -m review -f review.md`.
+- `-m` picks a preset (`ao-model ls`). Reviewers use a read-only preset and can join any lane: `wk invoice-review -d invoice-fix -m review -t invoice:review -f review.md`.
 
 Then follow it:
 
@@ -114,7 +119,10 @@ mq run                             # only if no runner is up (mq add starts one)
 mq ls                              # queue, claims, bounced lanes and their workers
 ```
 
+`land` runs from mq: use `mq add WT`. Integration branches (e.g. `integ/*`) are lanes too: use `mq add WT`, never `git merge`. A direct exception needs `LAND_DIRECT=1 LAND_REASON="why" land WT` and records `landed-direct`.
+
 `mq` lands ready lanes in trains of up to 4 (`MQ_TRAIN=1` for one at a time): rebase, preflight, one full check, fast-forward, then removes each worktree, its dev server and its database copy. A red train lands the lanes the failure does not point at first, then checks the suspect alone. A conflict or red check goes back to the lane's worker with the error, and the lane rejoins the queue when the worker finishes with everything committed (uncommitted leftovers park it). After two failed fixes the lane is parked for you (`mq drop NAME` to remove it from the queue). `mq add` starts a runner when none is running; an atomic lock refuses concurrent runners and allows takeover of a dead runner’s lock. If you edit files in the main checkout yourself, a lane that changes the same files waits (`mq waiting` names it) until you commit.
+First submissions that change check or CI config, the land preflight, or `package.json` scripts park with `check policy changed: review`; test and baseline changes are allowed. Review the diff, then use `mq add NAME` to land that commit. `land` selects checks from the main checkout's `package.json` and `.remote-ci.conf`; `check:remote` still runs the candidate's script body.
 
 ```sh
 lanes                              # one line per lane; what needs you first
@@ -130,7 +138,7 @@ codex-limit              # Codex plan usage and reset time
 codex-watch 95 &         # pause running workers automatically at 95% usage
 ```
 
-`wk` refuses new launches when usage reaches `WK_MAX_PCT` (default 100). Expired usage windows count as 0%; unknown usage allows a launch. A worker cut off by a provider error continues with `wk NAME -r`.
+`wk` refuses new Codex launches when usage reaches `WK_MAX_PCT` (default 100); other harnesses are not checked. Expired usage windows count as 0%; unknown usage allows a launch. A worker cut off by a provider error continues with `wk NAME -r`.
 
 ### 7. Change models
 
@@ -144,8 +152,22 @@ Presets are the only place model names live. `ao-model ls` shows them; override 
 | A worker shows `DIED` in `batches` | `batches report NAME`, then `wk NAME -r` to continue or `batches ack NAME` to hide it. |
 | A worker shows `STALLED` | Its log has been quiet for a while but the process lives. Check `batches report NAME`; stop it with `batches pause --stalled NAME` before `wk NAME -r`. `batches ack NAME` hides it from the default listing while leaving the process alive. |
 | `mq` says `PARKED` | Read `mq ls` and the lane's last report; fix it in the worktree, `wtcommit`, then `mq add NAME` again. |
-| `remote-ci` exits 3 | The runner is unreachable. `remote-ci info` still shows configured direct/alias and SSH routes; check the cable, network or VPN and `~/.config/agent-lanes/config`. `land` and `mq` treat this as a failed check; only the pre-push hook falls back to a local run. |
+| `remote-ci` exits 3 | The runner is unreachable. `remote-ci info` still shows configured direct/alias and SSH routes; check the cable, network or VPN and `~/.config/agent-lanes/config`. `land` reports infrastructure failure and `mq` keeps the lanes queued without a fixer; the pre-push hook defers the push too; no automatic local fallback. |
 | `wt-dev new` stops with a database error | The copy of the local database failed (missing client tools, a failed create or dump/restore, different table counts, or a database without a built-in adapter: set `WT_DEV_DB_CLONE`/`WT_DEV_DB_DROP`), so the new worktree was removed. Fix the cause, or rerun with `--shared-db` to use the main database on purpose. No `DATABASE_URL` means no database; a remote one stays shared with a warning. |
+
+## Supported harnesses
+
+A worker harness is the agent CLI that runs a worker. Pick it per preset with an optional 6th column in `models.conf` (`codex` when absent). Non-Codex harnesses run through `harness_run.py`, which writes the same log shape as Codex (header, `tokens used`, final report; a last `ERROR:` line on failure, or `stopped by signal N` after `batches pause`). So `batches`, `wk -r`, `batches pause` and `mq` work the same for every harness.
+
+| Harness | CLI | read-only | workspace-write | full-access | Resume | Status |
+|---|---|---|---|---|---|---|
+| `codex` (default) | Codex CLI | native sandbox | native sandbox | `danger-full-access` | `codex exec resume` | tested daily |
+| `pi` | [pi](https://github.com/earendil-works/pi) | tools `read,grep,find,ls` only (no shell) | refused (no sandbox) | all tools | `--session-id` | tested live |
+| `opencode` | [opencode](https://opencode.ai) | injected agent: read tools, shell only for `git diff/log/show/status` | refused (no sandbox) | `--auto` | `--session` | tested live |
+| `cursor` | Cursor CLI (`cursor-agent`) | `--mode ask` | `--sandbox enabled` | `--sandbox disabled` | `create-chat` + `--resume` | stub-tested only |
+| `omp` | [oh-my-pi](https://github.com/can1357/oh-my-pi) | refused (not yet tested) | refused (no sandbox) | `--approval-mode=yolo` | `--resume` | stub-tested only |
+
+"Refused" means a preset that asks for that sandbox fails at launch with a clear message; it never runs with more access than asked. The pi and opencode read-only modes were probed by hand against the live CLIs (pi 0.85, opencode 1.18) with prompts that try to write a file every way they can (file tools, shell chains, redirects, `git diff --output`, `git difftool`, opencode `task` subagents); none wrote. The repo tests check the flags and config, not the enforcement. A pi reviewer has no shell, so give it file paths to read rather than asking for `git diff`. Stub-tested harnesses pass the fake-CLI tests in `tests/test_harness.py` but have not run a live worker yet. The `codex-limit` usage guard applies to Codex presets only.
 
 ## Supported stacks
 
@@ -161,6 +183,10 @@ Lanes, claims, the merge queue and the check runner work with any git repository
 | Nuxt, SvelteKit, Astro, Angular | `nuxi dev` / `vite dev` / `astro dev` / `ng serve` with the port | Preset, not yet tested |
 | Rails, Laravel, Phoenix | `bin/rails server -p` / `php artisan serve --port` / `mix phx.server` | Preset, not yet tested |
 | Anything else: Express, Fastify, NestJS, FastAPI, Flask, Go, Rust... | `WT_DEV_CMD` in `.wt-dev.conf` (read `PORT`) | Works with any command that listens on `PORT` |
+
+`LAND_BASELINE_CMD` in the main checkout's `.wt-dev.conf` (a lane's copy is ignored) opts into a command that `land` runs in the lane on the stack tip. `LAND_BASELINE_FILES` lists space-separated paths to commit with `chore(tooling): update baseline`. Changes to other tracked files fail. An unset command skips the step; these settings alone leave framework detection active.
+
+`.wt-dev.conf` is data: `WT_DEV_*`/`LAND_*` keys with literal values, and reading it runs nothing (a line with `$`, backticks, `;` or another key is refused). Its command values still run, and `land` runs lane code on your machine by design: the install (with the project's own install scripts), your `tools/land-preflight.sh` in the lane, `LAND_BASELINE_CMD` there, and the lane's `check:remote` script. So a lane needs the same trust as the repo code; agent-lanes does not sandbox `land`. `.remote-ci.conf` is shell code that runs on the runner.
 
 **Installs** follow the lockfiles at the root: pnpm, npm, yarn, bun, uv, poetry, bundler, composer and mix (or `WT_DEV_INSTALL`). `land` reinstalls only when a lockfile changed.
 
@@ -196,7 +222,7 @@ remote-ci info      # route=local
 - The runner's PostgreSQL uses its own port (5418 for version 18), so it does not collide with a dev database on 5432. It runs only during checks.
 - The run starts with a clean environment: the lane's `DATABASE_URL`, `NODE_ENV` and `PATH` do not reach it.
 - Checks share the CPU with your dev servers and workers. They run at `nice 10`; keep `REMOTE_CI_SLOTS=1` and cap test workers (e.g. `export VITEST_MAX_WORKERS=4` in `.remote-ci.conf`). With many lanes, `wt-dev sleep-idle` stops idle dev servers, and `diskguard install` adds a 60-second free-space check.
-- Lighter option: `LAND_CHECK="pnpm test"` runs the check in the lane's worktree with the environment of the shell that runs `mq`. It needs no setup, but the tests reach whatever database that environment (or the lane's `.env`, if your test command loads it) points at, and the queue gets no failure summary, so a red train lands one lane at a time.
+- Lighter option: `LAND_CHECK="pnpm test"` runs the check in the lane's worktree with the environment of the shell that runs `mq`. It needs no setup, but the tests reach whatever database that environment (or the lane's `.env`, if your test command loads it) points at, and the queue gets no failure summary, so a red train lands one lane at a time. The check must not edit tracked files or commit: `land` refuses to land a tree other than the one it checked.
 - Moving to a second machine later is one line: set `REMOTE_CI_HOST` to its SSH host and run `remote-ci setup` again.
 
 ## Example setup: a MacBook and a Mac mini
@@ -244,7 +270,7 @@ Then once per project: `remote-ci init` (adds `.remote-ci.conf` and a pre-push h
 
 | Tool | Purpose |
 |---|---|
-| `wk` | Launch a Codex worker in one line: preset, worktree, path claim, the repo's standing header |
+| `wk` | Launch a worker in one line: preset (model and harness), worktree, path claim, the repo's standing header |
 | `mq` | Merge queue over `land` |
 | `batches` | Worker status: running, died, stalled; lanes with work to land; `batches pause` / `batches resume` |
 | `diskguard` | Warn on low disk space; pause workers below 5 GB and resume its own workers at 7 GB; optional 60-second LaunchAgent |
@@ -255,15 +281,63 @@ Then once per project: `remote-ci init` (adds `.remote-ci.conf` and a pre-push h
 | `ao-model` | Model presets lookup and launch checks |
 | `ui-audit`, `ui-shots`, `pw-run`, `wt-compare` | Mechanical UI checks, role-based screenshots (one shared login per role), before/after review pages |
 | `ui-quick` (skill) | Fast 1:1 UI polishing with the owner watching the live page: no worktree or workers; lanes that need those edits wait in the queue |
+| `discuss` (skill) | Discussion mode: talk through ideas and plans with no edits, workers or commits until you say to start; wraps up into a notes file |
 | `session-stats` | Workflow metrics from Claude Code transcripts |
 | `ctrash` | Move files to a dated trash folder instead of `rm` (safe for unattended agents) |
 
 Project-specific pieces stay in each project: the worker header (`~/.claude/state/headers/<repo>.md`; see [templates/](templates/)), an optional `tools/land-preflight.sh`, and `.remote-ci.conf`.
 
+## Claude Code mods
+
+Two optional [Claude Code](https://docs.claude.com/en/docs/claude-code) plugins in [mods/](mods/). They load in every session.
+
+**`workers`**: a band above the prompt with context use, running workers per repo and failed workers with where they came from:
+
+```
+☀ Clear 5% of context 52.2k / 1.0M   last turns ▁▃▅ ▲ +52.2k   ⚙ 7 running (my-app, api-server) · 1 stalled (my-app worktree search-fix) · 1 errored (api-server worktree auth-retry)   5h 4%  [-]
+```
+
+`/workers` opens the full `batches` list in a side pane. When a worker that this session launched finishes or fails, the mod sends this session a prompt, so the lead acts without polling:
+
+```
+[workers mod, automatic] Your workers changed state:
+- search-fix finished: read `batches report search-fix`, verify, continue.
+- auth-retry ERRORED (stream disconnected): find the cause (log tail, batches report), fix the brief or the tool, resume or relaunch.
+```
+
+If the launching session was closed when its worker finished, nobody gets that prompt. The report then shows as **unclaimed** (`· 2 unclaimed` in the band, listed in `/workers` with the session it came from). `/workers adopt` sends them to the current session as one prompt. Nothing is sent to other sessions on its own.
+
+**`guards`**: blocks risky commands before they run and says what to do instead: `rm` (use `ctrash`), `pkill`/`killall`, AI attribution trailers in commits, subagents without a model tag in their description, and subagents on models you list. Force pushes and pushes to `main`/`staging` stop with an **Allow once** button in `/guards`:
+
+```
+Guards
+  push to main
+  git push origin main
+  [ Allow once ]
+```
+
+Install (user scope, all projects):
+
+```sh
+claude plugin marketplace add <path-to-this-repo>
+claude plugin install workers@agent-lanes --scope user
+claude plugin install guards@agent-lanes --scope user
+```
+
+Settings go in `~/.config/agent-lanes/config`: `GUARDS_BLOCK_SUBAGENT_MODELS=<regex>` lists subagent models to block (case-insensitive, e.g. `opus|sonnet`). Unset, no model is blocked; the choice is yours. Edit a mod in `mods/`, then run `/reload-plugins`. Check with `claude plugin validate mods/<mod>` and `claude plugin test mods/<mod>`.
+
 ## Status
 
-Extracted from daily use. Expect sharp edges: macOS-first (the remote-ci runner is an Apple Silicon Mac: your own or a second one, such as a Mac mini). Tests cover `session-stats`, `loop-stats`, `lanes`, `diskguard`, the runner's failure diagnostics and the screenshot login cache (`test_browser_tools.mjs` needs a project with Playwright); `mq` and `wk` are tested only by daily use. `codex-limit` ships as a usage guard: `wk` refuses new launches at `WK_MAX_PCT` (default 100). Issues and small pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Current version: see [VERSION](VERSION); every release is tagged `vX.Y.Z` and listed in [CHANGELOG.md](CHANGELOG.md). Extracted from daily use. Expect sharp edges: macOS-first (the remote-ci runner is an Apple Silicon Mac: your own or a second one, such as a Mac mini). Tests cover `session-stats`, `loop-stats`, `lanes`, `diskguard`, the runner's failure diagnostics and the screenshot login cache (`test_browser_tools.mjs` needs a project with Playwright); `wk` harness adapters have fake-CLI tests (`tests/test_harness.py`); the rest of `mq` and `wk` is tested by daily use. `codex-limit` ships as a usage guard: `wk` refuses new Codex launches at `WK_MAX_PCT` (default 100). Issues and small pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
 MIT
+
+Queue review boundaries:
+- First submissions compare test/check sections in `package.json`, `pyproject.toml`, and `setup.cfg`; dependency-only edits still pass. Invalid configuration parks for review. TOML inspection needs Python 3.11+ or `tomli` on older Python.
+- Put custom check inputs in the target branch's `.mq-policy`, one relative file or directory per line (blank lines and `#` comments allowed). Changes to that list also require review. The candidate cannot remove its own guard inputs.
+- `mq-wait NAME [REPO [SUBMISSION]]` captures the current accepted submission and waits for its terminal record. A pending duplicate `mq add` keeps its ID; manual resubmission and automatic repair requeue create new IDs. Landed returns 0; parked, bounced or dropped returns 1. A stopped queue leaves a pending submission pending. Old logs are read literally and cannot satisfy a newer queued submission.
+- Direct landing uses the same native lock as the queue and refuses before rebase when busy. `LAND_TARGET` alone never authorizes a landing. Custom `land` wrappers should `exec` the real tool; subprocess wrappers must preserve the one-use `MQ_LAND_CHANNEL` descriptor (the native lock itself is never inherited by checks or daemons).
+
+Checks run through `safe-check` on configured remote runners; GitHub Actions is disabled. The runner needs Python 3.11+, `tests/requirements.txt`, and the npm dependencies. Use `safe-check` for the full configured check or `safe-check --run '<focused command>'` for relevant checks. The separate `npm run test:workers:host` command also runs through the queue and requires Claude Code's real plugin test host. Record the commit, runner OS, command and result in the pull request. An unavailable runner never permits a direct local fallback.

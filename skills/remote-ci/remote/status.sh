@@ -1,19 +1,24 @@
 #!/bin/bash
 # ABOUTME: Prints remote-ci state for one project: route, lock, Postgres, last runs, disk.
-. "$HOME/ci/bin/lib.sh"
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/lib.sh"
 load_project "$1" || exit $?
-REMOTE_CI_SLOTS=${3:-$REMOTE_CI_SLOTS}
-# Also display live slots from another worktree using a larger slot setting.
+REMOTE_CI_SLOTS=${3:-$REMOTE_CI_SLOTS} REMOTE_CI_EXCLUSIVE=${4:-$REMOTE_CI_EXCLUSIVE}
+# An exclusive run holds the host-wide $ci/lock as its one slot.
+[ "$REMOTE_CI_EXCLUSIVE" = 1 ] && REMOTE_CI_SLOTS=1
+# Also display live slots from another worktree using a larger or non-exclusive slot setting.
 for f in "$dir"/slots/*.lock; do
   lock_live "$f" || continue
+  REMOTE_CI_EXCLUSIVE=0
   number=$(basename "$f" .lock)
   [ "$number" -gt "$REMOTE_CI_SLOTS" ] && REMOTE_CI_SLOTS=$number
 done
 echo "route: $2"
 if [ -f "$ci/lock" ]; then echo "lock: held by pid $(cat "$ci/lock")"; else echo "lock: free"; fi
+python3 "$here/resources.py" status || true
 echo "slots: $REMOTE_CI_SLOTS"
 for ((slot=1; slot<=REMOTE_CI_SLOTS; slot++)); do
-  if [ "$REMOTE_CI_SLOTS" = 1 ]; then f=$ci/lock; else f=$dir/slots/$slot.lock; fi
+  if [ "$REMOTE_CI_EXCLUSIVE" = 1 ]; then f=$ci/lock; else f=$dir/slots/$slot.lock; fi
   if lock_live "$f"; then
     echo "  slot $slot: busy pid=$(cat "$f") run=$(cat "$dir/slots/$slot.run" 2>/dev/null || echo exclusive)"
   elif lock_live "$ci/lock"; then

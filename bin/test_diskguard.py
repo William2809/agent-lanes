@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 GUARD = Path(__file__).with_name('diskguard').resolve()
-WT_DEV = shutil.which('wt-dev')
+WT_DEV = Path(__file__).resolve().parents[1] / 'skills/wt-dev/bin/wt-dev'
 
 
 class CacheRecovery(unittest.TestCase):
@@ -79,7 +79,7 @@ echo "fixture 99999999 0 $free 0% /"
         self.assertFalse((self.wtroot / 'idle/apps/web/.next').exists())
         for lane in ['00-invoke', 'active', 'busy']:
             self.assertTrue((self.wtroot / lane / 'apps/web/.next').exists(), lane)
-        self.assertIn('freed 1 MB', result.stdout)
+        self.assertRegex(result.stdout, r'freed [1-9][0-9]* MB')  # block size differs by OS (Linux: 2 MB)
         return result.stdout
 
     def test_warn_crossing_real_df_real_wt_dev(self):

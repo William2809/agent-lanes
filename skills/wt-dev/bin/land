@@ -4,82 +4,276 @@
 # Usage (inside the repo's main checkout): land <worktree>... [--keep]
 # Prints one line per step, then "LANDED <sha>" or "FAILED <step>". Run as one background command.
 # On a red stack tip, rerun with fewer worktrees (the failing step names the commit range).
+# The Python gate holds the repository lock and runs the body with no inherited guard FD.
+root=$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd) || exit 1
+exec python3 "$root/bin/mq-lock.py" enter "$(readlink -f "$0")" "$@"
+# LAND_BODY
 set -u
+direct=${LAND_DIRECT:-0}
 keep=0; names=""
 for a in "$@"; do [ "$a" = "--keep" ] && keep=1 || names="$names $a"; done
 [ -n "$names" ] || { echo "usage: land <worktree>... [--keep]"; exit 2; }
+started=$(date +%s); timings=""; timed_step=""
+step_end() {
+  [ -n "$timed_step" ] || return 0
+  now=$(date +%s); timings="$timings $timed_step=$((now - step_started))"; timed_step=""
+}
+step_start() { step_end; timed_step=$1; step_started=$(date +%s); }
+timing() { step_end; echo "timing$timings total=$(($(date +%s) - started))"; }
 main=$(git rev-parse --show-toplevel) || exit 1
 base=$(git -C "$main" rev-parse --abbrev-ref HEAD)
-restore=""
-# On failure, put every stacked worktree back on its own original commit, so a failed
-# train never leaves one batch carrying another's commits.
-fail() {
-  for pair in $restore; do git -C "${pair%%=*}" reset -q --hard "${pair#*=}" 2>/dev/null; done
-  [ -n "$restore" ] && echo "restored worktrees to their original commits"
-  echo "FAILED $*"; exit 1
+# The branch to land on, recorded now: a check that switches the main checkout must not redirect the merge.
+target=$(git -C "$main" symbolic-ref -q HEAD) || target=""
+# LAND_TARGET (environment variable, set by mq): the branch the queue lands on; refuse any other.
+[ -z "${LAND_TARGET:-}" ] || [ "$target" = "$LAND_TARGET" ] ||
+  { timing; echo "FAILED target moved (main checkout is on $base, not ${LAND_TARGET#refs/heads/})"; exit 1; }
+[ -n "$target" ] || { timing; echo "FAILED main checkout is not on a branch"; exit 1; }
+# LAND_TAIL (environment variable, set by mq): file that gets a bounded raw tail of a failed step's output,
+# so mq can classify transient faults the short summary below drops. Same trust as the runner's own logs.
+[ -z "${LAND_TAIL:-}" ] || : >"$LAND_TAIL"
+keep_tail() { [ -z "${LAND_TAIL:-}" ] || printf '%s\n' "$out" | tail -80 | cut -c1-300 >"$LAND_TAIL"; }
+direct_logged=0; direct_locked=0
+if [ "$direct" = 1 ]; then
+  tool_root=$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd) || exit 1
+  . "$tool_root/skills/agent-workers/scripts/state.sh"
+  repo_main=$(cd "$(git rev-parse --git-common-dir)/.." && pwd) || exit 1
+  direct_state="$HOME/.claude/state/mq/$(basename "$repo_main")"
+  direct_lanes=$(printf '%s' "${names# }" | tr ' \t\r\n' ',,,,')
+  direct_reason=$(printf '%s' "$LAND_REASON" | tr '\t\r\n' '   ')
+  tool_rev=$(git -C "$tool_root" rev-parse HEAD 2>/dev/null || echo unknown)
+fi
+direct_event() {
+  [ "$direct" = 1 ] && [ "$direct_logged" = 0 ] || return 0
+  [ "$direct_locked" = 1 ] || { ops_lock "$direct_state/state.lock" || { echo "direct event FAILED (land kept)"; return 1; }; direct_locked=1; }
+  if printf '%s\t%s\tlanded-direct\t%s lanes=%s reason=%s; tool=%s\n' "$(date +%s)" "$direct_lanes" "$full" "$direct_lanes" "$direct_reason" "$tool_rev" >>"$direct_state/events"; then
+    direct_logged=1
+  else echo "direct event FAILED (land kept)"; fi
 }
+direct_unlock() { [ "$direct_locked" = 0 ] || ops_unlock "$direct_state/state.lock"; direct_locked=0; }
+# On failure or interruption, put every stacked worktree back on its own original commit, so a
+# failed train never leaves one batch carrying another's commits. One "dir<TAB>sha" per line.
+tab=$(printf '\t')
+restore=$(mktemp "${TMPDIR:-/tmp}/land-restore.XXXXXX") || { timing; echo "FAILED no temp file"; exit 1; }
+rebasing() {
+  for _r in rebase-merge rebase-apply; do
+    _p=$(git -C "$1" rev-parse --git-path "$_r" 2>/dev/null) && [ -d "$_p" ] && return 0
+  done
+  return 1
+}
+restore_all() {
+  _ok=0; _bad=""
+  while IFS=$tab read -r _dir _sha; do
+    rebasing "$_dir" && git -C "$_dir" rebase --abort 2>/dev/null
+    # Restored = no rebase left, the reset worked and HEAD is the original commit.
+    if ! rebasing "$_dir" && git -C "$_dir" reset -q --hard "$_sha" 2>/dev/null &&
+       [ "$(git -C "$_dir" rev-parse HEAD 2>/dev/null)" = "$_sha" ]; then _ok=$((_ok + 1)); else _bad="$_bad ${_dir##*/}"; fi
+  done <"$restore"
+  : >"$restore"
+  [ "$_ok" = 0 ] || echo "restored $_ok worktree(s) to their original commits"
+  [ -z "$_bad" ] || echo "NOT restored (check by hand):$_bad"
+}
+fail() { trap - EXIT INT TERM HUP; step_end; direct_unlock; restore_all; rm -f "$restore"; timing; echo "FAILED $*"; exit 1; }
+# A stopped runner (INT/TERM/HUP, or an error exit) restores too. A signal waits for the running step.
+interrupted() {
+  trap - EXIT INT TERM HUP
+  # Stopped right after the merge: the lanes landed; putting them back would undo nothing and confuse mq.
+  if [ -n "${full:-}" ] && git -C "$main" merge-base --is-ancestor "$full" "$target" 2>/dev/null; then
+    direct_event; direct_unlock
+    rm -f "$restore"; timing; echo "LANDED $sha on $base (interrupted after the merge; post-land and cleanup skipped)"; exit 0
+  fi
+  step_end; direct_unlock; restore_all; rm -f "$restore"; timing; echo "FAILED interrupted ($1)"; exit "$2"
+}
+trap 'interrupted exit 1' EXIT
+trap 'interrupted INT 130' INT; trap 'interrupted TERM 143' TERM; trap 'interrupted HUP 129' HUP
 
 # 1. Stack: each worktree rebases onto the previous one's tip (the first onto the branch).
+step_start rebase
 onto=$base; last=""; last_name=""
 for name in $names; do
   wt=$(wt-dev path "$name") || fail "no worktree $name"
   [ -z "$(git -C "$wt" status --porcelain -- . ':!.reviews')" ] || fail "$name dirty (commit first)"
   [ "$(git -C "$wt" rev-list --count "$base..HEAD")" -gt 0 ] || fail "$name has nothing to land"
-  restore="$restore $wt=$(git -C "$wt" rev-parse HEAD)"
+  printf '%s\t%s\n' "$wt" "$(git -C "$wt" rev-parse HEAD)" >>"$restore"
   git -C "$wt" rebase -q "$onto" >/dev/null 2>&1 || { git -C "$wt" rebase --abort 2>/dev/null; fail "$name conflicts onto $onto"; }
   onto=$(git -C "$wt" rev-parse HEAD); last=$wt; last_name=$name
   echo "stacked $name"
 done
+step_end
 wt=$last
-command -v migcheck >/dev/null && { migcheck "$wt" || fail "migration journal (renumber with a newer when)"; }
+# at: the candidate (stack tip) every failure from here names, so mq can blame a lane from it.
+at() { _s=$(git -C "$wt" rev-parse --short HEAD); echo "on $_s ($base..$_s)"; }
+# tree_clean STEP: a step that edits tracked files would make the checked tree differ from the commit.
+tree_clean() {
+  changed=$(git -C "$wt" status --porcelain --untracked-files=no)
+  [ -z "$changed" ] || { printf '%s\n' "$changed" | head -5; fail "$1 changed tracked files $(at)"; }
+}
+if command -v migcheck >/dev/null; then
+  step_start migcheck
+  migcheck "$wt" || fail "migration journal (renumber with a newer when) $(at)"
+  step_end
+fi
 
-# 2. Baseline once, on the tip.
-if [ -f "$wt/tools/check-file-size.mjs" ]; then
-  out=$(cd "$wt" && node tools/check-file-size.mjs --update 2>&1) || { printf "%s\n" "$out" | tail -8; fail "file-size ratchet"; }
-  git -C "$wt" diff --quiet -- tools/file-size-baseline.json ||
-    { git -C "$wt" commit -q -m "chore(tooling): lower file-size baseline" -- tools/file-size-baseline.json; echo "baseline lowered"; }
+# 2. Optional repo baseline once, on the tip. Settings come from the main checkout's .wt-dev.conf
+# only: a lane's own copy is candidate code and must not choose what runs here.
+LAND_BASELINE_CMD="" LAND_BASELINE_FILES="" LAND_BASELINE_MSG="" LAND_PUSH_BRANCHES=""
+if [ -f "$main/.wt-dev.conf" ]; then
+  conf=$(python3 "$(dirname "$(readlink -f "$0")")/wtdev_db.py" conf "$main/.wt-dev.conf") || fail "main checkout .wt-dev.conf $(at)"
+  LAND_BASELINE_CMD=$(eval "$conf"; printf '%s' "${LAND_BASELINE_CMD:-}")
+  LAND_BASELINE_FILES=$(eval "$conf"; printf '%s' "${LAND_BASELINE_FILES:-}")
+  LAND_BASELINE_MSG=$(eval "$conf"; printf '%s' "${LAND_BASELINE_MSG:-}")
+  LAND_PUSH_BRANCHES=$(eval "$conf"; printf '%s' "${LAND_PUSH_BRANCHES:-}")
+fi
+if [ -n "${LAND_BASELINE_CMD:-}" ]; then
+  step_start baseline
+  [ -n "${LAND_BASELINE_FILES:-}" ] || fail "baseline needs LAND_BASELINE_FILES $(at)"
+  out=$(cd "$wt" && sh -c "$LAND_BASELINE_CMD" 2>&1) || { keep_tail; printf '%s\n' "$out" | tail -8; fail "baseline $(at)"; }
+  # Literal paths only; shell globs must not widen the commit or the clean-tree guard.
+  set -f
+  set -- .
+  for f in $LAND_BASELINE_FILES; do set -- "$@" ":(literal,exclude)$f"; done
+  changed=$(git -C "$wt" status --porcelain --untracked-files=no -- "$@")
+  [ -z "$changed" ] || { printf '%s\n' "$changed" | head -5; fail "baseline changed tracked files outside LAND_BASELINE_FILES $(at)"; }
+  set --
+  for f in $LAND_BASELINE_FILES; do set -- "$@" ":(literal)$f"; done
+  git -C "$wt" add -- "$@" || fail "baseline files $(at)"
+  if ! git -C "$wt" diff --cached --quiet -- "$@"; then
+    git -C "$wt" commit -q -m "${LAND_BASELINE_MSG:-chore(tooling): update baseline}" -- "$@" || fail "baseline commit $(at)"
+    echo "baseline updated"
+  fi
+  set +f
+  tree_clean baseline
+  step_end
 fi
 
 # 3. Preflight: seconds-cheap guards that otherwise cost a full remote round.
 # Install when dependencies are missing (--no-install worktree) or a lockfile differs from the
-# one last installed here (the rebase picked up a new dependency: 2026-10-05, six lanes failed
-# typecheck after one lane added a package). wt-dev picks the commands from the lockfiles.
-out=$(wt-dev install "$last_name" --if-changed 2>&1) || { printf '%s\n' "$out" | tail -6; fail "install"; }
+# one last installed here (the rebase picked up a new dependency: without this, lanes fail
+# typecheck after another lane added a package). wt-dev picks the commands from the lockfiles.
+step_start install
+# Hooks have no runner exit contract. Only reserved transport statuses or a
+# matching runner marker turn their failure into infrastructure.
+runner_infra() {
+  case "$rc" in 74|75) return 0 ;; esac
+  case "$rc" in 3|76|12[6-9]|1[3-9][0-9]|2[0-4][0-9]|25[0-5])
+    printf '%s\n' "$out" | grep -Eq "^== finished rc=$rc( |$)" && return 0
+    if [ "$rc" = 3 ]; then printf '%s\n' "$out" | grep -qx 'remote-ci: runner unreachable'; return $?; fi ;;
+  esac
+  return 1
+}
+out=$(wt-dev install "$last_name" --if-changed 2>&1); rc=$?
+[ "$rc" = 0 ] || { keep_tail; printf '%s\n' "$out" | tail -6
+  case "$rc" in 126|127) fail "infra install tool unavailable rc=$rc $(at)" ;; esac
+  runner_infra && fail "infra install runner rc=$rc $(at)"
+  fail "install $(at)"
+}
 [ -z "$out" ] || printf '%s\n' "$out"
+tree_clean install
+step_end
 if [ -x "$main/tools/land-preflight.sh" ]; then
-  out=$(cd "$wt" && sh "$main/tools/land-preflight.sh" "$base" 2>&1) || { printf '%s\n' "$out" | tail -8; fail "preflight"; }
+  step_start preflight
+  out=$(cd "$wt" && sh "$main/tools/land-preflight.sh" "$base" 2>&1); rc=$?
+  [ $rc -eq 0 ] || { keep_tail; printf '%s\n' "$out" | tail -8
+    runner_infra && fail "infra preflight rc=$rc $(at)"
+    fail "preflight rc=$rc $(at)"
+  }
+  tree_clean preflight
   echo "preflight ok"
+  step_end
 fi
 
 # 4. One full check on the stack tip.
-sha=$(git -C "$wt" rev-parse --short HEAD); tries=0
+step_start check
+sha=$(git -C "$wt" rev-parse --short HEAD); full=$(git -C "$wt" rev-parse HEAD); tries=0
 check=remote-ci
-if [ -f "$wt/package.json" ] && command -v node >/dev/null && node -e 'const p = require(process.argv[1]); process.exit(typeof p.scripts?.["check:remote"] === "string" ? 0 : 1)' "$wt/package.json"; then check=pnpm; fi
+# Check policy comes from main, as with .wt-dev.conf; the candidate supplies the code to check.
+# custom=1: a check without remote-ci's exit-code contract (LAND_CHECK, or a check:remote that does not
+# call remote-ci). Decided from main's script text, never from the candidate's output.
+custom=0; [ -z "${LAND_CHECK:-}" ] || custom=1
+if [ -f "$main/package.json" ] && command -v node >/dev/null && node -e 'const p = require(process.argv[1]); process.exit(typeof p.scripts?.["check:remote"] === "string" ? 0 : 1)' "$main/package.json"; then
+  check=pnpm
+  node -e 'const p = require(process.argv[1]); process.exit(/\bremote-ci\b/.test(p.scripts["check:remote"]) ? 0 : 1)' "$main/package.json" || custom=1
+fi
 while :; do
   # LAND_CHECK (environment variable): run this command in the worktree instead, e.g. without a runner machine.
   if [ -n "${LAND_CHECK:-}" ]; then out=$(cd "$wt" && sh -c "$LAND_CHECK" 2>&1)
-  elif [ "$check" = pnpm ]; then out=$(cd "$wt" && pnpm -s check:remote --summary "$sha" 2>&1)
-  else out=$(cd "$wt" && remote-ci check --summary "$sha" 2>&1); fi
+  elif [ "$check" = pnpm ]; then out=$(cd "$wt" && REMOTE_CI_CONF="$main/.remote-ci.conf" pnpm -s check:remote --summary "$sha" 2>&1)
+  else out=$(cd "$wt" && REMOTE_CI_CONF="$main/.remote-ci.conf" remote-ci check --summary "$sha" 2>&1); fi
   rc=$?
   [ $rc -eq 75 ] || break
-  tries=$((tries + 1)); [ $tries -lt 120 ] || fail "runner busy for an hour"
+  tries=$((tries + 1)); [ $tries -lt 120 ] || fail "infra runner busy for an hour on $sha ($base..$sha)"
   sleep 30
 done
-[ $rc -eq 0 ] || { printf '%s\n' "$out" | grep -E "FAIL|Failed:|rror" | head -8; fail "check rc=$rc on $sha ($base..$sha)"; }
+# A candidate verdict: mq reads the marker line, so any code (custom checks use 2 or 127 too) gets a fixer.
+verdict() { echo "check verdict: candidate rc=$rc"; fail "check rc=$rc on $sha ($base..$sha)"; }
+if [ $rc -ne 0 ]; then
+  keep_tail; printf '%s\n' "$out" | grep -E "FAIL|Failed:|rror" | head -8
+  # A custom check has no runner contract: only the runner's reserved codes mean infrastructure;
+  # every other failure is the candidate's.
+  if [ "$custom" = 1 ]; then
+    runner_infra || verdict
+  fi
+  case "$rc" in
+    2) reason="configuration" ;; 3) reason="runner unreachable" ;;
+    74) reason="runner failure" ;; 75) reason="runner busy" ;; 76) pending=$(printf '%s\n' "$out" | sed -n 's/^runner cleanup pending: \([a-zA-Z0-9_.-]*\)$/\1/p' | head -1)
+        reason="runner cleanup pending: ${pending:-unknown}" ;;
+    12[6-9]|1[3-9][0-9]|2[0-9][0-9]) reason="runner execution" ;;
+    1) if [ -n "${LAND_CHECK:-}" ] || printf '%s\n' "$out" | grep -q '^== finished rc=1 '; then
+         verdict
+       fi
+       reason="runner failed without a verdict" ;;
+    *) if printf '%s\n' "$out" | grep -qx "== check-result rc=$rc"; then
+         verdict
+       fi
+       reason="unknown runner outcome" ;;
+  esac
+  fail "infra $reason rc=$rc on $sha ($base..$sha)"
+fi
+# Only the tree that was checked may land: a check that edits tracked files or commits tested something else.
+[ "$(git -C "$wt" rev-parse HEAD)" = "$full" ] || fail "check changed tracked files (the checked tree is not commit $sha)"
+tree_clean check
 echo "check green ($sha)"
+step_end
 
 # 5. Merge and clean up.
+step_start ff-merge
+# The event file must be writable before the merge; the lock is taken only to append (after the
+# merge), so a merge hook that calls mq never waits on this process.
+if [ "$direct" = 1 ]; then
+  mkdir -p "$direct_state" && : >>"$direct_state/events" || fail "direct event file"
+fi
+[ "$(git -C "$main" symbolic-ref -q HEAD)" = "$target" ] || fail "target moved (main checkout left $base during the check)"
 prev=$(git -C "$main" rev-parse HEAD)
 git -C "$main" merge -q --ff-only "$sha" 2>/dev/null || fail "ff-merge ($base moved; rerun land)"
+direct_event; direct_unlock
+# Landed: the stacked commits are on the branch now; nothing to put back.
+step_end; rm -f "$restore"
 # Optional repo hook: refresh the main checkout (install, migrate, health) after the merge.
 # Contract: runs in the main checkout as `tools/post-land.sh OLD_SHA NEW_SHA` (env LAND_BRANCH);
 # its lines starting with "refresh:" are shown; a failure is reported, never undoes the land.
 if [ -x "$main/tools/post-land.sh" ]; then
-  out=$(cd "$main" && LAND_BRANCH=$base ./tools/post-land.sh "$prev" "$sha" 2>&1); rc=$?
+  step_start refresh
+  out=$(cd "$main" || exit 1; unset LAND_TARGET LAND_TAIL LAND_DIRECT LAND_REASON; LAND_BRANCH=$base ./tools/post-land.sh "$prev" "$sha" 2>&1); rc=$?
   printf '%s\n' "$out" | grep '^refresh:' || true
   [ $rc -eq 0 ] || echo "refresh: post-land FAILED (rc=$rc): $(printf '%s\n' "$out" | grep -v '^refresh:' | tail -1)"
 fi
-[ $keep -eq 1 ] || for name in $names; do
-  cleanup=$(wt-dev rm "$name" 2>&1) || echo "cleanup failed: $name ($(printf '%s\n' "$cleanup" | tail -1))"
+# Optional push: LAND_PUSH_BRANCHES (main checkout's .wt-dev.conf) lists branches whose green lands go
+# straight to their remote, so an open PR shows the checked head. Plain push, so the remote takes
+# only a fast-forward. A failed push is reported, never undoes the land.
+for _pb in $LAND_PUSH_BRANCHES; do
+  [ "$_pb" = "$base" ] || continue
+  [ "$timed_step" = refresh ] || step_start refresh
+  remote=$(git -C "$main" config "branch.$base.remote" 2>/dev/null) || remote=origin
+  if out=$(GIT_TERMINAL_PROMPT=0 git -C "$main" push -q "$remote" "$full:refs/heads/$base" 2>&1); then
+    echo "pushed $sha to $remote/$base"
+  else echo "push FAILED ($remote/$base, land kept): $(printf '%s\n' "$out" | tail -1)"; fi
 done
+step_end
+if [ $keep -ne 1 ]; then
+  step_start cleanup
+  for name in $names; do
+  cleanup=$(wt-dev rm "$name" 2>&1) || echo "cleanup failed: $name ($(printf '%s\n' "$cleanup" | tail -1))"
+  done
+fi
+trap - EXIT INT TERM HUP
+timing
 echo "LANDED $sha on $base"

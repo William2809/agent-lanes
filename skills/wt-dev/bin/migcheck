@@ -13,7 +13,7 @@ for j in glob.glob(os.path.join(root, "**/drizzle/meta/_journal.json"), recursiv
         n = re.match(r"\d+", x["tag"]).group()
         if n in seen and x["tag"] in recent: print(f"migcheck: duplicate migration number {n} ({x['tag']}) in {j}"); bad = 1
         seen.add(n)
-        if prev and x["when"] <= prev["when"]:
+        if prev and x["when"] <= prev["when"] and x["tag"] in recent:  # applied history is frozen
             print(f"migcheck: {x['tag']} when={x['when']} is not newer than {prev['tag']} when={prev['when']}; Drizzle would skip it"); bad = 1
         prev = x
 # Decision records (docs/decisions/NNNN-*.md): parallel batches pick the same next number.

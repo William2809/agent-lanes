@@ -1,0 +1,11 @@
+{
+  "name": "agent-lanes-checks",
+  "private": true,
+  "scripts": {
+    "test:workers": "sh tests/check-workers",
+    "test:workers:host": "sh tests/check-workers --host"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

@@ -4,3 +4,5 @@
 - Keep tools tiny, quiet and cheap to read: one line per event, short reports.
 - Never commit machine-specific values (hosts, users, paths, credentials). They belong in `~/.config/agent-lanes/config`.
 - Model names live only in `presets/models.conf`. Tools ask for roles.
+
+- Do not use or re-enable GitHub Actions. Run expensive checks through the configured remote resource queue; record exact commit/command/runner results in the pull request. Keep unavailable runners unavailable; never fall back to direct local execution.

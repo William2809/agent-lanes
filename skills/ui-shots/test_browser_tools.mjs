@@ -6,6 +6,8 @@ import { createServer } from "node:http"
 import { randomUUID } from "node:crypto"
 import { execFile, execFileSync } from "node:child_process"
 import { promisify } from "node:util"
+// The repo's own ctrash, so the tests need nothing on PATH (install.sh links it next to ui-shots).
+const CTRASH = fileURLToPath(new URL("../../bin/ctrash", import.meta.url))
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, symlinkSync, utimesSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -198,5 +200,5 @@ test("browser tools share auth and stop on the first locator failure", { timeout
       assert.ok(runs.some(r => /page\.waitForURL: Timeout 20000ms exceeded during login/.test(r.text)))
       runs.forEach(r => { assert.ok(!r.text.includes(email)); assert.ok(!r.text.includes(password)) })
     })
-  } finally { await new Promise(resolve => server.close(resolve)); execFileSync("ctrash", [dir], { stdio: "ignore" }) }
+  } finally { await new Promise(resolve => server.close(resolve)); execFileSync(CTRASH, [dir], { stdio: "ignore" }) }
 })

@@ -20,6 +20,7 @@ ui-shots --as admin --click "Edit order" /orders?date=2026-09-29   # open a dial
 - `--click "~text"` matches a control whose accessible name contains text (e.g. a button with a description line). Exact names are preferred; ambiguous same-role matches fail.
 - `--click "type:5"` / `--click "press:Enter"` type into or press a key on the focused control, in order with the clicks (keyboard flows).
 - `--eval "expr"` prints a page expression's JSON value per shot, e.g. count scrollable table containers instead of trusting overlay scrollbars in headless shots.
+- `--pre-eval "expr"` runs a page expression right before each shot, e.g. force an app-controlled theme: `--pre-eval "document.documentElement.dataset.theme=document.body.dataset.theme='light'"`.
 - `--console` prints browser console errors/warnings per shot (hydration mismatches show here); `--verbose` prints full messages (e.g. the hydration diff).
 - `--no-js` blocks the app's JS chunks (CSS and inline stream scripts still load): the server's first paint before hydration. Compare with a normal shot to catch anything that flashes on refresh.
 
@@ -50,3 +51,14 @@ pw-run --base http://localhost:3000 --as ADMIN --width 390 steps.mjs
 Artifacts use `PW_OUT` when set, otherwise a unique `/tmp/pw-run-*` folder. Auth counters have the same one-line format with `tool=pw-run`. Login failures are summarized without credential values; URL-wait timeouts retain a safe `page.waitForURL: Timeout` marker for loop-stats; known credentials are redacted from diagnostic text and login inputs are masked in failure screenshots. Auth state files contain session secrets: never print, screenshot, or commit them.
 
 Regression check (run from a project with Playwright installed): `node --test /path/to/agent-lanes/skills/ui-shots/test_browser_tools.mjs`. It uses an isolated local fixture and never connects to the project's server. Also run `node --test /path/to/agent-lanes/skills/ui-shots/test_auth_cache.mjs` for checkout/symlink rejection, killed-owner recovery and a twenty-process scaled contention check.
+
+## html-shots (local HTML files, e.g. Artifacts)
+
+The Chrome extension cannot scroll inside a published Artifact frame. Screenshot the local source file instead:
+
+```sh
+html-shots page.html --out <scratch>/shots '#level1 .chart-wrap' '#m6'   # top shot per width + one PNG per selector
+html-shots page.html --widths 1440,390 --theme dark --full
+```
+
+Prints PNG paths and `overflow WIDTH scrollWidth` (equal = no sideways scroll). Adds `<meta charset>` when the file has no doctype. No login, no server. Run from a project root that has Playwright (pnpm stores are found too). Tile results with `shot-sheet`.

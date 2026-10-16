@@ -1,14 +1,72 @@
 #!/bin/sh
-# ABOUTME: Safe delete for agents: moves paths into ~/.claude-trash/YYYY-MM-DD/ instead of rm.
-# ABOUTME: Name clashes get a time suffix; prints where each path went. Never prompts. Exit 1 if any move failed.
-# Usage: ctrash <path>...   (missing paths are skipped quietly; globs that match nothing are fine)
-d="$HOME/.claude-trash/$(date +%F)"; mkdir -p "$d"; rc=0
+# ABOUTME: Safe delete for agents: sends paths to the macOS Trash (Put Back works) instead of rm.
+# ABOUTME: Logs each item to ~/.claude-trash/trash.log so `ctrash -s` can report without reading ~/.Trash.
+# Usage: ctrash <path>...   send to the Trash (missing paths are skipped; never prompts; exit 1 if any failed)
+#        ctrash -s          one-line summary of what agents trashed (count, size, since when)
+#        ctrash -l [N]      last N log lines (default 10)
+#        ctrash -o          open the Trash in Finder (empty it there)
+# Regenerable folders (node_modules, .next, .venv, caches) are deleted for good, also inside a trashed folder.
+# System temp paths go to ~/.claude-trash/YYYY-MM-DD/ (not Finder); those dated folders expire after 7 days.
+# Without /usr/bin/trash (older macOS, Linux) everything falls back to ~/.claude-trash/YYYY-MM-DD/.
+# CTRASH_DATED=1 sends every path there too: for unattended callers (a CI runner) whose Finder Trash nobody empties.
+log="$HOME/.claude-trash/trash.log"
+keep_days=${CTRASH_KEEP_DAYS:-7}
+case "${1:-}" in
+  -s) [ -s "$log" ] || { echo "ctrash: nothing trashed yet"; exit 0; }
+      awk -F'\t' '{ n++; kb += $2; if (!first) first = $1 } END {
+        printf "ctrash: %d items, %.1f GB sent to the Trash since %s (empty it in Finder: ctrash -o)\n", n, kb / 1048576, first }' "$log"
+      exit 0 ;;
+  -l) tail -n "${2:-10}" "$log" 2>/dev/null; exit 0 ;;
+  -o) open "$HOME/.Trash"; exit 0 ;;
+  -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+mkdir -p "$HOME/.claude-trash"; rc=0
+stamp() { date '+%F %H:%M'; }
+# Dated folders (temp paths, tools that must use a plain mv) are deleted after keep_days; they never
+# reach Finder, whose Trash slowed to a crawl at ~150k files (2026-10-16).
+for old in "$HOME"/.claude-trash/20??-??-??; do
+  [ -d "$old" ] || continue
+  [ -n "$(find "$old" -maxdepth 0 -mtime +"$keep_days" 2>/dev/null)" ] || continue
+  kb=$(du -sk "$old" 2>/dev/null | cut -f1)
+  rm -rf "$old" && printf '%s\t%s\t%s\n' "$(stamp)" "${kb:-0}" "$old (expired after $keep_days days)" >>"$log"
+done
+# Names that a lockfile or a tool rebuilds; never worth a Trash round trip.
+regen_find() {
+  root=$1; shift
+  find "$root" -type d \( -name node_modules -o -name .pnpm-store -o -name .next -o -name .turbo -o -name .nuxt \
+    -o -name .svelte-kit -o -name .parcel-cache -o -name .venv -o -name __pycache__ -o -name .pytest_cache \
+    -o -name .mypy_cache -o -name .ruff_cache \) -prune "$@" 2>/dev/null
+}
 for p in "$@"; do
   [ -e "$p" ] || [ -L "$p" ] || continue
+  kb=$(du -sk "$p" 2>/dev/null | cut -f1)
+  abs=$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)/$(basename "$p")
+  # A regenerable folder itself, or the regenerable folders inside one: delete them (links are not followed).
+  if [ -d "$p" ] && [ ! -L "$p" ]; then
+    if [ -n "$(regen_find "$p" -maxdepth 0 -print)" ]; then
+      rm -rf "$p" && { printf '%s\t%s\t%s\n' "$(stamp)" "${kb:-0}" "$abs (regenerable, deleted)" >>"$log"; echo "deleted regenerable $p"; continue; }
+    fi
+    regen_find "$p" -exec rm -rf {} +
+    left=$(du -sk "$p" 2>/dev/null | cut -f1)
+    if [ "${kb:-0}" -gt "${left:-0}" ]; then
+      printf '%s\t%s\t%s\n' "$(stamp)" "$((kb - left))" "$abs (regenerable folders inside, deleted)" >>"$log"
+      kb=$left
+    fi
+  fi
+  # System temp paths skip Finder: one Trash item per call made Finder recompute a huge Trash.
+  case "$abs" in /private/var/folders/*/T/* | /private/tmp/* | /var/folders/*/T/* | /tmp/*) tmp_path=1 ;; *) tmp_path=0 ;; esac
+  [ "${CTRASH_DATED:-0}" = 1 ] && tmp_path=1
+  if [ "$tmp_path" = 0 ] && [ -x /usr/bin/trash ] && /usr/bin/trash "$p" 2>/dev/null; then
+    printf '%s\t%s\t%s\n' "$(stamp)" "${kb:-0}" "$abs" >>"$log"; echo "trashed $p"; continue
+  fi
+  d="$HOME/.claude-trash/$(date +%F)"; mkdir -p "$d"
   t="$d/$(basename "$p")"; { [ -e "$t" ] || [ -L "$t" ]; } && t="$t.$(date +%H%M%S).$$"
   if [ -L "$p" ]; then  # a link: recreate it in the trash (mv across volumes fails on broken/looping links)
     ln -s "$(readlink "$p")" "$t" && unlink "$p" && { echo "trashed link $p -> $t"; continue; }
-  elif mv "$p" "$t" 2>/dev/null || mv "$p" "$t"; then echo "trashed $p -> $t"; continue; fi
+  elif mv "$p" "$t" 2>/dev/null || mv "$p" "$t"; then
+    [ "$tmp_path" = 0 ] || printf '%s\t%s\t%s\n' "$(stamp)" "${kb:-0}" "$abs (temp, kept in $d)" >>"$log"
+    echo "trashed $p -> $t"; continue
+  fi
   echo "ctrash: FAILED to move $p" >&2; rc=1
 done
 exit $rc
