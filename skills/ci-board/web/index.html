@@ -1,0 +1,954 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CI board</title>
+<style>
+:root {
+  color-scheme: dark;
+  --page: #1d1d1d;
+  --card: #111111;
+  --ink: #ededed;
+  --grey: #8a8a8a;
+  --dim: #5a5a5a;
+  --rule: #1f1f1f;
+  --track: #2a2a2a;
+  --past: #6b6b6b;
+  --now: #ededed;
+  --accent: #12b886;
+  --fail: #b5524c;
+  --warn: #d29922;
+  --pill-bg: #ededed;
+  --pill-ink: #111111;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --page: #f1f0ec; --card: #ffffff; --ink: #161616; --grey: #6e6e6e; --dim: #a6a6a3;
+    --rule: #efefec; --track: #ebebe8; --past: #b4b4b0; --now: #161616; --accent: #0c9f72;
+    --fail: #c0504a; --warn: #b26b00; --pill-bg: #161616; --pill-ink: #ffffff;
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --page: #f1f0ec; --card: #ffffff; --ink: #161616; --grey: #6e6e6e; --dim: #a6a6a3;
+  --rule: #efefec; --track: #ebebe8; --past: #b4b4b0; --now: #161616; --accent: #0c9f72;
+  --fail: #c0504a; --warn: #b26b00; --pill-bg: #161616; --pill-ink: #ffffff;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font: 400 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.m { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.grey { color: var(--grey); }
+.dim { color: var(--dim); }
+.ok { color: var(--accent); }
+.bad { color: var(--fail); }
+.warn { color: var(--warn); }
+.hostsvc { margin-top: 12px; font-size: 12.5px; color: var(--dim); }
+.hostsvc .m { color: var(--grey); }
+.mem { font-size: 13px; color: var(--grey); margin-top: 6px; }
+.phases .pk { color: var(--dim); font-size: 12px; }
+.wrap {
+  max-width: 1480px; margin: 0 auto; padding-block: 14px 40px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+@media (min-width: 720px) { .wrap { padding-left: max(40px, env(safe-area-inset-left, 0px)); padding-right: max(40px, env(safe-area-inset-right, 0px)); } }
+.top { display: flex; align-items: baseline; gap: 16px; row-gap: 2px; flex-wrap: wrap; }
+.top h1 { margin: 0; font-size: 17px; font-weight: 500; letter-spacing: -.01em; }
+.top .grey { font-size: 12.5px; }
+.lanes { font-size: 12.5px; color: var(--grey); }
+.lanes:empty { display: none; }
+.lanes b { font-weight: 400; color: var(--ink); }
+main {
+  display: grid; gap: 16px; margin-top: 12px; align-items: start;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 660px));
+}
+.card { background: var(--card); border-radius: 24px; padding: 22px clamp(18px, 3.5vw, 36px) 28px; min-width: 0; }
+.stale > .body { opacity: .45; }
+.head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.head h2 { margin: 0; font-size: 20px; font-weight: 500; letter-spacing: -.01em; }
+.state { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--grey); }
+.state i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: inline-block; transform: translateY(-1px); }
+.state.unreachable i { background: var(--fail); }
+.state.asleep i, .state.connecting i { background: transparent; box-shadow: inset 0 0 0 1px var(--grey); }
+.head .machine { margin-left: auto; font-size: 13px; color: var(--grey); }
+.role { margin-top: 2px; font-size: 13px; color: var(--grey); }
+.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; margin-top: 20px; }
+.label { font-size: 13px; color: var(--grey); }
+.value { font-size: 15px; margin-top: 2px; white-space: nowrap; }
+.value .dim { font-size: 13px; }
+.line { height: 2px; background: var(--track); border-radius: 1px; margin-top: 10px; overflow: hidden; }
+.line i { display: block; height: 100%; width: 0; background: var(--past); border-radius: 1px; transition: width 1s cubic-bezier(.2, .7, .2, 1); }
+.line.high i { background: var(--now); }
+.line.crit i { background: var(--fail); }
+.section { margin-top: 26px; padding-top: 22px; border-top: 1px solid var(--rule); }
+.section > .label { display: flex; gap: 8px; margin-bottom: 18px; }
+.quiet { color: var(--dim); font-size: 14px; }
+/* running check: deploy timeline */
+.check + .check { margin-top: 32px; padding-top: 28px; border-top: 1px solid var(--rule); }
+.ctitle { font-size: 16px; font-weight: 500; }
+.csub { font-size: 13px; color: var(--grey); margin-top: 1px; }
+.hero { font-size: 64px; line-height: 1; letter-spacing: -.04em; margin-top: 22px; font-weight: 400; }
+/* several running: compact rows (about 80px) so four fit on one screen with the queue */
+.many .check + .check { margin-top: 14px; padding-top: 14px; }
+.crow1 { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.crow1 .ctitle { font-size: 15px; white-space: nowrap; }
+.crow1 .csub { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.crow1 .el { margin-left: auto; font-size: 22px; letter-spacing: -.03em; white-space: nowrap; }
+.many .seg { margin-top: 10px; }
+.many .seg .bars span { height: 6px; }
+.crow3 { display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 13px; color: var(--grey); }
+.crow3 .ctx { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.crow3 .ctx b { color: var(--ink); font-weight: 400; }
+.crow3 .steps { margin: 0 0 0 auto; padding: 2px 0 2px 6px; flex: none; flex-direction: row-reverse; }
+.many .steps + .phases, .many .crow3 + .phases { margin-top: 6px; }
+.many .phases li { padding: 4px 0; font-size: 13px; }
+.steps {
+  display: inline-flex; align-items: center; gap: 8px; margin-top: 16px; padding: 4px 6px 4px 0; border: 0; border-radius: 6px;
+  color: var(--grey); font: inherit; font-size: 13px; background: transparent; cursor: pointer;
+}
+.steps:hover { color: var(--ink); }
+.steps:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.steps .chev { width: 7px; height: 7px; border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(-45deg); transition: transform .2s; }
+.steps[aria-expanded="true"] .chev { transform: rotate(45deg) translate(-2px, -1px); }
+.steps + .phases { margin-top: 10px; }
+.context { font-size: 14px; color: var(--grey); margin-top: 10px; }
+.seg { margin-top: 28px; }
+.seg .labels, .seg .bars { display: flex; gap: 4px; }
+.seg .labels span { font-size: 11.5px; color: var(--grey); white-space: nowrap; overflow: hidden; text-overflow: clip; padding-bottom: 7px; min-width: 0; }
+.seg .labels span.now { color: var(--ink); }
+.seg .bars span { height: 10px; border-radius: 999px; background: var(--past); min-width: 6px; transform-origin: left; }
+.seg .bars span.now { background: var(--now); position: relative; overflow: hidden; }
+.seg .bars span.now::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(128,128,128,.35), transparent);
+  transform: translateX(-100%); animation: shimmer 2.6s ease-in-out infinite;
+}
+/* stalled: log quiet and no CPU; the live segment turns amber and stops shimmering */
+.stalled .seg .bars span.now { background: var(--warn); }
+.stalled .seg .bars span.now::after { animation: none; display: none; }
+.stalled .seg .labels span.now, .stall, .crow3 .ctx .stall b { color: var(--warn); }
+.seg .bars span.rest { background: transparent; box-shadow: inset 0 0 0 1px var(--track); }
+.seg .axis { display: flex; justify-content: space-between; margin-top: 8px; font-size: 11px; color: var(--dim); }
+.phases { list-style: none; margin: 24px 0 0; padding: 0; }
+.phases li { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto 52px; gap: 12px; align-items: center; padding: 7px 0; font-size: 14px; }
+.phases li .name { color: var(--grey); }
+.phases li.now .name { color: var(--ink); }
+.phases li.next .name { color: var(--dim); }
+.phases .d { text-align: right; font-size: 13px; }
+.phases .t { text-align: right; font-size: 12px; color: var(--dim); }
+.ico { width: 14px; height: 14px; border-radius: 50%; display: grid; place-items: center; }
+.ico.done { background: var(--past); }
+.ico.done::after { content: ""; width: 5px; height: 3px; border: solid var(--card); border-width: 0 0 1.5px 1.5px; transform: translate(0, -1px) rotate(-45deg); }
+.ico.now { box-shadow: inset 0 0 0 1.5px var(--now); }
+.ico.now::after { content: ""; width: 4px; height: 4px; border-radius: 50%; background: var(--now); }
+.ico.skip { border: 1px dashed var(--dim); }
+.ico.next { box-shadow: inset 0 0 0 1px var(--track); }
+/* queue */
+.rows { position: relative; }
+.row { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 12px; align-items: baseline; padding: 12px 0; border-top: 1px solid var(--rule); }
+.row:first-child { border-top: 0; padding-top: 0; }
+.row .pos { font-size: 13px; color: var(--dim); }
+.row .what { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .what .cmeta { margin-left: 0; }
+.row .what .m { font-size: 13px; color: var(--grey); margin-left: 8px; }
+.row .when { text-align: right; font-size: 13px; white-space: nowrap; }
+.row .when div + div { color: var(--grey); font-size: 12px; }
+.move { margin-top: 5px; padding: 3px 8px; border: 1px solid var(--dim); border-radius: 7px;
+  color: var(--ink); background: transparent; font: inherit; font-size: 12px; cursor: pointer; }
+.move:hover { border-color: var(--ink); }
+.move:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.move:disabled { color: var(--dim); border-color: var(--rule); cursor: default; }
+.crow .what { white-space: normal; }
+.crow .what > .m { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; white-space: nowrap; }
+.cmeta { font-size: 12px; color: var(--grey); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.crow .pos { font-size: 8px; line-height: 20px; }
+.rsum { font-size: 13px; color: var(--grey); margin: -8px 0 20px; }
+.rsum .m { color: var(--ink); }
+.drain { font-size: 13px; color: var(--ink); margin: -6px 0 16px; }
+.row.enter { opacity: 0; transform: translateY(6px); }
+.row.leave { opacity: 0; transition: opacity .3s; }
+/* history chart */
+.chart { position: relative; height: 132px; margin-top: 30px; }
+.chart .bars { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 6px; }
+.chart .bars i {
+  flex: 1; min-height: 3px; border-radius: 4px; background: var(--track); transform-origin: bottom; position: relative;
+}
+.chart .bars i.fail { background: var(--fail); opacity: .75; }
+.chart .bars i.infra { background: transparent; box-shadow: inset 0 0 0 1px var(--track); }
+.chart .bars i.hi { background: var(--accent); opacity: 1; }
+.chart .bars i.hi.fail { background: var(--fail); }
+.chart .bars i em {
+  position: absolute; bottom: calc(100% + 6px); right: 0; font-style: normal; font-size: 11px; color: var(--ink); white-space: nowrap;
+}
+.chart .med { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--dim); pointer-events: none; }
+.chart .med b {
+  position: absolute; left: -2px; top: -10px; font-weight: 400; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  background: var(--pill-bg); color: var(--pill-ink);
+}
+.xaxis { display: flex; justify-content: space-between; margin-top: 8px; font-size: 11px; color: var(--dim); }
+.foot { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; margin-top: 28px; padding-top: 22px; border-top: 1px solid var(--rule); }
+.foot .value { overflow: hidden; text-overflow: ellipsis; }
+.repos { margin-top: 20px; display: grid; gap: 6px; }
+.repos div { display: grid; grid-template-columns: minmax(0, 1fr) 84px 64px; gap: 12px; align-items: center; font-size: 13px; color: var(--grey); }
+.repos svg { width: 84px; height: 18px; overflow: visible; }
+.repos polyline { fill: none; stroke: var(--past); stroke-width: 1.25; stroke-linejoin: round; stroke-linecap: round; }
+.repos .v { text-align: right; color: var(--ink); }
+.note { margin-top: 26px; font-size: 14px; color: var(--grey); }
+.note b { font-weight: 400; color: var(--ink); }
+.tip {
+  position: fixed; pointer-events: none; z-index: 10; background: var(--pill-bg); color: var(--pill-ink);
+  font: 11.5px/1.4 ui-monospace, "SF Mono", Menlo, monospace; padding: 4px 8px; border-radius: 8px;
+  opacity: 0; transition: opacity .12s; white-space: nowrap;
+}
+.tip.show { opacity: 1; }
+.grow { animation: grow .7s cubic-bezier(.2, .7, .2, 1) both; }
+.grow-x { animation: grow-x .7s cubic-bezier(.2, .7, .2, 1) both; }
+@keyframes grow { from { transform: scaleY(0); } }
+@keyframes grow-x { from { transform: scaleX(0); } }
+@keyframes shimmer { 60%, 100% { transform: translateX(100%); } }
+@media (max-width: 600px) {
+  .head .machine { margin-left: 0; width: 100%; }
+  .stats { gap: 14px; }
+  .hero { font-size: 52px; }
+  .phases li { grid-template-columns: 16px minmax(0, 1fr) auto; }
+  .phases .t { display: none; }
+  .foot { gap: 14px; }
+  .chart .bars { gap: 4px; }
+}
+/* workers: one row per worker, problems first; a row opens to its log, mq events and run */
+.workers { margin-top: 12px; max-width: 1336px; padding-bottom: 22px; }
+.workers .section { margin-top: 18px; padding-top: 16px; }
+.workers .section > .label { margin-bottom: 6px; }
+.wsum a, .wci a { color: inherit; text-decoration: none; }
+.wsum a:hover, .wci a:hover { text-decoration: underline; }
+.wrow + .wrow { border-top: 1px solid var(--rule); }
+.wtoggle {
+  display: grid; grid-template-columns: 8px minmax(0, 1fr) auto 10px; gap: 14px; align-items: center; width: 100%;
+  padding: 9px 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.wtoggle:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; border-radius: 6px; }
+.wtoggle .chev { width: 7px; height: 7px; border: solid var(--dim); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); transition: transform .2s; }
+.wtoggle[aria-expanded="true"] .chev { transform: rotate(-135deg) translate(-2px, -2px); }
+.wtoggle:hover .chev { border-color: var(--ink); }
+.wdot { width: 8px; height: 8px; border-radius: 50%; background: var(--past); }
+.wdot.ok { background: var(--accent); }
+.wdot.warn { background: var(--warn); }
+.wdot.bad { background: var(--fail); }
+.wdot.hollow { background: transparent; box-shadow: inset 0 0 0 1.5px var(--grey); }
+.wwhat, .wside { display: flex; flex-direction: column; min-width: 0; }
+.wside { align-items: flex-end; text-align: right; }
+.wl1, .wl2 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.wl1 { font-size: 14px; }
+.wl1 b { font-weight: 500; }
+.wl2 { font-size: 12.5px; color: var(--grey); margin-top: 1px; }
+.wproj { color: var(--grey); margin-left: 8px; font-size: 13px; }
+.wbr { color: var(--dim); margin-left: 8px; font-size: 12px; }
+.wside .wl1 { font-size: 13px; color: var(--grey); }
+.wside .ink { color: var(--ink); }
+.wdetail { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 4px 14px; margin: 0 0 12px 22px; font-size: 13px; }
+.wdetail[hidden], .wrows[hidden] { display: none; }
+.wdetail a { color: inherit; text-decoration: underline; text-decoration-color: var(--dim); text-underline-offset: 3px; }
+.wdetail dt { color: var(--grey); }
+.wdetail dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.wmq { list-style: none; margin: 4px 0 0; padding: 0; }
+.wmq li { padding: 1px 0; }
+.wmore { margin-top: 0; }
+.wmore + .wrows { margin-top: 6px; }
+.wrows + .wmore { margin-top: 8px; }
+.wmore + .wrows[hidden] + .wmore { margin-left: 18px; }
+.check:target, .row:target { box-shadow: -12px 0 0 -8px var(--accent); }
+@media (max-width: 600px) {
+  .wtoggle { grid-template-columns: 8px minmax(0, 1fr) 10px; row-gap: 2px; }
+  .wside { grid-column: 2; grid-row: 2; align-items: flex-start; text-align: left; }
+  .wtoggle .chev { grid-column: 3; grid-row: 1; }
+  .wdetail { grid-template-columns: minmax(0, 1fr); margin-left: 22px; }
+  .wdetail dd + dt { margin-top: 6px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><h1>CI board</h1><span class="grey" id="sub">connecting</span><span class="lanes" id="lanes"></span><span class="lanes wsum" id="wsum"></span></div>
+  <section class="card workers" id="workers" aria-label="Workers"></section>
+  <main id="runners"></main>
+</div>
+<div class="tip" id="tip"></div>
+<script>
+'use strict';
+const PHASES = [['queued', 'queued'], ['install', 'install'], ['database', 'database'], ['check', 'check'], ['cleanup', 'cleanup']];
+const BOARD_NONCE = '__CI_BOARD_NONCE__';
+const reduce = matchMedia('(prefers-reduced-motion: reduce)');
+let data = null, fetchedAt = 0, failures = 0;
+const painted = new Set();   // things that already grew in once
+
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+const mono = (text, cls) => el('span', 'm' + (cls ? ' ' + cls : ''), text);
+const nowS = () => Date.now() / 1000;
+const drift = () => Math.max(0, nowS() - fetchedAt);
+function dur(s) {
+  if (s == null || !isFinite(s)) return '–';
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ' + String(s % 60).padStart(2, '0') + 's';
+  return Math.floor(m / 60) + 'h ' + String(m % 60).padStart(2, '0') + 'm';
+}
+const short = s => s < 60 ? Math.round(s) + 's' : s < 3600 ? Math.round(s / 60) + 'm' : (s / 3600).toFixed(1) + 'h';
+const mmss = s => { s = Math.max(0, Math.round(s)); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); };
+const clock = t => new Date(t * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+const sha = s => (s || '').slice(0, 7);
+const gb = mb => mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB';
+const nick = p => p.length > 14 ? p.split(/[-_]/)[0] : p;
+
+// A ticking span: text = fmt(seconds since origin), refreshed every second without a rebuild.
+function tick(origin, fmt, cls) {
+  const s = mono('', cls);
+  s.dataset.origin = origin; s.dataset.fmt = fmt;
+  paintTick(s);
+  return s;
+}
+function paintTick(s) {
+  const v = nowS() - Number(s.dataset.origin);
+  s.textContent = s.dataset.fmt === 'mmss' ? mmss(v) : dur(v);
+}
+
+const tip = document.getElementById('tip');
+document.addEventListener('pointerover', e => {
+  const t = e.target.closest('[data-tip]');
+  if (!t) { tip.classList.remove('show'); return; }
+  tip.textContent = t.dataset.tip;
+  const r = t.getBoundingClientRect();
+  tip.classList.add('show');
+  const w = tip.offsetWidth;
+  tip.style.left = Math.min(innerWidth - w - 8, Math.max(8, r.left + r.width / 2 - w / 2)) + 'px';
+  tip.style.top = Math.max(8, r.top - 30) + 'px';
+});
+const tipFor = (n, text) => { n.dataset.tip = text; n.setAttribute('aria-label', text); return n; };
+const growOnce = (key, node, cls) => { if (!painted.has(key)) { node.classList.add(cls); painted.add(key); } };
+
+function lanesLine(lanes) {
+  const box = document.getElementById('lanes');
+  box.replaceChildren();
+  const groups = {};
+  for (const l of lanes) (groups[l.state] = groups[l.state] || []).push(l.lane);
+  const parts = [];
+  for (const state of ['landing', 'queued', 'bounced', 'parked', 'landed']) {
+    if (!groups[state]) continue;
+    const span = el('span');
+    span.append(state + ' ');
+    const b = el(state === 'landing' ? 'b' : 'span', null, groups[state].slice(0, 6).join(', ') + (groups[state].length > 6 ? ' +' + (groups[state].length - 6) : ''));
+    span.append(b);
+    parts.push(span);
+  }
+  parts.forEach((p, i) => { if (i) box.append(' · '); box.append(p); });
+}
+
+function stat(label, value, unit, frac, cls) {
+  const s = el('div');
+  const v = el('div', 'value');
+  v.append(mono(value));
+  if (unit) v.append(' ', mono(unit, 'dim'));
+  const line = el('div', 'line ' + (cls || ''));
+  const fill = el('i');
+  line.append(fill);
+  s.append(el('div', 'label', label), v, line);
+  s._fill = fill; s._frac = Math.max(0, Math.min(1, frac || 0));
+  return s;
+}
+
+// Phase durations of a running check from its timing lines (seconds), plus the live one.
+function phaseRows(r) {
+  const t = r.timings || {};
+  const sinceNow = r.phase_since != null ? Math.max(0, (r.elapsed_s || 0) - ((r.phase_since - r.started) || 0)) : 0;
+  const idx = r.step_index;
+  const done = {
+    queued: r.waited_s,
+    install: (t.checkout || 0) + (t.install || 0),
+    database: (t.database != null || t.prepare != null) ? (t.database || 0) + (t.prepare || 0) : null,
+    check: t.check,
+    cleanup: null,
+  };
+  let at = 0;
+  return PHASES.map(([key, name], i) => {
+    const row = { key, name, state: i < idx ? 'done' : i === idx ? 'now' : 'next', start: at };
+    if (row.state === 'done') {
+      row.secs = done[key];
+      if (row.secs == null) row.state = 'skip';
+      at += row.secs || 0;
+    } else if (row.state === 'now') {
+      row.secs = sinceNow;   // grows with drift at paint time
+      row.origin = fetchedAt - sinceNow;
+    }
+    return row;
+  });
+}
+
+// Steps accordion: open by default when one check runs, folded when several; a manual toggle
+// sticks per run across polls.
+const opened = new Map();
+document.addEventListener('click', e => {
+  const b = e.target.closest('button.steps');
+  if (!b) return;
+  opened.set(b.dataset.run, !b.dataset.open);
+  b.focus();
+  render();
+});
+
+const titleOf = r => r.project + (r.who && r.who !== r.project ? ' · ' + r.who : '');
+const kindOf = r => r.local ? 'safe-check job' : r.kind === 'run' ? '--run' : 'full check';
+
+// "1.6 GB now · peak 2.1 GB · of 2.0 GB reserved"; warn colour when now is over the reservation.
+function memText(r, box) {
+  if (r.rss_mb == null) return box;
+  const over = r.reserved_mb && r.rss_mb > r.reserved_mb;
+  box.append(mono(gb(r.rss_mb), over ? 'warn' : null), ' now');
+  if (r.peak_mb && r.peak_mb > r.rss_mb) box.append(' · peak ', mono(gb(r.peak_mb)));
+  if (r.reserved_mb) box.append(' · ', over ? el('span', 'warn', 'over ') : '', 'of ', mono(gb(r.reserved_mb)), ' reserved');
+  return box;
+}
+
+function subText(r, box, compact) {
+  // A known worker replaces the "full check" filler; a --run command still says so.
+  const parts = [];
+  if (r.sha) parts.push([mono(sha(r.sha))]);
+  if (!r.who || r.kind === 'run') parts.push([kindOf(r)]);
+  if (r.workers) parts.push(compact ? [mono(r.workers + 'w')] : [mono(String(r.workers)), ' worker' + (r.workers > 1 ? 's' : '')]);
+  if (compact && r.rss_mb != null) {
+    // Short form "3.4 / 4.0 GB" (now / reserved); the full sentence is the tooltip.
+    const over = r.reserved_mb && r.rss_mb > r.reserved_mb;
+    const mem = mono(r.reserved_mb ? (r.rss_mb / 1024).toFixed(1) + ' / ' + gb(r.reserved_mb) : gb(r.rss_mb), over ? 'warn' : null);
+    tipFor(mem, memText(r, el('span')).textContent);
+    parts.push([mem]);
+  }
+  if (!compact && r.cpu_pct != null) parts.push([mono(Math.round(r.cpu_pct) + '%'), ' cpu']);
+  parts.forEach((p, i) => { if (i) box.append(' · '); box.append(...p); });
+  return box;
+}
+
+function stepsButton(key, open, label) {
+  const btn = el('button', 'steps');
+  btn.type = 'button';
+  btn.dataset.run = key; btn.dataset.open = open ? '1' : '';
+  btn.setAttribute('aria-expanded', String(open));
+  btn.setAttribute('aria-controls', 'steps-' + key);
+  btn.append(el('span', 'chev'), label);
+  return btn;
+}
+
+function stepsList(rows, key, open, peaks) {
+  const list = el('ul', 'phases');
+  list.id = 'steps-' + key;
+  list.hidden = !open;
+  for (const p of rows) {
+    const li = el('li', p.state);
+    const name = el('span', 'name', p.state === 'skip' ? p.name + ' · skipped' : p.name);
+    const pk = (peaks || {})[p.key];
+    if (pk && p.key !== 'queued') name.append(el('span', 'pk', ' · peak ' + gb(pk)));
+    li.append(el('span', 'ico ' + p.state), name);
+    if (p.state === 'now') li.append(tick(p.origin, 'dur', 'd'));
+    else li.append(mono(p.state === 'done' ? dur(p.secs) : '', 'd'));
+    li.append(mono(p.state === 'next' || p.state === 'skip' ? '' : mmss(p.start), 't'));
+    list.append(li);
+  }
+  return list;
+}
+
+const hasSignal = r => r.overdue || r.suspected_stall;
+
+// One of several running checks: a compact row (title · sub · elapsed / bar / phase · eta · Steps).
+function compactCheck(r, key) {
+  const box = el('div', hasSignal(r) ? 'check stalled' : 'check');
+  box.dataset.key = key;
+  box.id = 'run-' + key;
+  const one = el('div', 'crow1');
+  const elv = el('span', 'el');
+  elv.append(tick(fetchedAt - ((r.admitted ? r.waited_s : r.elapsed_s) || 0), 'dur'));
+  one.append(el('span', 'ctitle', titleOf(r)), subText(r, el('span', 'csub'), true), elv);
+  box.append(one);
+  const three = el('div', 'crow3');
+  const ctx = el('span', 'ctx');
+  three.append(ctx);
+  if (r.admitted || r.local) {
+    if (r.admitted) ctx.append('admitted, waiting for a free project slot');
+    else expectText(r, ctx, (r.elapsed_s || 0) + drift());
+    box.append(three);
+    return box;
+  }
+  const elapsed = (r.elapsed_s || 0) + drift();
+  const rows = phaseRows(r);
+  box.append(segBar(r, key, rows, elapsed, false));
+  const now = rows.find(p => p.state === 'now');
+  if (hasSignal(r)) stallText(r, ctx);
+  if (now) ctx.append(el('b', null, now.name), ' · ');
+  expectText(r, ctx, elapsed);
+  const open = opened.has(key) ? opened.get(key) : false;
+  three.append(stepsButton(key, open, open ? 'Hide steps' : 'Steps'));
+  box.append(three, stepsList(rows, key, open, r.phase_peaks));
+  return box;
+}
+
+const WAITS = { cache: 'waiting on cache', database: 'database template', slot: 'waiting for slot' };
+// Deadline evidence and quiet-process suspicion are distinct. Neither changes runner state.
+function stallText(r, box) {
+  const s = el('span', 'stall');
+  if (r.overdue) {
+    const reason = { overall: 'overall', fast: 'fast job', phase: 'phase' }[r.deadline_reason] || 'phase';
+    s.append(el('b', null, 'overdue'), ' · ', reason,
+      ' deadline passed ', mono(short(Math.max(0, -(r.deadline_remaining_s || 0) + drift()))));
+  } else {
+    s.append(el('b', null, 'suspected stall'), ' · log idle ', mono(short((r.log_idle_s || 0) + drift())));
+  }
+  if (WAITS[r.wait]) s.append(' · ' + WAITS[r.wait]);
+  box.append(s, ' · ');
+  return box;
+}
+
+function runningCheck(r, many) {
+  const key = r.run || 'local-' + r.sequence;
+  if (many) return compactCheck(r, key);
+  const box = el('div', hasSignal(r) ? 'check stalled' : 'check');
+  box.dataset.key = key;
+  box.id = 'run-' + key;
+  box.append(el('div', 'ctitle', titleOf(r)), subText(r, el('div', 'csub'), false));
+  if (r.rss_mb != null) box.append(memText(r, el('div', 'mem')));
+  if (r.admitted) {
+    const hero = el('div', 'hero');
+    hero.append(tick(fetchedAt - (r.waited_s || 0), 'dur'));
+    const ctx = el('div', 'context');
+    ctx.append('admitted with ', mono(String(r.workers)), ' worker' + (r.workers > 1 ? 's' : '') + ', waiting for a free project slot');
+    if (r.median_s) ctx.append(' · usual run ', mono(dur(r.median_s)));
+    box.append(hero, ctx);
+    return box;
+  }
+  const hero = el('div', 'hero');
+  hero.append(tick(fetchedAt - (r.elapsed_s || 0), 'dur'));
+  const ctx = el('div', 'context');
+  const elapsed = (r.elapsed_s || 0) + drift();
+  if (hasSignal(r)) stallText(r, ctx);
+  expectText(r, ctx, elapsed);
+  box.append(hero, ctx);
+  if (r.local) return box;
+  const rows = phaseRows(r);
+  box.append(segBar(r, key, rows, elapsed, true));
+  const open = opened.has(key) ? opened.get(key) : true;
+  const now = rows.find(p => p.state === 'now');
+  box.append(stepsButton(key, open, open ? 'Hide steps' : 'Steps' + (now ? ' · now ' + now.name : '')),
+    stepsList(rows, key, open, r.phase_peaks));
+  return box;
+}
+
+// Segmented phase bar: done phases, the live one, and the usual remainder (labels and axis when wide).
+function segBar(r, key, rows, elapsed, full) {
+  const shown = rows.filter(p => p.state === 'done' || p.state === 'now');
+  const total = shown.reduce((a, p) => a + (p.secs || 0), 0);
+  const rest = r.median_s ? Math.max(0, r.median_s - elapsed) : 0;
+  const span = Math.max(1, total + rest);
+  const seg = el('div', 'seg');
+  const labels = el('div', 'labels'), bars = el('div', 'bars');
+  for (const p of shown) {
+    const w = Math.max(0.5, (p.secs || 0) / span * 100);
+    const lab = el('span', p.state === 'now' ? 'now' : null);
+    const b = el('span', p.state === 'now' ? 'now' : null);
+    lab.style.flex = b.style.flex = `${w} 1 0`;
+    if (full && w > 16) lab.append(mono(p.name + ' · '), p.state === 'now' ? tick(p.origin, 'dur') : mono(dur(p.secs)));
+    tipFor(b, `${p.name} · ${dur(p.secs)}`);
+    growOnce(key + p.key, b, 'grow-x');
+    labels.append(lab); bars.append(b);
+  }
+  if (rest > 0) {
+    const w = rest / span * 100;
+    const lab = el('span'), b = el('span', 'rest');
+    lab.style.flex = b.style.flex = `${w} 1 0`;
+    if (full && w > 18) lab.append(mono('~' + dur(rest) + ' left', 'dim'));
+    tipFor(b, `usual remaining ${dur(rest)}`);
+    labels.append(lab); bars.append(b);
+  }
+  if (!full) { seg.append(bars); return seg; }
+  const axis = el('div', 'axis');
+  axis.append(mono('00:00'), mono(mmss(span / 2)), mono(mmss(span)));
+  seg.append(labels, bars, axis);
+  return seg;
+}
+
+function expectText(r, ctx, elapsed) {
+  if (r.median_s && elapsed > r.median_s) ctx.append(mono('+' + dur(elapsed - r.median_s), 'warn'), ' over the usual ', mono(dur(r.median_s)));
+  else if (r.median_s) ctx.append('about ', mono(dur(r.median_s - elapsed), 'ok'), ' left · usual ', mono(dur(r.median_s)));
+  else ctx.append(r.local ? 'admitted by the host queue' : 'no earlier runs of this check to compare');
+}
+
+function drainRole(r, snap) {
+  const d = snap.drain;
+  if (!d) return null;
+  if (d.run && r.run === d.run) return 'owner';
+  if (r.behind_drain) return 'behind';
+  return null;
+}
+
+function lockText(lock, snap) {
+  if (!lock) {
+    const busy = [...new Set((snap.running || []).map(r => r.project))];
+    return 'waiting for the runner lock' + (busy.length ? ' · held by ' + busy.join(', ') : '');
+  }
+  if (lock.exclusive === false) return 'waiting for the runner to go idle';
+  return lock.project ? `waiting for the exclusive lock (${lock.project}${lock.kind === 'run' ? ' --run' : ''} run)` : 'waiting for the exclusive lock';
+}
+
+function queueRow(r, i, snap) {
+  const row = el('div', 'row');
+  row.dataset.key = r.run || 'local-' + r.sequence;
+  row.id = 'run-' + row.dataset.key;
+  row.append(mono(String(i + 1), 'pos'));
+  const what = el('div', 'what');
+  what.append(titleOf(r));
+  if (r.sha) what.append(mono(sha(r.sha)));
+  const reason = el('div', 'cmeta');
+  const drain = drainRole(r, snap || {});
+  if (typeof r.blocker === 'string' && r.blocker) reason.append(r.blocker.slice(0, 160));
+  else if (r.maintenance_state) reason.append(r.maintenance_state === 'starting' ? 'resuming after maintenance' : 'paused for maintenance');
+  else if (drain === 'owner') reason.append('draining the runner: waits for running checks to finish');
+  else if (drain === 'behind') reason.append('waiting behind the drain');
+  else reason.append({ tree: 'same tree as a running check', resources: 'waiting for host resources',
+    slot: 'waiting for a project slot', lock: lockText(snap && snap.lock, snap || {}) }[r.step] || 'queued');
+  if (r.kind === 'run') reason.append(' · --run');
+  if (r.transfer && !r.transfer.available) reason.append(' · ', r.transfer.reason || 'move unavailable');
+  what.append(reason);
+  const when = el('div', 'when');
+  const w = el('div');
+  w.append(mono('waits ', 'grey'), tick(fetchedAt - (r.waited_s || 0), 'dur'));
+  const s = el('div');
+  const start = r.est_start_s == null ? null : Math.max(0, r.est_start_s - drift());
+  if (r.maintenance_state) s.append(r.maintenance_state === 'starting' ? 'resuming' : 'on resume');
+  else if (drain === 'behind') s.append('after the drain');
+  else if (start == null || !r.est_known) s.append(i ? 'after ' : 'after the running check', i ? mono('#' + i) : '');
+  else if (start < 5) s.append('next');
+  else s.append('starts ', mono('~' + mmss(start)));
+  when.append(w, s);
+  if (r.transfer && (r.transfer.available || r.transfer.state === 'pending')) {
+    const move = el('button', 'move', r.transfer.state === 'pending' ? 'Moving…' : 'Move to PC');
+    move.type = 'button';
+    move.disabled = r.transfer.state === 'pending';
+    move.addEventListener('click', async () => {
+      move.disabled = true; move.textContent = 'Moving…';
+      try {
+        const res = await fetch('/api/transfer', { method: 'POST', headers: {
+          'Content-Type': 'application/json', 'X-CI-Board-Nonce': BOARD_NONCE
+        }, body: JSON.stringify({ run: r.run, source: r.transfer.source || r.runner, destination: r.transfer.destination }) });
+        const answer = await res.json();
+        if (!res.ok) throw new Error(answer.error || 'move unavailable');
+      } catch (error) {
+        move.textContent = error.message || 'Move unavailable';
+      }
+    });
+    when.append(move);
+  }
+  row.append(what, when);
+  return row;
+}
+
+// FLIP: keyed rows slide to their new place; new ones fade in; removed ones fade out.
+function reconcile(box, rows) {
+  const old = new Map([...box.children].filter(c => c.dataset.key && !c.classList.contains('leave')).map(c => [c.dataset.key, c]));
+  const first = new Map([...old].map(([k, c]) => [k, c.getBoundingClientRect()]));
+  const keep = new Set(rows.map(c => c.dataset.key));
+  const leaving = [...old].filter(([k]) => !keep.has(k)).map(([, c]) => [c, c.getBoundingClientRect()]);
+  const base = box.getBoundingClientRect();
+  box.replaceChildren(...rows);
+  if (reduce.matches) return;
+  for (const row of rows) {
+    const was = first.get(row.dataset.key);
+    if (!was) {
+      if (old.size) {
+        row.classList.add('enter');
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          row.style.transition = 'opacity .35s, transform .35s';
+          row.classList.remove('enter');
+        }));
+      }
+      continue;
+    }
+    const dy = was.top - row.getBoundingClientRect().top;
+    if (!dy) continue;
+    row.style.transform = `translateY(${dy}px)`;
+    row.style.transition = 'none';
+    requestAnimationFrame(() => { row.style.transition = 'transform .45s cubic-bezier(.2,.7,.2,1)'; row.style.transform = ''; });
+  }
+  for (const [c, r] of leaving) {
+    c.style.cssText = `position:absolute;left:0;right:0;top:${r.top - base.top}px;margin:0`;
+    box.append(c);
+    requestAnimationFrame(() => c.classList.add('leave'));
+    setTimeout(() => c.remove(), 320);
+  }
+}
+
+function containerList(c) {
+  const sec = el('div', 'section');
+  const head = el('div', 'label');
+  const items = (c && c.items) || [];
+  head.append('Containers', mono(String(items.length), 'dim'));
+  sec.append(head);
+  const quiet = { absent: 'docker not installed', stopped: 'docker not running', timeout: 'docker did not answer in time' };
+  if (!c || c.state !== 'ok') { sec.append(el('div', 'quiet', quiet[c && c.state] || 'docker not running')); return sec; }
+  if (!items.length) { sec.append(el('div', 'quiet', 'No containers running.')); return sec; }
+  const rows = el('div', 'rows');
+  for (const x of items) {
+    const row = el('div', 'row crow');
+    const what = el('div', 'what');
+    what.append(x.name, mono(x.image));
+    const meta = el('div', 'cmeta');
+    const port = (x.ports || '').split(',')[0].replace(/^(127\.0\.0\.1|0\.0\.0\.0|\[::\]):/, ':');
+    meta.append(x.owner ? 'used by the running ' + x.owner + ' check' : x.test ? 'test container' : 'long-lived');
+    meta.append(' · ', x.status.replace(/^Up /, 'up '));
+    if (port) meta.append(' · ', mono(port));
+    what.append(meta);
+    const when = el('div', 'when');
+    when.append(el('div', null), el('div', null));
+    when.firstChild.append(mono(x.mem_mb != null ? gb(x.mem_mb) : '–'));
+    when.lastChild.append(mono(x.cpu_pct != null ? x.cpu_pct.toFixed(1) + '%' : '–'), ' cpu');
+    row.append(el('span', 'pos m', x.owner ? '●' : ''), what, when);
+    if (x.owner) row.firstChild.classList.add('ok');
+    rows.append(row);
+  }
+  sec.append(rows);
+  return sec;
+}
+
+function history(s, runner) {
+  const sec = el('div', 'section');
+  const h = s.history;
+  const head = el('div', 'label');
+  head.append('History', mono('last ' + h.length, 'dim'));
+  sec.append(head);
+  if (!h.length) { sec.append(el('div', 'quiet', 'No finished runs yet.')); return sec; }
+  const secs = h.map(x => x.run_s ?? x.total_s ?? 0);
+  const real = h.filter(x => !x.cached && (x.outcome === 'pass' || x.outcome === 'fail')).map(x => x.run_s).filter(v => v != null).sort((a, b) => a - b);
+  const median = real.length ? real[Math.floor((real.length - 1) / 2)] : null;
+  const max = Math.max(...secs, median || 0, 1) * 1.15;
+  const chart = el('div', 'chart');
+  const bars = el('div', 'bars');
+  const pad = 20 - h.length;
+  for (let i = 0; i < pad; i++) { const e = el('i'); e.style.visibility = 'hidden'; bars.append(e); }
+  let slow = 0;
+  h.forEach((x, i) => { if (secs[i] > secs[slow]) slow = i; });
+  h.forEach((x, i) => {
+    const last = i === slow;   // the slowest run carries the accent and the label
+    const b = el('i', (x.outcome === 'fail' ? 'fail' : x.outcome === 'infra' ? 'infra' : '') + (last ? ' hi' : ''));
+    b.style.height = Math.max(2.5, secs[i] / max * 100) + '%';
+    tipFor(b, `${titleOf(x)} ${sha(x.sha)} · ${x.outcome}${x.cached ? ' (cached)' : ''}${x.rc > 1 ? ' rc=' + x.rc : ''} · ${dur(secs[i])} · ${clock(x.ended)}`);
+    if (last) {
+      const em = el('em', 'm', nick(x.project) + ' · ' + dur(secs[i]));
+      em.style.cssText = i + pad < 10 ? 'left:0' : 'right:0';
+      b.append(em);
+    }
+    growOnce(runner + ':h:' + (x.ended || i), b, 'grow');
+    bars.append(b);
+  });
+  chart.append(bars);
+  if (median) {
+    const line = el('div', 'med');
+    line.style.bottom = (median / max * 100) + '%';
+    line.append(el('b', 'm', 'med ' + dur(median)));
+    chart.append(line);
+  }
+  const axis = el('div', 'xaxis');
+  axis.append(mono(clock(h[0].ended)), mono(clock(h[Math.floor(h.length / 2)].ended)), mono(clock(h[h.length - 1].ended)));
+  const passed = h.filter(x => x.outcome === 'pass').length;
+  const foot = el('div', 'foot');
+  const cell = (label, ...value) => { const c = el('div'); const v = el('div', 'value'); v.append(...value); c.append(el('div', 'label', label), v); return c; };
+  foot.append(cell('Passed', mono(String(passed)), mono(' of ' + h.length, 'dim')),
+    cell('Median', mono(median ? dur(median) : '–')),
+    cell('Slowest', nick(h[slow].project), ' ', mono(short(secs[slow]), 'grey')));
+  sec.append(chart, axis, foot);
+  const repos = el('div', 'repos');
+  for (const [name, vals] of Object.entries(s.sparks || {}).sort()) {
+    if (vals.length < 2) continue;
+    const row = el('div');
+    row.append(el('span', null, name));
+    const ns = 'http://www.w3.org/2000/svg', svg = document.createElementNS(ns, 'svg');
+    const w = 84, hgt = 18, top = Math.max(...vals) || 1;
+    svg.setAttribute('viewBox', `0 0 ${w} ${hgt}`);
+    const pl = document.createElementNS(ns, 'polyline');
+    pl.setAttribute('points', vals.map((v, i) => (i * w / (vals.length - 1)).toFixed(1) + ',' + (hgt - 1 - v / top * (hgt - 2)).toFixed(1)).join(' '));
+    svg.append(pl);
+    tipFor(svg, `${name}: ${vals.map(short).join(' · ')}`);
+    row.append(svg, mono(s.medians[name] ? dur(s.medians[name]) : '', 'v'));
+    repos.append(row);
+  }
+  if (repos.children.length) sec.append(repos);
+  return sec;
+}
+
+function runnerCard(v, prev) {
+  const s = v.snapshot;
+  const card = prev || el('article', 'card');
+  card.dataset.key = v.name;
+  card.classList.toggle('stale', v.state !== 'ok' && !!s);
+  const head = el('div', 'head');
+  head.append(el('h2', null, v.name));
+  const st = el('span', 'state ' + v.state);
+  st.append(el('i'), { ok: 'online', connecting: 'connecting', asleep: 'asleep', unreachable: 'unreachable' }[v.state] || v.state);
+  if (v.down_since && v.state !== 'ok') st.append(' since ', mono(clock(v.down_since)));
+  head.append(st);
+  if (s) {
+    const m = el('span', 'machine');
+    m.append(s.host + ' · ' + (s.platform === 'darwin' ? 'macOS' : s.platform === 'linux' ? 'Linux' : s.platform) + ' · ', mono(String(s.metrics.cores)), ' cores');
+    head.append(m);
+  }
+  const parts = [head];
+  const role = el('div', 'role');
+  if ((v.roles || []).length) role.append(v.roles.join(' · '));
+  if (s) {
+    const pol = s.policy || {}, jobs = pol.max_jobs || 1, max = pol.max_workers || 2;
+    if (role.childNodes.length) role.append(' · ');
+    role.append(mono(String(s.queue.active.length)), ' of ', mono(String(jobs)), jobs === 1 ? ' job · ' : ' jobs · ',
+      mono(String(s.queue.granted || 0)), ' of ', mono(String(max)), ' workers');
+  }
+  if (role.childNodes.length) parts.push(role);
+  const body = el('div', 'body');
+  const fills = [];
+  if (!s) {
+    const n = el('div', 'note');
+    if (v.state === 'asleep') n.append(el('b', null, 'Asleep. '), 'Game mode or off; retrying every 3 s.');
+    else if (v.state === 'connecting') n.append('Waiting for the first snapshot.');
+    else n.append(el('b', null, 'No answer. '), (v.error || 'unreachable') + '; retrying every 3 s.');
+    body.append(n);
+  } else {
+    if (v.state !== 'ok') {
+      const n = el('div', 'note');
+      n.append(el('b', null, v.state === 'asleep' ? 'Asleep (game mode or off). ' : 'No answer. '), 'Last data from ', mono(clock(v.last_ok)), '.');
+      body.append(n);
+    }
+    const m = s.metrics, pol = s.policy || {};
+    const stats = el('div', 'stats');
+    if (m.mem_total_mb) {
+      const used = m.mem_total_mb - (m.mem_available_mb || 0), f = used / m.mem_total_mb;
+      const x = stat('Memory', (used / 1024).toFixed(1), '/ ' + Math.round(m.mem_total_mb / 1024) + ' GB', f, m.pressure > 1 || f > .92 ? 'crit' : '');
+      tipFor(x, `${(m.mem_available_mb / 1024).toFixed(1)} GB available · pressure ${m.pressure ?? '?'}`);
+      stats.append(x); fills.push(x);
+    }
+    const lf = m.load == null ? 0 : m.load / m.cores;
+    const cpu = stat('CPU load', m.load == null ? '–' : m.load.toFixed(1), '/ ' + m.cores, lf, lf > 1.25 ? 'crit' : '');
+    stats.append(cpu); fills.push(cpu);
+    const max = pol.max_workers || 2, jobs = pol.max_jobs || 1, granted = s.queue.granted || 0;
+    const wk = stat('Workers', String(granted), 'of ' + max, granted / max, granted > max ? 'crit' : '');
+    tipFor(wk, `${s.queue.active.length} of ${jobs} job(s) admitted; at most ${max} workers on this host`);
+    stats.append(wk); fills.push(wk);
+    body.append(stats);
+    const svc = s.services || {};
+    if (svc.postgres || svc.vm) {
+      // Memory that serves checks but sits outside every check's process tree.
+      const h = el('div', 'hostsvc');
+      if (svc.postgres) h.append('postgres ', mono(gb(svc.postgres)));
+      if (svc.postgres && svc.vm) h.append(' · ');
+      if (svc.vm) h.append('docker VM ', mono(gb(svc.vm)), svc.vm_size_mb ? ' of ' : '', svc.vm_size_mb ? mono(gb(svc.vm_size_mb)) : '');
+      body.append(h);
+    }
+
+    const run = el('div', 'section');
+    const rl = el('div', 'label');
+    rl.append('Running', mono(String(s.running.length), 'dim'));
+    run.append(rl);
+    const many = s.running.length > 1;
+    run.classList.toggle('many', many);
+    if (s.running.length) {
+      const sum = el('div', 'rsum');
+      const rss = s.running.reduce((a, r) => a + (r.rss_mb || 0), 0);
+      sum.append(mono(String(s.running.length)), ' running · ', mono(String(granted)), ' of ', mono(String(max)), ' workers');
+      if (s.running.some(r => r.rss_mb != null)) {
+        sum.append(' · ', mono(gb(rss)), ' used by checks');
+        if (m.mem_total_mb) sum.append(' of ', mono(Math.round(m.mem_total_mb / 1024) + ' GB'));
+      }
+      run.append(sum);
+    }
+    if (s.running.length) s.running.forEach(r => run.append(runningCheck(r, many)));
+    else run.append(el('div', 'quiet', 'Nothing running.'));
+
+    const q = el('div', 'section');
+    const ql = el('div', 'label');
+    ql.append('Queue', mono(String(s.waiting.length), 'dim'));
+    q.append(ql);
+    const rows = card._rows || el('div', 'rows');
+    card._rows = rows;
+    if (s.drain) {
+      const d = el('div', 'drain');
+      const behind = s.waiting.filter(r => drainRole(r, s) === 'behind').length;
+      d.append('draining for ', s.drain.project ? s.drain.project + ' ' : 'an exclusive run', s.drain.run ? mono(s.drain.run.split('-')[2] ? s.drain.run.split('-')[2].slice(0, 7) : '') : '',
+        s.drain.at ? ' (submitted ' : '', s.drain.at ? mono(clock(s.drain.at)) : '', s.drain.at ? ')' : '',
+        ' · ', mono(String(behind)), ' waiting behind it');
+      q.append(d);
+    }
+    if (!s.waiting.length) q.append(el('div', 'quiet', 'Queue empty.'));
+    q.append(rows);
+    body.append(run, q, containerList(s.containers), history(s, v.name));
+    card._after = () => reconcile(rows, s.waiting.map((r, i) => queueRow(r, i, s)));
+  }
+  card.replaceChildren(...parts, body);
+  if (card._after) { card._after(); card._after = null; }
+  const before = card._fracs || {}, after = {};
+  fills.forEach((f, i) => { after[i] = f._frac; f._fill.style.width = ((before[i] ?? 0) * 100) + '%'; });
+  card._fracs = after;
+  requestAnimationFrame(() => requestAnimationFrame(() => fills.forEach(f => { f._fill.style.width = (f._frac * 100) + '%'; })));
+  return card;
+}
+
+function render() {
+  if (!data) return;
+  const focused = document.activeElement && document.activeElement.matches('button.steps') ? document.activeElement.dataset.run : null;
+  const box = document.getElementById('runners');
+  const existing = new Map([...box.children].filter(c => c.dataset.key).map(c => [c.dataset.key, c]));
+  const cards = data.runners.map(v => runnerCard(v, existing.get(v.name)));
+  if (!cards.length) {
+    const c = el('article', 'card');
+    const n = el('div', 'note');
+    n.append(el('b', null, 'No runners configured. '), 'Set ', mono('CI_RUNNERS="name=sshhost"'), ' or REMOTE_CI_HOST in ~/.config/agent-lanes/config.');
+    c.append(n);
+    cards.push(c);
+  }
+  box.replaceChildren(...cards);
+  lanesLine(data.lanes || []);
+  if (window.renderWorkers) window.renderWorkers(data);
+  subline();
+  if (focused) {
+    const again = document.querySelector(`button.steps[data-run="${CSS.escape(focused)}"]`);
+    if (again) again.focus();
+  }
+}
+function subline() {
+  if (!data) return;
+  const ok = data.runners.filter(r => r.state === 'ok').length;
+  const sub = document.getElementById('sub');
+  sub.replaceChildren(mono(String(ok)), ' of ', mono(String(data.runners.length)), ' online · updated ', mono(short(drift())), ' ago', failures ? ' · board offline' : '');
+}
+
+async function poll() {
+  try {
+    const res = await fetch('/api/snapshot', { cache: 'no-store' });
+    if (!res.ok) throw new Error(res.status);
+    data = await res.json();
+    fetchedAt = nowS();
+    failures = 0;
+  } catch (e) {
+    failures++;
+  }
+  render();
+  setTimeout(poll, 3000);
+}
+poll();
+setInterval(() => { document.querySelectorAll('[data-origin]').forEach(paintTick); subline(); }, 1000);
+</script>
+<script src="/workers.js"></script>
+</body>
+</html>

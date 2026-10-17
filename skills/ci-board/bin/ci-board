@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+# ABOUTME: Live board of every check runner (running, queued, history) served on 127.0.0.1.
+# ABOUTME: Polls each runner's remote/snapshot.py over SSH every few seconds and merges mq landing state.
+"""Usage:
+  ci-board [--port N] [--open]     serve the board on 127.0.0.1 and print its URL
+  ci-board --json                  print one merged snapshot and exit
+  ci-board --fixtures DIR          read runners from DIR/runners (fake HOMEs, *.json, *.down, *.asleep)
+                                   and merge-queue state from DIR/mq instead of SSH and ~/.claude/state/mq
+Runners: CI_RUNNERS="name=sshhost name2=sshhost2:wol" (":wol" = wakes on LAN; shown as asleep when
+unreachable; "local" = this machine), else the remote-ci route (REMOTE_CI_HOST / REMOTE_CI_DIRECT_HOST)
+from ~/.config/agent-lanes/config or ~/.config/agent-lanes/config. Snapshots are read-only; the sole control
+asks a live pool client to move its own still-queued check. Config values are never printed."""
+import argparse
+import http.server
+import json
+import os
+import secrets
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+
+# Snapshot collection stays read-only: no .pyc next to the board's modules, nor from python it starts.
+sys.dont_write_bytecode = True
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SNAPSHOT = os.path.join(ROOT, 'remote', 'snapshot.py')
+PAGE = os.path.join(ROOT, 'web', 'index.html')
+ASSETS = {'/workers.js': ('workers.js', 'text/javascript; charset=utf-8')}
+sys.path.insert(0, os.path.join(ROOT, 'lib'))
+from who import Who  # noqa: E402
+import mqstate  # noqa: E402
+import workers as workermod  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(ROOT), 'remote-ci', 'bin'))
+import manual_transfer  # noqa: E402
+KEYS = ('CI_RUNNERS', 'REMOTE_CI_HOST', 'REMOTE_CI_DIRECT_HOST', 'REMOTE_CI_HOSTKEY_ALIAS', 'REMOTE_CI_USER')
+DEFAULT_RUN_S = 600   # expected check length before a repo has history
+# A started check whose log has not grown for STALL_IDLE_S while its process tree uses under STALL_CPU % is
+# suspected, not proven stuck. A trusted runner deadline is the distinct overdue signal.
+STALL_IDLE_S, STALL_CPU = 300, 2.0
+ASLEEP_ERRORS = ('ssh unreachable', 'timeout')   # a :wol runner that does not answer; other errors stay errors
+ROLES = dict(unit='unit tests', db='database', browser='browser', pdf='PDF', cpu='CPU-heavy')
+STEPS = ('queued', 'install', 'database', 'check', 'cleanup')
+WORKERS_EVERY_S = 10  # a worker scan stats ~100-2000 files; worker state changes slowly
+
+
+def read_config(path, keys):
+    """KEY=VALUE lines of a shell config read as text, never sourced or executed. Later lines win;
+    one pair of matching quotes is removed; a value with an expansion ($ or `) is skipped."""
+    values = {}
+    try:
+        with open(path, errors='replace') as f:
+            lines = f.read(65536).splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if line.startswith('export '):
+            line = line[7:].lstrip()
+        key, sep, value = line.partition('=')
+        if not sep or key not in keys:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+            value = value[1:-1]
+        else:
+            value = value.split(' #', 1)[0].rstrip()
+        if '$' in value or '`' in value:
+            continue
+        values[key] = value
+    return values
+
+
+def config():
+    """Only the runner keys; agent-lanes overrides agent-lanes, the environment overrides both."""
+    values = {}
+    home = os.path.expanduser('~')
+    for name in ('agent-lanes', 'agent-lanes'):
+        values.update({k: v for k, v in read_config(os.path.join(home, '.config', name, 'config'), KEYS).items() if v})
+    values.update({k: os.environ[k] for k in KEYS if os.environ.get(k)})
+    return values
+
+
+def bridge_router():
+    try:
+        return subprocess.run(['ipconfig', 'getoption', 'bridge0', 'router'], capture_output=True,
+                              text=True, timeout=2).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ''
+
+
+def runners(values):
+    """[{name, routes: [ssh target args] or ['local'], wakeable}]"""
+    result = []
+    if values.get('CI_RUNNERS'):
+        for item in values['CI_RUNNERS'].split():
+            # name=host[:wol][:role...], e.g. source=source-host:unit  pc=pc-host:wol:db:browser
+            name, _, rest = item.partition('=')
+            target, *tags = (rest or name).split(':')
+            wake = 'wol' in tags
+            roles = [ROLES.get(t, t) for t in tags if t != 'wol']
+            if name and target:
+                result.append(dict(name=name, routes=['local' if target == 'local' else [target]], wakeable=wake,
+                                   roles=roles))
+        return result
+    host = values.get('REMOTE_CI_HOST', '')
+    if host == 'local':
+        return [dict(name='local', routes=['local'], wakeable=False)]
+    user = values.get('REMOTE_CI_USER', '')
+    routes = []
+    direct = values.get('REMOTE_CI_DIRECT_HOST') or bridge_router()
+    if direct:
+        alias = values.get('REMOTE_CI_HOSTKEY_ALIAS', '')
+        routes.append((['-o', 'HostKeyAlias=' + alias] if alias else []) + [(user + '@' if user else '') + direct])
+    if host:
+        routes.append([(user + '@' if user else '') + host])
+    return [dict(name='source', routes=routes, wakeable=False)] if routes else []
+
+
+def fixture_runners(directory):
+    base = os.path.join(directory, 'runners')
+    names = {}
+    for entry in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        stem, ext = os.path.splitext(entry)
+        if os.path.isdir(os.path.join(base, entry)):
+            names[entry] = dict(name=entry, routes=[['home:' + os.path.join(base, entry)]], wakeable=False)
+        elif ext in ('.json', '.down', '.asleep') and entry != 'roles.json':
+            names[stem] = dict(name=stem, routes=[[ext[1:] + ':' + os.path.join(base, entry)]],
+                               wakeable=ext == '.asleep')
+    try:
+        with open(os.path.join(base, 'roles.json')) as f:
+            for name, roles in json.load(f).items():
+                if name in names:
+                    names[name]['roles'] = [ROLES.get(r, r) for r in roles]
+    except (OSError, ValueError):
+        pass
+    return list(names.values())
+
+
+def run_snapshot(route, timeout, known=''):
+    """(snapshot dict, None) or (None, short error). Never returns stderr text.
+    known: "run=key,..." finished runs the board already holds (the snapshot skips reading them)."""
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+    extra = [known] if known else []
+    if route == 'local' or route[0].startswith('home:'):
+        args = [sys.executable, '-B', SNAPSHOT, *extra]
+        if route != 'local':
+            env['CI_BOARD_HOME'] = route[0][5:]
+    elif route[0].startswith(('json:', 'down:', 'asleep:')):
+        kind, _, path = route[0].partition(':')
+        if kind != 'json':
+            return None, 'ssh unreachable'
+        try:
+            with open(path) as f:
+                return json.load(f), None
+        except (OSError, ValueError):
+            return None, 'fixture unreadable'
+    else:
+        args = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3', '-o', 'ServerAliveInterval=2',
+                *route, 'python3', '-B', '-', *extra]
+    try:
+        with open(SNAPSHOT, 'rb') as script:
+            proc = subprocess.run(args, stdin=script, capture_output=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return None, 'timeout'
+    except OSError:
+        return None, 'cannot start ssh'
+    if proc.returncode == 255:
+        return None, 'ssh unreachable'
+    if proc.returncode != 0:
+        return None, 'snapshot exit %d' % proc.returncode
+    try:
+        return json.loads(proc.stdout), None
+    except ValueError:
+        return None, 'bad snapshot output'
+
+
+class Runner:
+    def __init__(self, spec):
+        self.spec = spec
+        self.lock = threading.Lock()
+        self.busy = False
+        self.good = 0          # index of the route that last answered
+        self.snap = None
+        self.fetched = None
+        self.error = None
+        self.down_since = None
+        self.last_ok = None
+        self.peaks = {}        # run id -> {'all': MB, phase: MB}: peak memory seen while the board watched
+        self.finished = {}     # run id -> finished row with its cache key (the snapshot skips unchanged ones)
+
+    def known(self):
+        # Keys are digits, dots and dashes; run ids hex, digits and dashes: safe as one ssh argument.
+        return ','.join('%s=%s' % (run, row['cache_key']) for run, row in self.finished.items()
+                        if row.get('cache_key') and mqstate.SAFE.sub('', run) == run)
+
+    def fill(self, snap):
+        """Unchanged finished runs come back as stubs: restore them from the cache; drop deferred ones."""
+        rows = []
+        for row in snap.get('finished') or []:
+            if row.get('same'):
+                row = self.finished.get(row.get('run'))
+            elif row.get('deferred'):
+                row = None
+            if row:
+                rows.append(row)
+        self.finished = {r['run']: r for r in rows if r.get('run') and r.get('cache_key')}
+        snap['finished'] = rows
+
+    def track_peaks(self, snap):
+        """Peak RSS per running check and per phase (install/database/check), across polls."""
+        active = snap.get('active') or []
+        for row in active:
+            if row.get('rss_mb') is None or not row.get('run'):
+                continue
+            peaks = self.peaks.setdefault(row['run'], {})
+            for key in ('all', row.get('phase')):
+                if key:
+                    peaks[key] = max(peaks.get(key, 0), row['rss_mb'])
+        for run in set(self.peaks) - {r.get('run') for r in active}:
+            del self.peaks[run]
+
+    def poll(self, timeout=8):
+        routes = self.spec['routes']
+        order = [self.good] + [i for i in range(len(routes)) if i != self.good] if routes else []
+        snap, error = None, 'no route configured'
+        for index in order:
+            snap, error = run_snapshot(routes[index], timeout, self.known())
+            if snap is not None:
+                self.good = index
+                self.fill(snap)
+                break
+        with self.lock:
+            now = time.time()
+            if snap is not None:
+                self.snap, self.fetched, self.error, self.down_since, self.last_ok = snap, now, None, None, now
+                self.track_peaks(snap)
+            else:
+                self.error = error
+                self.down_since = self.down_since or now
+            self.busy = False
+
+    def view(self):
+        with self.lock:
+            state = 'ok' if self.error is None and self.snap else (
+                'asleep' if self.spec['wakeable'] and self.error in ASLEEP_ERRORS else 'unreachable'
+            ) if self.error else 'connecting'
+            route = None
+            if self.snap is not None and self.spec['routes']:
+                first = self.spec['routes'][self.good]
+                if first == 'local':
+                    route = 'local'
+                elif first[0].startswith(('home:', 'json:')):
+                    route = 'fixture'
+                elif len(self.spec['routes']) > 1:
+                    route = 'direct' if self.good == 0 else 'fallback'
+                else:
+                    route = 'ssh'
+            return dict(name=self.spec['name'], state=state, wakeable=self.spec['wakeable'], error=self.error,
+                        roles=self.spec.get('roles') or [],
+                        down_since=self.down_since, last_ok=self.last_ok, fetched=self.fetched, route=route,
+                        snapshot=with_peaks(derive(self.snap), self.peaks) if self.snap else None)
+
+
+def with_peaks(snap, peaks):
+    for row in snap.get('running') or []:
+        found = peaks.get(row.get('run')) or {}
+        row['peak_mb'] = found.get('all')
+        row['phase_peaks'] = {k: v for k, v in found.items() if k != 'all'}
+    return snap
+
+
+def median(values):
+    values = [v for v in values if isinstance(v, (int, float))]
+    return statistics.median(values) if values else None
+
+
+def derive(snap):
+    """Add per-repo medians, progress/ETA for running checks and estimated starts for waiting ones."""
+    snap = json.loads(json.dumps(snap))
+    finished = sorted(snap.get('finished') or [], key=lambda r: r.get('ended') or 0)
+    per, by_check = {}, {}
+    for row in finished:
+        if row.get('outcome') in ('pass', 'fail') and not row.get('cached') and row.get('run_s'):
+            # Repo medians and sparklines describe the full suite; one-off --run commands only
+            # ever compare with earlier runs of the same command.
+            if row.get('kind') != 'run':
+                per.setdefault(row['project'], []).append(row['run_s'])
+            by_check.setdefault((row['project'], row.get('check')), []).append(row['run_s'])
+    medians = {p: median(v[-10:]) for p, v in per.items()}
+    overall = median([v for vals in per.values() for v in vals[-10:]])
+    fallback = overall or DEFAULT_RUN_S
+    now = snap.get('now') or time.time()
+    running, waiting = [], []
+    for row in snap.get('active') or []:
+        # Same project and same check command first (a one-off --run differs from the full check).
+        same = by_check.get((row['project'], row.get('check')))
+        if same and row.get('check'):
+            expected = median(same[-10:])
+        else:
+            expected = None if row.get('kind') == 'run' else medians.get(row['project'])
+        row['median_s'] = expected
+        row['step_index'] = STEPS.index(row['phase']) if row.get('phase') in STEPS else 0
+        if row.get('started') is not None:
+            elapsed = row.get('elapsed_s') or 0
+            row['progress'] = min(1.0, elapsed / expected) if expected else None
+            row['eta_s'] = max(0, round(expected - elapsed)) if expected else None
+            row['over_median'] = bool(expected and elapsed > expected)
+            deadlines = [(row.get('phase_deadline'), 'phase')]
+            if row.get('step') not in ('cleanup', 'maintenance'):
+                deadlines.extend(((row.get('run_deadline'), 'overall'),
+                                  (row.get('job_deadline'), 'fast')))
+            deadlines = [(value, reason) for value, reason in deadlines
+                         if type(value) in (int, float) and value > 0]
+            deadline, reason = min(deadlines) if deadlines else (None, None)
+            row['deadline_at'] = deadline
+            row['deadline_reason'] = reason
+            row['deadline_remaining_s'] = round(deadline - now) if deadline else None
+            row['overdue'] = bool(row.get('live') and deadline and now > deadline)
+            row['suspected_stall'] = bool(
+                row.get('live') and not row['overdue'] and row.get('phase') not in ('queued', 'following') and
+                (row.get('log_idle_s') or 0) >= STALL_IDLE_S and
+                row.get('cpu_pct') is not None and row['cpu_pct'] < STALL_CPU)
+            running.append(row)
+        elif row.get('live') and row.get('workers'):
+            # Admitted by the host queue (workers granted) but still waiting for a project slot:
+            # it holds capacity, so it is one of the active jobs.
+            row.update(admitted=True, progress=None, eta_s=None, over_median=False,
+                       overdue=False, suspected_stall=False)
+            running.append(row)
+        else:
+            waiting.append(row)
+    # Jobs admitted outside remote-ci (safe-check runs on the runner itself) hold capacity too.
+    for row in (snap.get('queue') or {}).get('active', []) + (snap.get('queue') or {}).get('waiting', []):
+        if row.get('kind') != 'local':
+            continue
+        local = dict(project='safe-check', run=None, sha=None, local=True, sequence=row.get('sequence'),
+                     workers=row.get('workers'), median_s=None, step_index=0,
+                     rss_mb=row.get('rss_mb'), cpu_pct=row.get('cpu_pct'))
+        if row.get('workers'):
+            local.update(phase='check', step='check', step_index=3, started=row.get('since'),
+                         elapsed_s=round(now - row['since']) if row.get('since') else None,
+                         progress=None, eta_s=None, over_median=False)
+            running.append(local)
+        else:
+            local.update(phase='queued', step='resources', started=None,
+                         waited_s=round(now - row['since']) if row.get('since') else None)
+            waiting.append(local)
+    # Oldest start first; admitted-but-unstarted jobs after every started one.
+    running.sort(key=lambda r: (r.get('started') is None, r.get('started') or 0, r.get('submitted') or 0))
+    max_jobs = max(1, int((snap.get('policy') or {}).get('max_jobs') or 1))
+    # Each job slot becomes free at (seconds from now, whether that time is known, why).
+    lanes = []
+    for r in running:
+        if r.get('admitted'):
+            lanes.append((r.get('median_s') or fallback, bool(r.get('median_s')), 'eta'))
+        elif r.get('eta_s') is None:
+            lanes.append((max(0, fallback - (r.get('elapsed_s') or 0)), False, 'unknown'))
+        else:
+            lanes.append((r['eta_s'], True, 'overdue' if r.get('over_median') else 'eta'))
+    lanes.sort()
+    lanes += [(0, True, 'free')] * max(0, max_jobs - len(lanes))
+    big = float('inf')
+    drain = snap.get('drain') or {}
+
+    def drain_rank(r):
+        # An exclusive drain goes first; runs submitted after it wait behind it (run.sh FCFS).
+        if drain.get('run') and r.get('run') == drain['run']:
+            return 0
+        # Later exclusive runs queue behind the owner whatever their submit time.
+        if drain and ((drain.get('at') and (r.get('submitted') or 0) > drain['at']) or r.get('exclusive')):
+            r['behind_drain'] = True
+            return 2
+        return 1
+    waiting.sort(key=lambda r: (drain_rank(r), r['sequence'] if r.get('sequence') is not None else big,
+                                r.get('submitted') or 0))
+    # Admission is FIFO (only the head can be admitted), so a start is never earlier, nor better
+    # known, than the one before it.
+    prev_start, prev_known = 0, True
+    for row in waiting:
+        if row.get('maintenance_state'):
+            row.update(est_start_s=None, est_known=False, est_basis='maintenance')
+            continue
+        lanes.sort()
+        start, known, basis = lanes[0]
+        if start < prev_start:
+            start, basis = prev_start, 'eta'
+        known = known and prev_known
+        prev_start, prev_known = start, known
+        row.update(est_start_s=round(start), est_known=known, est_basis=basis)
+        length = row.get('median_s')
+        lanes[0] = (start + (length or fallback), known and bool(length), 'eta' if length else 'unknown')
+    history = [dict(project=r['project'], run=r.get('run'), outcome=r.get('outcome'), sha=r.get('sha'), ended=r.get('ended'),
+                    run_s=r.get('run_s'), total_s=r.get('total_s'), cached=r.get('cached'), rc=r.get('rc'))
+               for r in finished[-20:]]
+    sparks = {p: v[-10:] for p, v in per.items()}
+    snap.update(running=running, waiting=waiting, medians=medians, history=history, sparks=sparks,
+                fallback_s=fallback)
+    return snap
+
+
+def mq_lanes(root, now=None):
+    now = now or time.time()
+    result = []
+    for repo in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        mqdir = os.path.join(root, repo)
+        if repo == 'claims' or not os.path.isdir(mqdir):
+            continue
+        events = mqstate.mq_events(mqdir)
+        queued = set()
+        try:
+            with open(os.path.join(mqdir, 'queue'), errors='replace') as f:
+                rows = [line.split('\t') for line in f.read().splitlines() if line.strip()]
+        except OSError:
+            rows = []
+        for parts in rows:
+            name, state = parts[0], parts[1] if len(parts) > 1 else ''
+            evs = events.get(name, [])
+            last = evs[-1] if evs else (0, '', '')
+            if state == 'ready':
+                state = 'landing' if last[1] == 'landing' else 'queued'
+            queued.add(name)
+            result.append(dict(repo=repo, lane=name, state=state or 'unknown', since=last[0] or None))
+        for name, evs in events.items():
+            landed = [t for t, e, _ in evs if e == 'landed']
+            if name not in queued and landed and now - landed[-1] < 3600:
+                result.append(dict(repo=repo, lane=name, state='landed', since=landed[-1]))
+    order = dict(landing=0, queued=1, bounced=2, parked=3, landed=5)
+    result.sort(key=lambda r: (order.get(r['state'], 4), -(r['since'] or 0)))
+    return result
+
+
+def last_landing(path, lanes=None):
+    """The lane named by the last 'landing <lane>' line of an mq run.log (its events may say queued).
+    With lanes, only a lane mq knows counts (run.log text is never passed on otherwise)."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(max(0, os.fstat(f.fileno()).st_size - 4096))
+            lines = f.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if line.startswith('landing ') and len(line.split()) == 2:
+            lane = line.split()[1]
+            return lane if lanes is None or lane in lanes else None
+    return None
+
+
+class Board:
+    def __init__(self, specs, mq_root, who=None, workers=None, transfer_root=None):
+        self.runners = [Runner(s) for s in specs]
+        self.mq_root = mq_root
+        self.who = who or Who()
+        self.workers = workers
+        self.worker_rows, self.workers_at, self.scanning = [], None, False
+        self.worker_lock = threading.Lock()
+        self.transfer_root = transfer_root
+        self.runner_names = {s['name'] for s in specs}
+        self.pc = next((s['name'] for s in specs if s['name'].lower() == 'pc'), None)
+
+    def transfer_status(self, run, source):
+        if not self.pc:
+            return dict(available=False, reason='PC runner is not configured')
+        if source == self.pc:
+            return dict(available=False, reason='already queued on PC')
+        result = manual_transfer.status(run, source, self.pc, self.transfer_root)
+        result['source'] = source
+        return result
+
+    def request_transfer(self, run, source, destination):
+        if destination != self.pc:
+            raise ValueError('unknown runner')
+        # A request is valid only while the board still sees this exact waiting row on its source.
+        found = False
+        for runner in self.runners:
+            view = runner.view()
+            if view['name'] == source:
+                found = any(row.get('run') == run for row in (view.get('snapshot') or {}).get('waiting', []))
+                break
+        if not found:
+            raise ValueError('check is no longer waiting on the source')
+        return manual_transfer.request(run, source, destination, self.runner_names, self.transfer_root)
+
+    def scan_workers(self):
+        try:
+            rows = self.workers.scan()
+        except Exception:   # a bad state file must not stop the board; keep the last scan
+            rows = None
+        with self.worker_lock:
+            if rows is not None:
+                self.worker_rows, self.workers_at = rows, time.time()
+            self.scanning = False
+
+    def tick(self, wait=False):
+        threads = []
+        for runner in self.runners:
+            with runner.lock:
+                if runner.busy:
+                    continue  # previous poll still running; skip this tick
+                runner.busy = True
+            thread = threading.Thread(target=runner.poll, daemon=True)
+            thread.start()
+            threads.append(thread)
+        with self.worker_lock:
+            start = self.workers is not None and not self.scanning and (
+                wait or not self.workers_at or time.time() - self.workers_at >= WORKERS_EVERY_S)
+            self.scanning = self.scanning or start
+        if start:
+            thread = threading.Thread(target=self.scan_workers, daemon=True)
+            thread.start()
+            threads.append(thread)
+        if wait:
+            for thread in threads:
+                thread.join()
+
+    def merged(self):
+        views = [r.view() for r in self.runners]
+        lanes = mq_lanes(self.mq_root)
+        landing = {}
+        for lane in lanes:
+            if lane['state'] == 'landing':
+                landing.setdefault(lane['repo'], []).append(lane['lane'])
+        one = {repo: names[0] for repo, names in landing.items() if len(names) == 1}
+        for repo in os.listdir(self.mq_root) if os.path.isdir(self.mq_root) else []:
+            if repo not in one:
+                mqdir = os.path.join(self.mq_root, repo)
+                lane = last_landing(os.path.join(mqdir, 'run.log'), set(mqstate.mq_events(mqdir)))
+                if lane:
+                    one[repo] = lane
+        rows = []
+        for view in views:
+            snap = view['snapshot'] or {}
+            for row in snap.get('waiting', []):
+                if row.get('run'):
+                    row['transfer'] = self.transfer_status(row['run'], view['name'])
+            rows += snap.get('running', []) + snap.get('waiting', []) + snap.get('history', [])
+        # Worker (lane) behind each run, from its client process on this machine.
+        self.who.annotate(rows, one)
+        current, last = {}, {}
+        for view in views:
+            snap = view['snapshot'] or {}
+            for state, key in (('running', 'running'), ('queued', 'waiting')):
+                for r in snap.get(key, []):
+                    if r.get('who') and r.get('run'):
+                        current.setdefault((r.get('project'), r['who']), dict(run=r['run'], runner=view['name'], state=state, sha=r.get('sha')))
+            for r in sorted(snap.get('history', []), key=lambda r: r.get('ended') or 0):
+                if r.get('who'):
+                    last[(r.get('project'), r['who'])] = dict(run=r.get('run'), runner=view['name'], state='finished', sha=r.get('sha'),
+                                          outcome=r.get('outcome'), ended=r.get('ended'))
+        with self.worker_lock:
+            found, at = self.worker_rows, self.workers_at
+        return dict(version=1, generated=time.time(), runners=views, lanes=lanes,
+                    workers=workermod.with_ci(found, current, last), workers_at=at)
+
+
+def serve(board, port, interval, open_browser):
+    nonce = secrets.token_urlsafe(24)
+
+    def page():
+        with open(PAGE, 'rb') as f:
+            return f.read().replace(b'__CI_BOARD_NONCE__', nonce.encode())
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def send(self, code, body, kind):
+            self.send_response(code)
+            self.send_header('Content-Type', kind)
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            # Refuse other Host names so a web page cannot read the board via DNS rebinding.
+            host = (self.headers.get('Host') or '').rsplit(':', 1)[0]
+            if host not in ('127.0.0.1', 'localhost'):
+                return self.send(403, b'forbidden\n', 'text/plain')
+            path = self.path.split('?', 1)[0]
+            if path == '/':
+                return self.send(200, page(), 'text/html; charset=utf-8')
+            if path in ASSETS:
+                name, kind = ASSETS[path]
+                with open(os.path.join(ROOT, 'web', name), 'rb') as f:
+                    return self.send(200, f.read(), kind)
+            if path == '/api/snapshot':
+                return self.send(200, json.dumps(board.merged()).encode(), 'application/json')
+            return self.send(404, b'not found\n', 'text/plain')
+
+        def do_POST(self):
+            host = self.headers.get('Host') or ''
+            host_name = host.rsplit(':', 1)[0]
+            origin = self.headers.get('Origin') or ''
+            if (host_name not in ('127.0.0.1', 'localhost') or origin != 'http://' + host or
+                    not secrets.compare_digest(self.headers.get('X-CI-Board-Nonce') or '', nonce)):
+                return self.send(403, b'{"error":"forbidden"}\n', 'application/json')
+            if self.path.split('?', 1)[0] != '/api/transfer':
+                return self.send(404, b'{"error":"not found"}\n', 'application/json')
+            try:
+                length = int(self.headers.get('Content-Length') or '-1')
+            except ValueError:
+                length = -1
+            if not 0 <= length <= 1024 or self.headers.get_content_type() != 'application/json':
+                return self.send(400, b'{"error":"invalid request"}\n', 'application/json')
+            try:
+                request = json.loads(self.rfile.read(length))
+                if not isinstance(request, dict) or set(request) != {'run', 'source', 'destination'}:
+                    raise ValueError('invalid request')
+                result = board.request_transfer(request['run'], request['source'], request['destination'])
+            except (ValueError, TypeError, OSError) as error:
+                message = str(error) if isinstance(error, ValueError) else 'move unavailable'
+                return self.send(409, json.dumps({'error': message[:160]}).encode(), 'application/json')
+            return self.send(202, json.dumps(result).encode(), 'application/json')
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    url = 'http://127.0.0.1:%d/' % server.server_address[1]
+    print('ci-board ' + url, flush=True)
+
+    def loop():
+        while True:
+            board.tick()
+            time.sleep(interval)
+    threading.Thread(target=loop, daemon=True).start()
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog='ci-board', description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--open', action='store_true')
+    parser.add_argument('--port', type=int, default=0)
+    parser.add_argument('--interval', type=float, default=3.0)
+    parser.add_argument('--fixtures')
+    parser.add_argument('--mq')
+    args = parser.parse_args(argv)
+    if args.fixtures:
+        specs = fixture_runners(args.fixtures)
+        mq_root = args.mq or os.path.join(args.fixtures, 'mq')
+    else:
+        specs = runners(config())
+        mq_root = args.mq or os.path.join(os.path.expanduser('~'), '.claude', 'state', 'mq')
+    who = None
+    if args.fixtures:
+        # Fixture runs have no local clients: labels come from DIR/who.json ({run id: label}) only.
+        try:
+            with open(os.path.join(args.fixtures, 'who.json')) as f:
+                who = Who(fixture=json.load(f))
+        except (OSError, ValueError):
+            who = Who(fixture={})
+    if args.fixtures:
+        # Fixture workers: DIR/logs, DIR/mq and DIR/*.tsv; DIR/pids.json is the fake ps table.
+        try:
+            with open(os.path.join(args.fixtures, 'pids.json')) as f:
+                table = {int(k): (1, 0, '', v) for k, v in json.load(f).items()}
+        except (OSError, ValueError):
+            table = {}
+        workers = workermod.Workers(roots=[args.fixtures], table=lambda: table, alive=lambda pid: pid in table)
+    else:
+        workers = workermod.Workers(roots=[r for r in (os.path.dirname(mq_root), workermod.canonical_root())
+                                           if os.path.isdir(r)])
+    transfer_root = os.path.join(args.fixtures, 'transfers') if args.fixtures else None
+    board = Board(specs, mq_root, who, workers, transfer_root)
+    if args.json:
+        board.tick(wait=True)
+        json.dump(board.merged(), sys.stdout, indent=1)
+        sys.stdout.write('\n')
+        return 0
+    return serve(board, args.port, args.interval, args.open)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

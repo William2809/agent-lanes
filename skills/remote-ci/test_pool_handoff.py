@@ -215,7 +215,7 @@ class Mover(unittest.TestCase):
     def setUp(self):
         self.move = module('pool_move', KIT / 'bin/pool_move.py')
         self.pool = self.move.pool
-        self.runners = self.pool.registry('mini=mini-route:unit pc=pc-route:unit bare=bare-route', {})
+        self.runners = self.pool.registry('source=source-route:unit pc=pc-route:unit bare=bare-route', {})
         self.temp = tempfile.TemporaryDirectory()
         self.out = str(Path(self.temp.name) / 'move')
         self.calls = []
@@ -255,7 +255,7 @@ class Mover(unittest.TestCase):
         def alive():
             left[0] -= 1
             return left[0] >= 0
-        return self.move.move(self.runners, 'mini', {'unit'}, 'proj', 'run1', 60, 5, self.out,
+        return self.move.move(self.runners, 'source', {'unit'}, 'proj', 'run1', 60, 5, self.out,
                               probe=self.probe(answers), remote=self.remote(statuses, withdraw_rc),
                               sleep=self.sleeps.append, alive=alive)
 
@@ -273,15 +273,15 @@ class Mover(unittest.TestCase):
             with self.subTest(row=row):
                 self.assertIs(queued(json.loads(self.status(**row)), 'run1'), False)
 
-    def test_moves_after_two_ready_probes_with_one_withdraw(self):
+    def test_idle_pc_moves_after_two_ready_probes_without_initial_delay(self):
         self.assertEqual(self.run_move([self.status()], {'pc': [True]}), 'moved')
         self.assertEqual(Path(self.out).read_text().strip(), 'pc')
         self.assertEqual(self.withdraws(), ['python3 ~/ci/projects/proj/runs/run1/bin/resources.py '
                                             'withdraw --token proj-run1-42 --generation 5 --to pc'])
-        self.assertEqual(self.sleeps[:2], [60, 5])
+        self.assertEqual(self.sleeps, [5])
         self.assertEqual([c for c in self.calls if c[1] == 'probe'], [('pc', 'probe')] * 2)
         # The status read and the withdraw go to the source; the needs-less runner is never probed.
-        self.assertTrue(all(route == 'mini-route' for route, command in self.calls if command != 'probe'))
+        self.assertTrue(all(route == 'source-route' for route, command in self.calls if command != 'probe'))
 
     def test_one_flap_does_not_move(self):
         result = self.run_move([self.status()], {'pc': [True, False, False]}, loops=3)
@@ -300,8 +300,8 @@ class Mover(unittest.TestCase):
         self.assertEqual(len(self.withdraws()), 1)
 
     def test_no_other_eligible_runner_means_no_work(self):
-        runners = self.pool.registry('mini=mini-route:unit pc=pc-route:unit', {'CI_RUNNER_pc_ENABLED': '0'})
-        result = self.move.move(runners, 'mini', {'unit'}, 'proj', 'run1', 60, 5, self.out,
+        runners = self.pool.registry('source=source-route:unit pc=pc-route:unit', {'CI_RUNNER_pc_ENABLED': '0'})
+        result = self.move.move(runners, 'source', {'unit'}, 'proj', 'run1', 60, 5, self.out,
                                 probe=lambda *a: self.fail('probe'), remote=lambda *a: self.fail('ssh'),
                                 sleep=lambda s: self.fail('sleep'))
         self.assertEqual(result, 'none')
@@ -471,6 +471,50 @@ class Client(unittest.TestCase):
         pool = module('pool', KIT / 'bin/pool.py')
         self.assertEqual(pool.recorded(self.state, 'fixture', 'latest'), 'b')
         self.assertEqual(pool.recorded(self.state, 'fixture', first[1]), 'b')
+
+    def test_manual_request_moves_through_owner_and_keeps_the_snapshot(self):
+        a = self.host('a', 'v2', 0, hold=60)
+        pc = self.host('pc', 'v2', 0)
+        (Path(self.temp.name) / 'config').write_text('CI_RUNNERS="a=a-route:unit pc=pc-route:unit"\n')
+        (self.repo / 'manual.txt').write_text('same snapshot\n')
+        transfers = Path(self.temp.name) / '.local/state/remote-ci/transfers'
+        env = dict(self.env, REMOTE_CI_MOVE_AFTER='300', REMOTE_CI_MOVE_GAP='5',
+                   REMOTE_CI_TRANSFER_STATE=str(transfers))
+        child = subprocess.Popen(['/bin/bash', str(KIT / 'bin/remote-ci'), 'check', '--worktree',
+                                  '--summary', '--force', '--run', 'echo manual'], env=env,
+                                 cwd=self.repo, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+        # Submission/setup may be slow on a loaded regression runner. Start the
+        # registration guarantee at source launch, not at client process creation.
+        launch_deadline = time.time() + 60
+        while time.time() < launch_deadline and not (a / 'run.args').exists():
+            time.sleep(.05)
+        self.assertTrue((a / 'run.args').exists(), 'source run did not launch')
+        deadline = time.time() + 10
+        owner = None
+        while time.time() < deadline:
+            found = list(transfers.glob('*/owner.json'))
+            if found:
+                owner = json.loads(found[0].read_text())
+                break
+            time.sleep(.05)
+        self.assertIsNotNone(owner, 'pool client did not register manual transfer support')
+        helper = module('manual_transfer_test', KIT / 'bin/manual_transfer.py')
+        helper.request(owner['run'], 'a', 'pc', {'a', 'pc'}, transfers)
+        stdout, stderr = child.communicate(timeout=120)
+        output = stdout + stderr
+        self.assertEqual(child.returncode, 0, output)
+        self.assertIn('from a to pc', output)
+        first = self.read('a', 'run.args').split(' ')
+        second = self.read('pc', 'run.args').split(' ')
+        self.assertEqual((first[1], first[4], first[5], first[8]),
+                         (second[1], second[4], second[5], second[8]))
+        self.assertEqual(self.read('a', 'run.conf'), self.read('pc', 'run.conf'))
+        snapshot = subprocess.run(['git', '-C', str(self.repo), 'show', first[1] + ':manual.txt'],
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(snapshot.stdout, 'same snapshot\n')
+        self.assertEqual(self.read('pc', 'pushes'), 'after\n')
+        self.assertIn('--to pc', self.read('a', 'withdraw.args'))
 
     def test_queued_v2_source_moves_to_v1_destination(self):
         self.host('a', 'v2', 0, hold=60)
