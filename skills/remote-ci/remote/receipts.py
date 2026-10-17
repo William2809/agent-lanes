@@ -356,11 +356,23 @@ def parse_time(text):
     if match:
         result.update(user_seconds=float(match[1]), system_seconds=float(match[2]),
                       cpu_seconds=float(match[1]) + float(match[2]))
+    else:
+        user = re.search(r'^\s*User time \(seconds\):\s*([\d.]+)\s*$', text, re.M)
+        system = re.search(r'^\s*System time \(seconds\):\s*([\d.]+)\s*$', text, re.M)
+        if user and system:
+            result.update(user_seconds=float(user[1]), system_seconds=float(system[1]),
+                          cpu_seconds=float(user[1]) + float(system[1]))
     for key, label in [('max_rss_bytes', 'maximum resident set size'),
                        ('block_output_operations', 'block output operations')]:
         match = re.search(r'^\s*(\d+)\s+' + label + r'\s*$', text, re.M)
         if match:
             result[key] = int(match[1])
+    maximum = re.search(r'^\s*Maximum resident set size \(kbytes\):\s*(\d+)\s*$', text, re.M)
+    outputs = re.search(r'^\s*File system outputs:\s*(\d+)\s*$', text, re.M)
+    if maximum:
+        result['max_rss_bytes'] = int(maximum[1]) * 1024
+    if outputs:
+        result['block_output_operations'] = int(outputs[1])
     return result
 
 

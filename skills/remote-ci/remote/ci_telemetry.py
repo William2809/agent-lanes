@@ -29,6 +29,8 @@ def record(event, fields, now=None):
         raise ValueError('invalid timestamp')
     row = dict(schema=SCHEMA, event=event, at=stamp)
     for key, value in fields.items():
+        if key in ('rss_mb', 'limit_mb') and event != 'stopped':
+            raise ValueError('working-set observations require a stop event')
         if key in NUMERIC:
             if type(value) not in (int, float) or not 0 <= value <= 10**18 or not math.isfinite(value):
                 raise ValueError('invalid telemetry number')

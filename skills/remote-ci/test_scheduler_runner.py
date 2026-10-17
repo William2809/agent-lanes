@@ -80,12 +80,14 @@ class SchedulerRunner(unittest.TestCase):
 
     def test_two_slots_run_and_cleanup_without_global_lock(self):
         self.configure(slots=2)
+        with (self.dir / 'conf').open('a') as stream:
+            stream.write('REMOTE_CI_WORKERS=2\n')
         first = self.start('first', command='bash "$HOME/check"; true')
         second = self.start('second', command='bash "$HOME/check"; :')
         self.wait_for(lambda: self.count() == 2)
         running = [r for r in self.rows().values() if r.get('state') == 'running']
         self.assertEqual({r['slot'] for r in running}, {1, 2})
-        self.assertEqual(sum(r['workers'] for r in running), 2)
+        self.assertEqual([r['workers'] for r in running], [2, 2])
         self.assertFalse((self.ci/'lock').exists())
         (self.home / 'release').touch()
         self.assert_result(first, 'first', 0)

@@ -258,9 +258,9 @@ class Receipts(unittest.TestCase):
         self.addCleanup(fixture.doCleanups)
         return fixture
 
-    def test_non_darwin_skips_bsd_timing(self):
+    def test_unknown_platform_skips_external_timing(self):
         """Portability brief: unsupported timing cannot suppress or alter a check."""
-        for platform, code in [('Linux', 0), ('Linux', 7), ('Unknown', 0)]:
+        for platform, code in [('Unknown', 0), ('Unknown', 7)]:
             with self.subTest(platform=platform, code=code):
                 fixture = self.runner_fixture()
                 fixture.configure(rc=code)
@@ -408,10 +408,18 @@ if __name__ == '__main__':"""))
         self.assertEqual(run.call_args.args[0], ['/bin/sh', str(KIT / 'remote/ctrash.sh'),
             str(folder / 'old.json'), str(timing)])
 
-    def test_bsd_time_units_no_secret_capture(self):
-        """Requirement: rusage fallback; boundary: blocks are not bytes; ignore command text."""
+    def test_platform_time_units_no_secret_capture(self):
+        """Requirement: portable rusage; boundary: normalize Linux KiB and ignore commands."""
         parsed = self.r.parse_time('secret-value\n 1048576 maximum resident set size\n 7 block output operations\n')
         self.assertEqual(parsed, {'max_rss_bytes': 1048576, 'block_output_operations': 7})
+        linux = self.r.parse_time('''Command being timed: "secret-value"
+User time (seconds): 1.25
+System time (seconds): 0.50
+Maximum resident set size (kbytes): 2048
+File system outputs: 9
+''')
+        self.assertEqual(linux, {'user_seconds': 1.25, 'system_seconds': 0.5,
+            'cpu_seconds': 1.75, 'max_rss_bytes': 2097152, 'block_output_operations': 9})
         self.start()
         self.r.record_rusage(self.path, parsed)
         self.r.record_rusage(self.path, {'max_rss_bytes': 524288, 'block_output_operations': 3})
