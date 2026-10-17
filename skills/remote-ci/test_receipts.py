@@ -500,15 +500,31 @@ File system outputs: 9
         fixture.sha = fixture.git('-C', fixture.source, 'rev-parse', 'HEAD')
         # Keep Runner's valid execution identity; legacy keys deliberately miss.
         (fixture.home / 'release').touch()
-        turbo = fixture.home / 'turbo-fixture'
-        turbo.mkdir()
-        (turbo / 'stable').write_text('fixture\n')
+        receipts = fixture.bin / 'receipts.py'
+        real_receipts = fixture.bin / 'receipts-real.py'
+        receipts.rename(real_receipts)
+        receipts.write_text("""\
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+action = sys.argv[1] if len(sys.argv) > 1 else ''
+if action in ('turbo-before', 'turbo-after') and len(sys.argv) > 3:
+    target = Path(sys.argv[3])
+    size = 0
+    if target.exists():
+        size = int(subprocess.check_output(
+            ['du', '-sk', str(target)], text=True).split()[0]) * 1024
+    marker = Path.home() / (Path(sys.argv[2]).stem + '-' + action)
+    marker.write_text(str(size))
+os.execv(sys.executable, [sys.executable,
+    str(Path(__file__).with_name('receipts-real.py')), *sys.argv[1:]])
+""")
         for name, code in [('first', 0), ('cached', 0), ('failed', 1)]:
             fixture.configure(rc=code)
             with (fixture.dir / 'conf').open('a') as conf:
-                conf.write("REMOTE_CI_INSTALL='mkdir -p node_modules'\nREMOTE_CI_INSTALL_INPUTS=source.txt\n"
-                           'export TURBO_CACHE_DIR="$HOME/turbo-fixture"\n')
-            turbo_before = self.r.turbo_size(turbo)
+                conf.write("REMOTE_CI_INSTALL='mkdir -p node_modules'\nREMOTE_CI_INSTALL_INPUTS=source.txt\n")
             proc = fixture.start(name, force=bool(code))
             fixture.assert_result(proc, name, code)
             receipt = fixture.ci / 'receipts/fixture' / (name + '.json')
@@ -523,8 +539,9 @@ File system outputs: 9
                 self.assertEqual(row['cache']['install'], {
                     'outcome': 'miss' if name == 'first' else 'hit',
                     'reason': 'inputs-changed-or-missing' if name == 'first' else 'input-match'})
-                self.assertEqual(row['turbo_size_delta_bytes'],
-                                 self.r.turbo_size(turbo) - turbo_before)
+                before = int((fixture.home / (name + '-turbo-before')).read_text())
+                after = int((fixture.home / (name + '-turbo-after')).read_text())
+                self.assertEqual(row['turbo_size_delta_bytes'], after - before)
 
 
 def live_probe():
