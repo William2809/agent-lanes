@@ -818,6 +818,23 @@ def containers(started, active, deadline):
     return dict(state='ok', items=items[:40])
 
 
+def upgrade_status():
+    """Bounded display-only maintenance state; never expose routes or job envelopes."""
+    try:
+        with open(os.path.join(CI, 'upgrade.json')) as stream:
+            raw = stream.read(1048577)
+        if len(raw) > 1048576:
+            return None
+        value = json.loads(raw)
+        phase = value.get('phase')
+        if phase not in ('prepared', 'pausing', 'draining', 'installing', 'installed', 'resuming', 'ready', 'aborted'):
+            return None
+        return dict(phase=phase, updated_at=value.get('updated_at'),
+                    blocked=bool(value.get('last_error')))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def main():
     start = time.monotonic()
     docker = docker_start()
@@ -832,7 +849,7 @@ def main():
                    granted=sum(r['workers'] for r in live_rows),
                    active=[r for r in live_rows if r['workers']],
                    waiting=[r for r in live_rows if not r['workers']]),
-        lock=lock_holder(), drain=drain_holder(), slots=slots, active=active, finished=finished)
+        lock=lock_holder(), drain=drain_holder(), upgrade=upgrade_status(), slots=slots, active=active, finished=finished)
     usage = {r['run']: r for r in live_rows if r['run']}
     for row in active:
         found = usage.get(row['run'])
