@@ -1,10 +1,22 @@
 """Paused work remains visible without inventing process liveness or an ETA."""
+import json
 import time
 import unittest
 from test_runner import Tmp, board, fixtures, snapshot
 
 
 class MaintenanceVisibility(Tmp):
+    def test_upgrade_status_exposes_only_bounded_display_fields(self):
+        home = fixtures.Home(self.dir)
+        home.save()
+        from pathlib import Path
+        target = Path(self.dir)/'ci/upgrade.json'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(dict(phase='draining', updated_at=123,
+                                         last_error='private details', accepted={'token': 'secret'})))
+        value = snapshot(self.dir)['upgrade']
+        self.assertEqual(value, dict(phase='draining', updated_at=123, blocked=True))
+
     def test_ownerless_parked_and_starting_jobs_remain_visible_as_waiting(self):
         home = fixtures.Home(self.dir)
         expected = {}

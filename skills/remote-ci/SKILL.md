@@ -934,3 +934,29 @@ The receipt sampler sums each owned PID once per sample and keeps the largest
 sample for each phase. The profile uses the largest phase peak, not their sum.
 Shared mapped pages can still appear in several processes' RSS, so a saved peak
 does not identify shared-page contribution.
+
+### Rolling upgrades on active runners
+
+Use `remote-ci upgrade start worker_b worker_a` with configured runner names in the desired
+order. This starts a detached controller; `remote-ci upgrade status [ID]` reads its
+journal and `remote-ci upgrade resume ID` recovers a blocked/interrupted operation.
+The candidate kit must be committed and clean. Qualify the candidate on both
+platforms through the remote queue before starting an upgrade. Runner names and
+SSH routes come only from `CI_RUNNERS` or `CI_ROUTE_RUNNERS` in host configuration.
+
+The controller stages every device before pausing any, then upgrades one device
+at a time. It preserves accepted job identities and deadlines, parks supported
+queued jobs, waits for active jobs to finish, installs atomically, verifies kit,
+shared helpers and protocol hooks, and resumes the original pinned snapshots.
+A harmless queued canary must pass before the next device is paused. Legacy
+queued owners drain normally. Their waiting time still counts toward their
+original deadline; maintenance never extends or replaces a job's identity.
+
+A failed/disconnected operation retains its journal and queued work. Inspect the
+reported error, repair its cause, then resume the same ID. Do not restore an old
+queue JSON, kill active jobs, manually swap only the kit symlink, or start a
+second upgrade. Protocol migrations are rejected: they need an explicit migration
+plan. Canary failure stops progression; it does not roll back code underneath
+running work. A repeated canary after an ambiguous disconnect is harmless and
+separate from user jobs. Existing manual freezes are refused; later manual
+freezes remain owned by the operator. The board exposes upgrade progress.

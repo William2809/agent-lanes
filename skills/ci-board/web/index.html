@@ -808,6 +808,11 @@ function runnerCard(v, prev) {
     head.append(m);
   }
   const parts = [head];
+  if (s && s.upgrade && !['ready', 'aborted'].includes(s.upgrade.phase)) {
+    const phases = { prepared: 'Update staged', pausing: 'Pausing queue', draining: 'Finishing active runs', installing: 'Installing update', installed: 'Verifying update', resuming: 'Resuming preserved jobs' };
+    parts.push(el('div', 'drain', (phases[s.upgrade.phase] || 'Updating runner') +
+      (s.upgrade.blocked ? ' · needs attention; jobs preserved' : ' · queued jobs preserved')));
+  }
   const role = el('div', 'role');
   if ((v.roles || []).length) role.append(v.roles.join(' · '));
   if (s) {

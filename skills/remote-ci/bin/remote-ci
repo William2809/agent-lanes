@@ -26,11 +26,17 @@ remote-ci init                                                         add .remo
 remote-ci freeze [reason] | thaw                                       hold new checks on the runner / resume intake
 remote-ci pause [reason] | resume                                      park supported queued v2 checks / resume them
 remote-ci install-runner                                               freeze, wait for running checks, install this master kit as the host kit, thaw
+remote-ci upgrade start RUNNER... | status [ID] | resume ID              staged, recoverable, one-device-at-a-time upgrade
 Exit codes: see ../SKILL.md (check, infrastructure, busy, cleanup).
 USAGE
 }
 cmd=${1:-}; shift || true
 [ "$cmd" = init ] && exec bash "$kit/bin/remote-ci-init" "$@"
+if [ "$cmd" = upgrade ]; then
+  export CI_RUNNERS="${CI_RUNNERS:-${CI_ROUTE_RUNNERS:-}}"
+  for policy_key in ${!CI_RUNNER_@}; do export "$policy_key"; done
+  exec python3 "$kit/bin/rolling_upgrade.py" "$@"
+fi
 case "$cmd" in check | fail | blame | status | setup | info | log | freeze | thaw | pause | resume | install-runner) ;; *) usage; exit 2 ;; esac
 # Runner protocol this client speaks. A runner with a host kit (~/ci/kit, see install-runner) refuses pushes
 # from older clients (remote/pre-receive.sh), so one admission protocol runs on the runner at a time.
