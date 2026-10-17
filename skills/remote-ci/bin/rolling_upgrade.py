@@ -107,13 +107,19 @@ def run_canary(op, host, directory):
     for key in list(env):
         if key.startswith(('REMOTE_CI_', 'REMOTE_CI_', 'CI_ROUTE_', 'CI_RUNNER')):
             env.pop(key)
+    # This checks runner admission, not application dependencies. Empty install
+    # skips dependency publication; ':' would falsely try to seal absent outputs.
+    canary_conf = directory/(host['name']+'-canary-'+str(time.time_ns())+'.conf')
+    canary_conf.write_text((directory/'canary.conf').read_text()+
+                           "\nREMOTE_CI_INSTALL=''\nREMOTE_CI_PREPARE=''\nREMOTE_CI_POSTGRES=''\n")
+    canary_conf.chmod(0o600)
     env['AGENT_LANES_CONFIG'] = '/dev/null'
     user, separator, hostname = host['route'].rpartition('@')
     if not separator:
         hostname, user = host['route'], os.environ.get('USER', '')
     env.update(AGENT_LANES_CONFIG='/dev/null', REMOTE_CI_MOVE='0',
                REMOTE_CI_HOST=host['route'], REMOTE_CI_DIRECT_HOST=hostname,
-               REMOTE_CI_USER=user, REMOTE_CI_CONF=str(directory/'canary.conf'))
+               REMOTE_CI_USER=user, REMOTE_CI_CONF=str(canary_conf))
     log = directory/(host['name']+'-canary-'+str(time.time_ns())+'.log')
     host['canary_log'] = str(log)
     save(directory/'operation.json', op)
@@ -221,7 +227,7 @@ def start(names, timeout):
             shutil.copy2(item, candidate/item.name)
     shutil.copytree(KIT/'bin', directory/'client/bin', ignore=shutil.ignore_patterns('__pycache__'))
     shutil.copytree(candidate, directory/'client/remote')
-    canary = conf.read_text()+"\nREMOTE_CI_NEEDS=''\nREMOTE_CI_INSTALL=':'\nREMOTE_CI_PREPARE=':'\nREMOTE_CI_INSTALL_INPUTS=''\nREMOTE_CI_INSTALL_OUTPUTS=''\nREMOTE_CI_TIMEOUT=120\nREMOTE_CI_WAIT_TIMEOUT=900\nREMOTE_CI_WORKERS=1\nREMOTE_CI_SUMMARY_PATTERN='^rolling-upgrade-canary-ok$|^Ran |^OK$|FAILED|Error:|^FAIL'\n"
+    canary = conf.read_text()+"\nREMOTE_CI_NEEDS=''\nREMOTE_CI_INSTALL=''\nREMOTE_CI_PREPARE=''\nREMOTE_CI_INSTALL_INPUTS=''\nREMOTE_CI_INSTALL_OUTPUTS=''\nREMOTE_CI_TIMEOUT=120\nREMOTE_CI_WAIT_TIMEOUT=900\nREMOTE_CI_WORKERS=1\nREMOTE_CI_SUMMARY_PATTERN='^rolling-upgrade-canary-ok$|^Ran |^OK$|FAILED|Error:|^FAIL'\n"
     (directory/'canary.conf').write_text(canary)
     (directory/'canary.conf').chmod(0o600)
     with tarfile.open(directory/'bundle.tar', 'w') as archive:

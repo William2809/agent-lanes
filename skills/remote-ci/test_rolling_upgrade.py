@@ -97,6 +97,7 @@ class Controller(unittest.TestCase):
         from types import SimpleNamespace
         self.op.update(root=str(self.root), registry='beta=user@worker:linux')
         host = dict(name='beta', route='user@worker')
+        (self.directory/'canary.conf').write_text("REMOTE_CI_NAME=fixture\nREMOTE_CI_INSTALL=':'\n")
         def execute(argv, **kwargs):
             env = kwargs['env']
             self.assertNotIn('CI_RUNNERS', env)
@@ -105,6 +106,8 @@ class Controller(unittest.TestCase):
             self.assertEqual(env['REMOTE_CI_DIRECT_HOST'], 'worker')
             self.assertEqual(env['REMOTE_CI_USER'], 'user')
             self.assertIn('check', argv)
+            config = Path(env['REMOTE_CI_CONF']).read_text()
+            self.assertTrue(config.endswith("REMOTE_CI_INSTALL=''\nREMOTE_CI_PREPARE=''\nREMOTE_CI_POSTGRES=''\n"))
             kwargs['stdout'].write('rolling-upgrade-canary-ok\n')
             return SimpleNamespace(returncode=0)
         with patch.object(upgrade.subprocess, 'run', side_effect=execute):
