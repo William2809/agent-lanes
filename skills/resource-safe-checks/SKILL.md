@@ -40,12 +40,19 @@ path. The two toolkits ship the same helper and share host queue state.
 
 ## Bound every layer
 
-The host queue defaults to one heavy job and up to two runner workers (one on
-the development device). Admission needs normal memory pressure, CPU headroom
-and a memory reservation. CPU/memory limits apply across repositories and
-worktrees. Jobs wait FIFO until the total wait deadline. The supervisor limits
-each command's wall time and monitors aggregate process-group RSS; it stops its
-own group on budget overrun or critical memory pressure. `nice` alone is not a cap.
+Read the execution host's installed policy instead of assuming a concurrency
+limit from a screenshot or project slot count. V1 uses FIFO admission. V2 can
+reserve a fast lane, age long waiters, and lend idle fast capacity. Both share
+host CPU, memory and worker budgets across projects. Phase deadlines and
+process-tree monitoring bound checks and cleanup; `nice` alone is not a cap.
+
+With a configured runner pool, compatible queued jobs can hand over to another
+available device while preserving their snapshot and deadline. Running jobs
+cannot migrate. Use the board's move control or supported owner-mediated
+handover; never copy queue rows or delete the source ticket. A job that requires
+macOS, browsers or Docker cannot move to a host lacking those capabilities.
+Inspect the actual blocker (project slot, database setup, memory, workers,
+freeze or compatibility) before changing capacity.
 
 Use the granted `AGENT_CI_WORKERS` in tool-specific configuration:
 
@@ -61,7 +68,8 @@ Use the granted `AGENT_CI_WORKERS` in tool-specific configuration:
 Do not use a universal Node heap flag as a total memory cap: it covers V8 heap,
 not every child, native allocation or browser. Tests that spawn detached sessions
 or external Docker/VM services need their own service/container resource limits
-and cleanup; process-group monitoring cannot contain those resources.
+and cleanup; process-tree sampling cannot contain external services or guarantee
+observation of every short-lived detached child.
 
 Avoid starting a dev server for every editing lane. Start one only for a task
 that requires it, reuse a compatible server, and stop only task-owned idle servers.
@@ -69,20 +77,31 @@ Serialize browser capture work. Do not kill unrelated agents, Finder or Shottr.
 
 ## Tune and verify
 
-Start with the defaults. Host-only settings belong in
-`~/.config/agent-lanes/config` (legacy agent-lanes config is read first):
-`AGENT_CI_MAX_JOBS`, `AGENT_CI_MAX_WORKERS`, `AGENT_CI_CPU_RESERVE`,
-`AGENT_CI_MEM_RESERVE_MB`, `AGENT_CI_WORKER_MB`, `AGENT_CI_KILL_PCT`. All are positive integers.
-`AGENT_CI_WORKER_MB` sizes admission; a run is stopped for memory only above
-`AGENT_CI_KILL_PCT` percent of its grant (default 150). Critical host pressure stops any run.
-They must be set on the execution host; project slot settings cannot raise the
-host ceiling. Per-project `REMOTE_CI_WORKERS` / `REMOTE_CI_WORKERS` can request fewer.
+Host policy belongs in `~/.config/agent-lanes/config` (legacy agent-lanes
+config is read first), on the execution device. Preserve the user's configured
+limits. Project slots cannot raise the host ceiling; per-project worker requests
+still share `AGENT_CI_MAX_WORKERS`.
 
-Use measured peak group RSS plus headroom to size worker memory. Raise concurrency
-one step only after representative checks pass without sustained CPU saturation,
-growing swap, critical pressure or poor UI response. Offloading does not add RAM
-to the runner. If arrivals exceed service capacity, coalesce identical snapshots,
-batch full checks at landing, and reserve per-edit runs for relevant changes.
+V2 `AGENT_CI_RESERVATION_CAP_MB=3072` caps accounting reservations at 3 GiB.
+`AGENT_CI_INITIAL_MEMORY_MB` controls initial phase-aware admission. These are
+separate from the actual working-set ceiling (`AGENT_CI_MAX_JOB_MB`) and burst
+percentage (`AGENT_CI_KILL_PCT`). Do not turn a requested reservation cap into
+an actual hard kill limit. Existing admitted runs retain their saved policy.
+
+Use trusted measured demand and configured floors, without synthetic
+percentage padding or a fixed database allowance. Do not restore old global
+memory reservations merely because one suite had a large peak. Inspect live
+available memory, pressure, swap growth and unused commitments together; a low
+current RSS does not prove the next phase needs little memory. Small checks
+should receive smaller grants when their profile supports it. Use targeted
+checks during editing and full checks at landing; do not duplicate an active
+submission while it waits.
+
+For an upgrade, use the runner's supported pause, drain, install and resume
+commands. Capture accepted job identities before pausing and compare them after
+resuming. Preserve snapshots, submission times and deadlines, and retain any
+pre-existing manual freeze. Keep waiting clients alive; do not discard queued
+jobs to make the installer finish.
 
 Validate queue order, cross-project exclusion, worker grants, stale owners,
 deadline expiry, descendant cleanup, resource failures and no local outage
