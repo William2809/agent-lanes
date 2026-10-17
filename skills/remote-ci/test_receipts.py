@@ -504,6 +504,8 @@ File system outputs: 9
             fixture.configure(rc=code)
             with (fixture.dir / 'conf').open('a') as conf:
                 conf.write("REMOTE_CI_INSTALL='mkdir -p node_modules'\nREMOTE_CI_INSTALL_INPUTS=source.txt\n")
+            turbo = fixture.dir / 'work/.turbo'
+            turbo_before = self.r.turbo_size(turbo)
             proc = fixture.start(name, force=bool(code))
             fixture.assert_result(proc, name, code)
             receipt = fixture.ci / 'receipts/fixture' / (name + '.json')
@@ -518,7 +520,8 @@ File system outputs: 9
                 self.assertEqual(row['cache']['install'], {
                     'outcome': 'miss' if name == 'first' else 'hit',
                     'reason': 'inputs-changed-or-missing' if name == 'first' else 'input-match'})
-                self.assertEqual(row['turbo_size_delta_bytes'], 0)
+                self.assertEqual(row['turbo_size_delta_bytes'],
+                                 self.r.turbo_size(turbo) - turbo_before)
 
 
 def live_probe():
