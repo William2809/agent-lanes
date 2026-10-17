@@ -10,7 +10,9 @@ case "$platform_os" in
   Linux)
     platform_path=$HOME/ci/node/default/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
     platform_locale=C.UTF-8
-    if [ -x /usr/bin/time ]; then platform_time=(/usr/bin/time -v)
+    if [ -x /usr/bin/time ]; then
+      # Explicit fields omit GNU time's command line from the persisted receipt input.
+      platform_time=(/usr/bin/time -f $'User time (seconds): %U\nSystem time (seconds): %S\nMaximum resident set size (kbytes): %M\nFile system outputs: %O')
     else platform_time=(python3 "$platform_dir/platform_info.py" time); fi
     ;;
   *) echo 'remote-ci: unsupported runner platform' >&2; return 3 ;;

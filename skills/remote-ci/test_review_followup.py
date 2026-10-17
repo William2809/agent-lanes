@@ -54,6 +54,8 @@ class PolicyAndEvents(unittest.TestCase):
     def test_telemetry_rejects_cost_fields_and_events(self):
         # Review 4: receipts are the only cost schema.
         with tempfile.TemporaryDirectory() as temp:
+            self.assertTrue(ci_telemetry.emit(temp, 'stopped', run_id='run',
+                                              reason='memory-budget', rss_mb=2, limit_mb=1))
             for event, fields in [('sample', {}), ('phase-ended', {}), ('finished', {}),
                                   ('cleanup', {'duration_s': 1}), ('cleanup', {'peak_rss_mb': 1}),
                                   ('admitted', {'rss_mb': 1})]:

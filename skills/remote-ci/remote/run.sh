@@ -255,9 +255,11 @@ base_db=$REMOTE_CI_DB
 role=ci
 # Receipt hooks: only structured metadata crosses this boundary.
 receipt_file=$ci/receipts/$project/$run.json
-# BSD time is optional. Linux/WSL and unknown hosts keep sampled metrics only.
-receipt_bsd_time=0
-[ "$platform_os" != Darwin ] || receipt_bsd_time=1
+# External time is optional. Unsupported hosts keep sampled metrics only.
+receipt_time=0
+if [ "$platform_os" = Darwin ] || { [ "$platform_os" = Linux ] && [ -x /usr/bin/time ]; }; then
+  receipt_time=1
+fi
 receipt() {
   # Bound the whole observer group, including a stuck SQL client or index lock.
   perl -e '
@@ -713,9 +715,9 @@ supervised() {
   fi
   [ "$supervised_seconds" -gt 0 ] || return 74
   # time opens -o before exec. Give it an already-open descriptor, or run bare.
-  if [ "$receipt_bsd_time" = 1 ] && { exec 9>"$dir/results/$run.time"; } 2>/dev/null; then
+  if [ "$receipt_time" = 1 ] && { exec 9>"$dir/results/$run.time"; } 2>/dev/null; then
     timing_available=1
-    perl -e 'setpgrp(0,0); exec @ARGV' /usr/bin/time -l -o /dev/fd/9 "$@" &
+    perl -e 'setpgrp(0,0); exec @ARGV' "${platform_time[@]}" -o /dev/fd/9 "$@" &
   else
     perl -e 'setpgrp(0,0); exec @ARGV' "$@" &
   fi
@@ -942,7 +944,7 @@ echo "== $check"
 check_start=$(date +%s)
 receipt_phase check
 check_prefix=(nice -n 10)
-[ "$receipt_bsd_time" != 1 ] || check_prefix=("${platform_time[@]}" "${check_prefix[@]}")
+[ "$platform_os" != Darwin ] || check_prefix=("${platform_time[@]}" "${check_prefix[@]}")
 candidate check "$check" "${check_prefix[@]}"; rc=$?
 echo "== timing check $(( $(date +%s) - check_start ))s"
 echo "== timing run $(( $(date +%s) - started ))s (before cleanup)"

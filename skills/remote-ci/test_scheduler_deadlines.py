@@ -21,7 +21,7 @@ class Deadlines(unittest.TestCase):
         home = patch.dict(os.environ, HOME=tmp.name)
         home.start()
         self.addCleanup(home.stop)
-        pressure = patch.object(r, 'sample', return_value=dict(pressure=1))
+        pressure = patch.object(r, 'sample', return_value=dict(pressure=1, available_mb=20000))
         pressure.start()
         self.addCleanup(pressure.stop)
         old = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
