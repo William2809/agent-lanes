@@ -366,6 +366,15 @@ class RunnerTest(Tmp):
                                   REMOTE_CI_USER='ci'))[0]
         self.assertEqual(spec['routes'], [['-o', 'HostKeyAlias=tb', 'ci@192.0.2.2'], ['ci@tail']])
 
+    def test_fixture_runner_order_follows_registry_not_filenames(self):
+        base = os.path.join(self.dir, 'runners')
+        os.makedirs(os.path.join(base, 'z-source'))
+        with open(os.path.join(base, 'a-pc.asleep'), 'w'):
+            pass
+        with open(os.path.join(base, 'roles.json'), 'w') as stream:
+            json.dump({'z-source': ['unit'], 'a-pc': ['db']}, stream)
+        self.assertEqual([r['name'] for r in board.fixture_runners(self.dir)], ['z-source', 'a-pc'])
+
     def test_fake_unreachable_runner_over_ssh(self):
         runner = board.Runner(dict(name='gone', routes=[['-o', 'ConnectTimeout=1', 'nonexistent.invalid']],
                                    wakeable=False))

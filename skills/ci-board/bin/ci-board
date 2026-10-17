@@ -129,14 +129,18 @@ def fixture_runners(directory):
         elif ext in ('.json', '.down', '.asleep') and entry != 'roles.json':
             names[stem] = dict(name=stem, routes=[[ext[1:] + ':' + os.path.join(base, entry)]],
                                wakeable=ext == '.asleep')
+    order = []
     try:
         with open(os.path.join(base, 'roles.json')) as f:
             for name, roles in json.load(f).items():
                 if name in names:
                     names[name]['roles'] = [ROLES.get(r, r) for r in roles]
+                    order.append(name)
     except (OSError, ValueError):
         pass
-    return list(names.values())
+    # Fixture registry order models CI_RUNNERS order; filenames are only transport state.
+    order.extend(name for name in names if name not in order)
+    return [names[name] for name in order]
 
 
 def run_snapshot(route, timeout, known=''):
