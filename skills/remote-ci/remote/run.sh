@@ -717,7 +717,7 @@ supervised() {
   # time opens -o before exec. Give it an already-open descriptor, or run bare.
   if [ "$receipt_time" = 1 ] && { exec 9>"$dir/results/$run.time"; } 2>/dev/null; then
     timing_available=1
-    perl -e 'setpgrp(0,0); exec @ARGV' "${platform_time[@]}" -o /dev/fd/9 "$@" &
+    perl -e 'setpgrp(0,0); exec @ARGV' "${platform_receipt_time[@]}" -o /dev/fd/9 "$@" &
   else
     perl -e 'setpgrp(0,0); exec @ARGV' "$@" &
   fi
