@@ -107,7 +107,8 @@ def run_canary(op, host, directory):
     for key in list(env):
         if key.startswith(('REMOTE_CI_', 'REMOTE_CI_', 'CI_ROUTE_', 'CI_RUNNER')):
             env.pop(key)
-    env.update(AGENT_LANES_CONFIG='/dev/null', AGENT_LANES_CONFIG='/dev/null',
+    env['AGENT_LANES_CONFIG'] = '/dev/null'
+    env.update(AGENT_LANES_CONFIG='/dev/null',
                CI_RUNNERS=op['registry'], REMOTE_CI_RUNNER=host['name'], REMOTE_CI_MOVE='0',
                REMOTE_CI_CONF=str(directory/'canary.conf'))
     log = directory/(host['name']+'-canary-'+str(time.time_ns())+'.log')
