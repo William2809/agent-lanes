@@ -497,10 +497,10 @@ class Client(unittest.TestCase):
             if child.poll() is None:
                 child.terminate()
             try:
-                stdout, stderr = child.communicate(timeout=5)
+                stdout, stderr = child.communicate(timeout=15)
             except subprocess.TimeoutExpired:
                 child.kill()
-                stdout, stderr = child.communicate(timeout=5)
+                stdout, stderr = child.communicate(timeout=15)
             self.fail('source run did not launch:\n' + stdout + stderr)
         deadline = time.time() + 10
         owner = None
