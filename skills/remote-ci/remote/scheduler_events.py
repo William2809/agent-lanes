@@ -16,6 +16,8 @@ BLOCKERS = {
     'workers': 'workers',
     'cpu': 'cpu',
     'memory': 'memory',
+    'memory-growth': 'memory-growth',
+    'memory-growth-reserve': 'memory-growth-reserve',
 }
 
 

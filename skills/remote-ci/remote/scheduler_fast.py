@@ -22,7 +22,7 @@ def admit(data, pending, active, metrics, limits, now, frozen):
                       metrics['available_mb']) - limits['MEM_RESERVE_MB']))
     def flat(row, token):
         return dict(id=token, project=row['project'], sequence=row['sequence'],
-                    submitted_at=row['submitted_at'], **{k:row['requested'][k] for k in ('workers','memory_mb')},
+                    submitted_at=row['submitted_at'], **{k:row.get(k, row['requested'][k]) for k in ('workers','memory_mb')},
                     profile_known=row.get('profile_known', False), predicted_s=row.get('predicted_s'),
                     estimate_scope=row.get('estimate_scope'), lane_class=row.get('lane_class','normal'),
                     drain=row.get('drain',False))
@@ -34,8 +34,8 @@ def admit(data, pending, active, metrics, limits, now, frozen):
         req=row['requested']
         reason=None
         if (req['workers'] > min(limits['MAX_WORKERS'],cpu) or
-                req['memory_mb'] > limits.get('MAX_JOB_MB', float('inf')) or
-                req['memory_mb'] > metrics.get('total_mb',float('inf'))-limits['MEM_RESERVE_MB']):
+                row.get('memory_ceiling_mb', req['memory_mb']) > limits.get('MAX_JOB_MB', float('inf')) or
+                row.get('memory_ceiling_mb', req['memory_mb']) > metrics.get('total_mb',float('inf'))-limits['MEM_RESERVE_MB']):
             row.update(state='rejected',result=75,finished_at=now,updated_at=now,
                        blocker=dict(reason='impossible-request',holder=None))
             continue

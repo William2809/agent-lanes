@@ -60,7 +60,7 @@ def main():
         leases.extend(['postgres:' + postgres, 'template:' + project, 'cleanup:' + project])
     task = meta.get('task') or ('full' if mode == 'full' else digest)
     request = dict(schema='agent-ci.request/v1', protocol=2, task=task,
-                   project=project, lane=meta.get('lane', ''), sha=sha, tree=tree, run_id=run,
+                   phase_memory_version=1, project=project, lane=meta.get('lane', ''), sha=sha, tree=tree, run_id=run,
                    mode=mode, command_digest=digest, profile_context=context,
                    generation=int(meta.get('generation', 1)), landing=bool(meta.get('landing', True)),
                    slots=int(os.environ.get('SCHEDULER_SLOTS', '1')), workers=workers,

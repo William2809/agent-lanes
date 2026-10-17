@@ -9,14 +9,14 @@ import re
 import time
 
 SCHEMA = 'agent-ci.telemetry/v1'
-EVENTS = {'queued', 'blocked', 'admitted', 'stopped', 'cleanup'}
+EVENTS = {'queued', 'blocked', 'admitted', 'stopped', 'cleanup', 'memory-granted', 'memory-released'}
 REASONS = {'fifo', 'jobs', 'workers', 'cpu', 'memory', 'pressure', 'project-slot',
-           'project-reserve', 'fast-reserve', 'head-drain', 'aged-drain', 'swap',
+           'memory-growth', 'memory-growth-reserve', 'project-reserve', 'fast-reserve', 'head-drain', 'aged-drain', 'swap',
            'lease', 'deadline', 'memory-budget', 'owner-lost', 'interrupted',
            'monitor-unavailable', 'cleanup-incomplete', 'quarantine-expired', 'complete', 'unknown'}
 PHASES = {'queue', 'checkout', 'install', 'template', 'database', 'prepare', 'check', 'cleanup', 'unknown'}
 NUMERIC = {'wait_s', 'workers', 'memory_mb', 'exit_code', 'predicted_s', 'samples',
-           'host_load', 'available_mb'}
+           'host_load', 'available_mb', 'previous_mb', 'ceiling_mb'}
 LANES = {'fast', 'normal'}
 MAX_BYTES = 2 * 1024 * 1024
 

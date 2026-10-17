@@ -112,6 +112,7 @@ if [ "${1:-}" = --cleanup ] || [ "${1:-}" = --cleanup-v2 ]; then
         pg_ctl -D "$pgdata" -l "$ci/pg/$REMOTE_CI_POSTGRES.log" start -w || exit 76
       clean_databases || exit 76
     fi
+    python3 "$runner_dir/cache.py" release --token "$project-$run-$owner" || exit 76
     git -C "$dir/repo.git" update-ref -d "refs/heads/run/$run" || exit 76
     exit 0
   fi
@@ -749,7 +750,7 @@ supervised() {
   return "$rc"
 }
 candidate() {
-  local stage=$1 command=$2 rc; shift 2
+  local stage=$1 command=$2 rc scheduler_heavy=1 scheduler_memory_stage=$1; shift 2
   candidate_failed=0
   supervised "$@" /bin/bash -c '
     /bin/bash -c "$1"; rc=$?
