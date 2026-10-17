@@ -93,6 +93,24 @@ class Controller(unittest.TestCase):
         self.drive()
         self.assertEqual(self.events, [('stage', 'alpha'), ('advance', 'alpha'), ('canary', 'alpha')])
 
+    def test_canary_uses_verified_remote_route_without_reentering_pool_selection(self):
+        from types import SimpleNamespace
+        self.op.update(root=str(self.root), registry='beta=user@worker:linux')
+        host = dict(name='beta', route='user@worker')
+        def execute(argv, **kwargs):
+            env = kwargs['env']
+            self.assertNotIn('CI_RUNNERS', env)
+            self.assertNotIn('REMOTE_CI_RUNNER', env)
+            self.assertEqual(env['REMOTE_CI_HOST'], 'user@worker')
+            self.assertEqual(env['REMOTE_CI_DIRECT_HOST'], 'worker')
+            self.assertEqual(env['REMOTE_CI_USER'], 'user')
+            self.assertIn('check', argv)
+            kwargs['stdout'].write('rolling-upgrade-canary-ok\n')
+            return SimpleNamespace(returncode=0)
+        with patch.object(upgrade.subprocess, 'run', side_effect=execute):
+            upgrade.run_canary(self.op, host, self.directory)
+        self.assertTrue(Path(host['canary_log']).exists())
+
     def test_hash_matches_existing_git_blob_protocol(self):
         directory = self.root/'kit'
         directory.mkdir()
