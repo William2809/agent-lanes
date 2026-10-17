@@ -18,14 +18,14 @@ Honor a project's local-test pause even for targeted tests and even with `CI=1`.
    `loop-stats --repo NAME`. Loop-stats measures recorded durations, not CPU or
    memory; compare it with host load, memory pressure, swap growth and process
    measurements. Do not infer crash causation from a current sample.
-3. With `.remote-ci.conf` or `.remote-ci.conf`, use `safe-check` for the full check,
-   or `safe-check --run '<targeted command>'`. It delegates to remote-ci/remote-ci,
+3. With `.remote-ci.conf` or `.mini-ci.conf`, use `safe-check` for the full check,
+   or `safe-check --run '<targeted command>'`. It delegates to remote-ci/mini-ci,
    including dirty-worktree snapshots, exact-tree pass caching and shared live
    results. Use the existing remote client directly for exact commit checks.
    Run one submission in the background and keep editing; do not repeatedly
    submit the same check while waiting.
 4. Without a second device, use the same runner with `REMOTE_CI_HOST=local`
-   (`REMOTE_CI_HOST=local` for remote-ci), or `safe-check --run '<command>'` when
+   (`MINI_CI_HOST=local` for mini-ci), or `safe-check --run '<command>'` when
    the project has no runner config. This runs locally through the shared queue
    with one worker. `--local` is rejected for configured projects. A host installed
    as `remote-required` also rejects direct local scheduler admission, even after
