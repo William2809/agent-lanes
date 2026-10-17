@@ -83,11 +83,14 @@ preserve the user's configured
 limits. Project slots cannot raise the host ceiling; per-project worker requests
 still share `AGENT_CI_MAX_WORKERS`.
 
-V2 `AGENT_CI_RESERVATION_CAP_MB=3072` caps accounting reservations at 3 GiB.
+When configured on a V2 host, `AGENT_CI_RESERVATION_CAP_MB=3072` caps
+accounting reservations at 3 GiB; the default 0 disables this optional cap.
 `AGENT_CI_INITIAL_MEMORY_MB` controls initial phase-aware admission. These are
 separate from the actual working-set ceiling (`AGENT_CI_MAX_JOB_MB`) and burst
 percentage (`AGENT_CI_KILL_PCT`). Do not turn a requested reservation cap into
-an actual hard kill limit. Existing admitted runs retain their saved policy.
+an actual hard kill limit. Existing admitted runs retain saved grants. Each
+phase supervisor reads the runtime kill policy when it starts, so drain active
+jobs before changing that policy.
 
 Use trusted measured demand and configured floors, without synthetic
 percentage padding or a fixed database allowance. Do not restore old global
