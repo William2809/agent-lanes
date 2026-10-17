@@ -500,11 +500,14 @@ File system outputs: 9
         fixture.sha = fixture.git('-C', fixture.source, 'rev-parse', 'HEAD')
         # Keep Runner's valid execution identity; legacy keys deliberately miss.
         (fixture.home / 'release').touch()
+        turbo = fixture.home / 'turbo-fixture'
+        turbo.mkdir()
+        (turbo / 'stable').write_text('fixture\n')
         for name, code in [('first', 0), ('cached', 0), ('failed', 1)]:
             fixture.configure(rc=code)
             with (fixture.dir / 'conf').open('a') as conf:
-                conf.write("REMOTE_CI_INSTALL='mkdir -p node_modules'\nREMOTE_CI_INSTALL_INPUTS=source.txt\n")
-            turbo = fixture.dir / 'work/.turbo'
+                conf.write("REMOTE_CI_INSTALL='mkdir -p node_modules'\nREMOTE_CI_INSTALL_INPUTS=source.txt\n"
+                           'export TURBO_CACHE_DIR="$HOME/turbo-fixture"\n')
             turbo_before = self.r.turbo_size(turbo)
             proc = fixture.start(name, force=bool(code))
             fixture.assert_result(proc, name, code)
