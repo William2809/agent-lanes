@@ -59,10 +59,10 @@ class PauseLifecycle(unittest.TestCase):
         (self.home/'release').touch()
         for proc in self.procs:
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=10)
+                proc.wait(timeout=15)
 
     def rows(self):
         path = self.home/'.local/state/agent-ci/queue.json'

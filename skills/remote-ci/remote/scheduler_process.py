@@ -88,8 +88,8 @@ def run(queue, token, phase, seconds, marker, command, heavy=False, stage=None):
             memory_generation = generation
             # A phase-sized grant is the monitored bound. Legacy jobs retain
             # their pinned percentage policy; do not silently shrink them.
-            if row.get('initial_memory_mb'):
-                percent, maximum = 100, memory
+            import scheduler_reservations
+            percent, maximum = scheduler_reservations.runtime_limits(row, percent, maximum)
             if phase not in ('cleanup', 'maintenance'):
                 # Queue time and earlier phases consume the same job budget.
                 # Fast-lane jobs may have an additional, shorter service limit.

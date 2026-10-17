@@ -123,6 +123,15 @@ check stays queued where it is. `REMOTE_CI_MOVE=0` turns moves off; a check that
 names its runner (`REMOTE_CI_RUNNER`) never moves. `REMOTE_CI_MOVE_GAP` (seconds
 between the two probes, default 5) exists for test fixtures.
 
+The CI board can request the same safe move immediately with **Move to PC**.
+Only the live `pool_move.py` process owned by the original `remote-ci` client
+accepts the request. It performs the readiness checks and fenced withdraw, then
+its parent resubmits the original commit or worktree snapshot, command, config
+snapshot, first-submission time, and deadline. The board never reconstructs a
+submission. Clients already running when this support is installed remain on
+the source. Named/pinned, v1, started, followed, and capability-incompatible
+checks cannot be transferred.
+
 Automatic routing can be enabled for selected projects through host settings
 `CI_ROUTE_POLICY` (a JSON file) and `CI_ROUTE_RUNNERS` (the same registry syntax).
 The policy uses `{"version":1,"projects":{"example":{"default_needs":["macos"],
@@ -515,9 +524,12 @@ cleanup failures become scoped quarantine records.
 `REMOTE_CI_SLOTS` limits project concurrency. `REMOTE_CI_EXCLUSIVE=1` requests host
 exclusion. `REMOTE_CI_LEASES` lists space-separated names, such as
 `ports:tcp:3000-3010 template:app`. Port ranges conflict on overlap within a
-protocol. Other names conflict on equality. Database jobs request
-`postgres:VERSION`, `template:PROJECT`, and `cleanup:PROJECT` through cleanup.
-This first version serializes each database cluster and keeps it warm.
+protocol. Other names conflict on equality. New phase-aware database jobs
+request `postgres:VERSION` and `template:PROJECT` during cluster startup,
+template work, and slot-database cloning. After the isolated database exists,
+an owner- and generation-bound transaction releases those setup leases before
+the check. Cleanup remains tied to the slot; a failed setup retains a PostgreSQL
+recovery fence. Older queued snapshots keep their original whole-run leases.
 All slot counts use one v2 path. `REMOTE_CI_DB='app_s{slot}_test'` preserves a
 required suffix. Without a placeholder, one slot keeps the base name; multiple
 slots append `_sN`. Names longer than PostgreSQL's limit are rejected.
@@ -590,8 +602,14 @@ The default reserve is one job, one worker and 2048 MB, with a 60-second service
 limit (`AGENT_CI_FAST_WORKERS`, `AGENT_CI_FAST_MEMORY_MB`, `AGENT_CI_FAST_SECONDS`).
 These are reservations inside the existing host ceiling, never extra capacity.
 A project with multiple checkout slots also reserves one checkout. A one-slot
-project cannot provide concurrent fast service. An idle fast reserve is not
-loaned to an unbounded check. Raising concurrency does not create more memory.
+project cannot provide concurrent fast service. By default an idle fast reserve
+stays reserved. Set host-only `AGENT_CI_FAST_BORROW=1` for throughput: when no
+fast job can be selected, normal checks may borrow idle fast checkout, CPU, and
+memory capacity. Loans are not preempted, so a new short check may wait for a
+borrower to finish. Eligible fast jobs retain preference, and named leases,
+pressure checks, aging, and host ceilings still apply. Admission replans after
+each real grant; a rejected lease or memory proposal consumes no phantom
+capacity. Raising concurrency does not create more memory.
 
 The host derives a profile from the command digest, snapshotted project config,
 actual copied runner code, Python/platform identity, worker count and database
@@ -848,6 +866,14 @@ Live host canaries and the unfiltered gate are required before enabling the flag
 
 
 ### Initial memory and phase growth
+
+Host-only `AGENT_CI_RESERVATION_CAP_MB` can cap ledger accounting for new and
+accepted phase-aware jobs without lowering the supervised working-set limit.
+The cap is applied under the queue lock to queued, starting, parked, and running
+records while preserving their identity, order, and deadline. Runtime processes
+remain bounded by the host burst percentage, absolute maximum, live pressure,
+and phase deadline. Existing supervisors adopt the cap at their next phase.
+The default `0` leaves reservation accounting unchanged.
 
 Host-only `AGENT_CI_INITIAL_MEMORY_MB=3072` enables a 3 GiB initial reservation
 for new phase-aware V2 runs (0, the default, keeps whole-job admission). This

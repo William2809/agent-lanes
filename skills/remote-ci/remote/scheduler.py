@@ -64,6 +64,14 @@ def validate(request):
             ports = port_range(lease)
             if not ports or not 1 <= ports[1] <= ports[2] <= 65535:
                 raise ValueError('invalid port range')
+    if 'lease_phase_version' in request:
+        if request['lease_phase_version'] != 1:
+            raise ValueError('unsupported phase-lease protocol')
+        for field in ('setup_leases', 'recovery_leases'):
+            value = request.get(field)
+            if (not isinstance(value, list) or len(value) > len(request['leases']) or
+                    any(lease not in request['leases'] for lease in value)):
+                raise ValueError('invalid phase lease list')
     if request['mode'] not in ('full', 'run'):
         raise ValueError('invalid check mode')
 
@@ -82,7 +90,7 @@ def submit(data, token, owner, start, now, deadline, request):
                landing=bool(request.get('landing')), blocker=None,
                cleanup_required=bool(request.get('cleanup_required')),
                requested={key: request[key] for key in ('slots', 'workers', 'memory_mb', 'leases')})
-    for key in ('predicted_mb', 'samples', 'source', 'profile_known', 'profile', 'predicted_s', 'estimate_scope', 'park_version', 'park_envelope', 'initial_memory_mb', 'memory_ceiling_mb'):
+    for key in ('predicted_mb', 'samples', 'source', 'profile_known', 'profile', 'predicted_s', 'estimate_scope', 'park_version', 'park_envelope', 'initial_memory_mb', 'memory_ceiling_mb', 'lease_phase_version', 'setup_leases', 'recovery_leases', 'reservation_policy_version'):
         if key in request:
             row[key] = request[key]
     if re.fullmatch(r'[a-zA-Z0-9_.-]{1,160}', request.get('run_id', '')):
@@ -148,8 +156,15 @@ def complete(data, token, result, now, quarantine=False):
     if quarantine:
         # Reaped processes no longer hold host capacity. Retain only resources
         # whose persistent state can be dirty; do not quarantine the host.
-        row['quarantined_leases'] = [x for x in row['requested']['leases']
-                                   if x != 'exclusive-host' and not x.startswith('postgres:')]
+        if row.get('lease_phase_version') == 1:
+            # Before setup release, retain template/custom fences too. After
+            # release, recovery adds only the cluster fence to custom leases.
+            import scheduler_db_leases
+            row['quarantined_leases'] = sorted(set(
+                scheduler_db_leases.held(row) + row['recovery_leases']))
+        else:
+            row['quarantined_leases'] = [x for x in row['requested']['leases']
+                                       if x != 'exclusive-host' and not x.startswith('postgres:')]
         row['recover_after'] = now
     else:
         row.pop('slot', None)
@@ -170,7 +185,8 @@ def blocker(row, active, metrics, limits):
     for token, other in active.items():
         if other.get('version') != 2:
             return dict(reason='legacy-run', holder=token)
-        leases = other.get('quarantined_leases', other['requested']['leases'])
+        import scheduler_db_leases
+        leases = other.get('quarantined_leases', scheduler_db_leases.held(other))
         if leases_conflict(req['leases'], leases):
             name = next((x for x in req['leases'] if leases_conflict([x], leases)), 'exclusive-host')
             return dict(reason='lease:' + name, holder=token)
@@ -209,8 +225,9 @@ def safe_backfill(head, candidate, active, metrics, limits):
     # Only lease conflicts are certain to depart before the head can start.
     # A full project slot also guarantees at least one departure. Keep the
     # remaining occupants, without predicting which one will depart first.
+    import scheduler_db_leases
     survivors = {t: r for t, r in active.items()
-                 if not leases_conflict(head['requested']['leases'], r.get('requested', {}).get('leases', []))}
+                 if not leases_conflict(head['requested']['leases'], scheduler_db_leases.held(r))}
     same = [t for t, r in survivors.items() if r.get('project') == head['project']]
     slots = min([head['requested']['slots']] + [survivors[t]['requested']['slots'] for t in same])
     if len(same) >= slots:
@@ -236,6 +253,8 @@ def safe_backfill(head, candidate, active, metrics, limits):
 
 def schedule(data, metrics, limits, procs, now):
     import resources
+    import scheduler_reservations
+    scheduler_reservations.apply(data, limits)
     jobs = data['jobs']
     observe(data, procs, now)
     for token, row in list(jobs.items()):
@@ -322,6 +341,8 @@ def schedule(data, metrics, limits, procs, now):
                    memory_mb=row['requested']['memory_mb'], admitted_at=now, phase='admitted', touched=False)
         row['granted'] = dict(jobs=1, slot=slot, workers=row['workers'],
                               memory_mb=row['memory_mb'], leases=list(row['requested']['leases']))
+        if row.get('lease_phase_version') == 1:
+            row['held_leases'] = list(row['requested']['leases'])
         token = next(t for t, r in jobs.items() if r is row)
         active[token] = row
     # Keep terminal outcomes for late followers. Bound retention by time, not

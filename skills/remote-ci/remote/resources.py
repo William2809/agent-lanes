@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ci_telemetry
 from process_tree import Tree
 
-KEYS = ('MAX_JOBS', 'MAX_WORKERS', 'CPU_RESERVE', 'MEM_RESERVE_MB', 'WORKER_MB', 'MAX_JOB_MB', 'KILL_PCT', 'CLEANUP_QUARANTINE_S', 'FAST_LANE', 'FAST_WORKERS', 'FAST_MEMORY_MB', 'FAST_SECONDS', 'INITIAL_MEMORY_MB')
+KEYS = ('MAX_JOBS', 'MAX_WORKERS', 'CPU_RESERVE', 'MEM_RESERVE_MB', 'WORKER_MB', 'MAX_JOB_MB', 'KILL_PCT', 'CLEANUP_QUARANTINE_S', 'FAST_LANE', 'FAST_WORKERS', 'FAST_MEMORY_MB', 'FAST_SECONDS', 'INITIAL_MEMORY_MB', 'FAST_BORROW', 'RESERVATION_CAP_MB')
 
 
 def output(args):
@@ -37,11 +37,11 @@ def policy(mode):
             script = '. "$1" >/dev/null 2>&1 || exit; shift; for key; do printf "%s=%s\n" "$key" "${!key}"; done'
             result = output(['/bin/bash', '-c', script, '_', str(path), *keys])
             values.update(line.split('=', 1) for line in result.splitlines() if line.partition('=')[2])
-    defaults = dict(MAX_JOBS=1, MAX_WORKERS=2, CPU_RESERVE=2, MEM_RESERVE_MB=2048, WORKER_MB=2048, MAX_JOB_MB=8192, KILL_PCT=150, CLEANUP_QUARANTINE_S=600, FAST_LANE=0, FAST_WORKERS=1, FAST_MEMORY_MB=2048, FAST_SECONDS=60, INITIAL_MEMORY_MB=0)
+    defaults = dict(MAX_JOBS=1, MAX_WORKERS=2, CPU_RESERVE=2, MEM_RESERVE_MB=2048, WORKER_MB=2048, MAX_JOB_MB=8192, KILL_PCT=150, CLEANUP_QUARANTINE_S=600, FAST_LANE=0, FAST_WORKERS=1, FAST_MEMORY_MB=2048, FAST_SECONDS=60, INITIAL_MEMORY_MB=0, FAST_BORROW=0, RESERVATION_CAP_MB=0)
     result = {}
     for key, default in defaults.items():
         raw = str(values.get('AGENT_CI_' + key, default))
-        if not raw.isdigit() or not (0 if key in ('FAST_LANE', 'INITIAL_MEMORY_MB') else 1) <= int(raw) <= (1 if key == 'FAST_LANE' else 1048576):
+        if not raw.isdigit() or not (0 if key in ('FAST_LANE', 'INITIAL_MEMORY_MB', 'FAST_BORROW', 'RESERVATION_CAP_MB') else 1) <= int(raw) <= (1 if key in ('FAST_LANE', 'FAST_BORROW') else 1048576):
             raise ValueError('AGENT_CI_' + key + ' must be a positive integer')
         result[key] = int(raw)
     if mode == 'local':
@@ -102,6 +102,8 @@ def acquire_v2(queue, token, owner, deadline, limits, request, mode=None, submit
     if mode == 'runner':
         import scheduler_profiles
         request = scheduler_profiles.authorize(request, Path.home()/'ci', limits)
+        import scheduler_reservations
+        request = scheduler_reservations.cap_request(request, limits)
     registered = False
     adopting = bool(request.pop('park_adopt', False))
     park_nonce = request.pop('park_nonce', '')
@@ -141,6 +143,14 @@ def acquire_v2(queue, token, owner, deadline, limits, request, mode=None, submit
                         return dict(result=75, state='expired')
                     if not adopted:
                         return dict(result=scheduler_pause.PARKED, state='park-conflict')
+                    # The new kit rebuilt this request from the verified parked
+                    # envelope. Opt into its setup release before any admission.
+                    if request.get('lease_phase_version') == 1:
+                        row = data['jobs'][token]
+                        for key in ('lease_phase_version', 'setup_leases', 'recovery_leases'):
+                            row[key] = request[key]
+                        row['requested']['leases'] = request['leases']
+
                 else:
                     scheduler.submit(data, token, owner, procs[owner]['start'], now, deadline, request)
                     data['jobs'][token]['owner_birth'] = procs[owner]['birth']
@@ -744,7 +754,7 @@ def local_run(args, queue, limits):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['acquire', 'release', 'mark', 'watch', 'status', 'run', 'local-allowed', 'scheduler-version', 'cancel', 'verify', 'verify-resume', 'active-count', 'quarantined-projects', 'recover-pending', 'event', 'telemetry', 'reap', 'profile', 'withdraw'])
+    parser.add_argument('action', choices=['acquire', 'release', 'mark', 'watch', 'status', 'run', 'local-allowed', 'scheduler-version', 'cancel', 'verify', 'verify-resume', 'active-count', 'quarantined-projects', 'recover-pending', 'event', 'telemetry', 'reap', 'profile', 'withdraw', 'release-setup-leases'])
     parser.add_argument('--json', action='store_true', help='status is always JSON')
     parser.add_argument('--token')
     parser.add_argument('--run-id')
@@ -809,6 +819,18 @@ def main():
             print(scheduler_version())
             return 0
         queue = Queue()
+        if args.action == 'release-setup-leases':
+            import scheduler_db_leases
+            import scheduler_process
+            with queue.transaction() as data:
+                row = data['jobs'].get(args.token, {})
+                owner = scheduler_process.snapshot().get(args.owner, {})
+                if (not row.get('owner_birth') or
+                        owner.get('birth') != row['owner_birth'] or
+                        not scheduler_db_leases.release_setup(
+                            data, args.token, args.owner, args.generation)):
+                    raise ValueError('database setup lease ownership changed')
+            return 0
         if args.action == 'withdraw':
             import scheduler_withdraw
             try:

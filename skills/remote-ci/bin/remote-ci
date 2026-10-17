@@ -224,9 +224,12 @@ wait_remote() {
       kill -0 "$2" 2>/dev/null || exit 0
       sleep 1
     done
+    # Give remote deadline publication two elapsed seconds of grace.
+    # A fixed or adjusted wall clock must not extend this grace indefinitely.
+    sleep 2
     kill -TERM -"$2" 2>/dev/null
     sleep 1; kill -KILL -"$2" 2>/dev/null
-  ' _ "$((wait_deadline + 2))" "$wait_child" &
+  ' _ "$wait_deadline" "$wait_child" &
   wait_watchdog=$!
   wait "$wait_child" 2>/dev/null; rc=$?
   kill -TERM -"$wait_watchdog" 2>/dev/null || kill -TERM "$wait_watchdog" 2>/dev/null

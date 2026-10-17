@@ -242,7 +242,8 @@ class Telemetry(unittest.TestCase):
 class Admission(unittest.TestCase):
     def test_snapshot_taken_after_lock_cannot_erase_new_submitter(self):
         # The other submitter appears while this caller acquires the ledger lock.
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.dict(os.environ, HOME=temp, AGENT_CI_SCHEDULER='v1'):
             queue = r.Queue(temp)
             original = queue.transaction
             inside = [False]

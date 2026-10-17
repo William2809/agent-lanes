@@ -166,6 +166,67 @@ class FastScheduler(unittest.TestCase):
             self.assertEqual((queued['state'], queued['result']), ('rejected', 75))
             self.assertNotIn('workers', queued)
 
+    def test_rejected_lease_proposal_does_not_consume_followers_capacity(self):
+        a = self.submit('a', fast=True, leases=['ports:tcp:9000'])
+        b = self.submit('b', fast=True, leases=['ports:tcp:9000'])
+        c = self.submit('c', fast=True)
+        self.tick(limits=dict(LIMITS, MAX_JOBS=2, MAX_WORKERS=2))
+        self.assertEqual([a['state'], b['state'], c['state']], ['running', 'queued', 'running'])
+        self.assertEqual(b['blocker']['holder'], 'a')
+        self.assertEqual(b['blocker']['reason'], 'lease:ports:tcp:9000')
+        self.assertNotIn('granted', b)
+
+    def test_rejected_growth_proposal_does_not_hold_phantom_memory(self):
+        large = self.submit('large', memory_mb=1024, initial_memory_mb=1024,
+                            memory_ceiling_mb=8192, phase_memory_version=1)
+        small = self.submit('small', memory_mb=3072)
+        self.tick(metrics=dict(METRICS, available_mb=7168))
+        self.assertEqual(large['state'], 'queued')
+        self.assertEqual(large['blocker']['reason'], 'memory-growth-reserve')
+        self.assertEqual(small['state'], 'running')
+
+    def test_idle_fast_capacity_is_loaned_without_preempting_running_jobs(self):
+        limits = dict(LIMITS, FAST_BORROW=1)
+        normal = [self.submit(t, project='shared', slots=4) for t in ('a','b','c','d')]
+        self.tick(limits=limits)
+        self.assertTrue(all(row['state'] == 'running' for row in normal))
+        quick = self.submit('quick', now=101, project='shared', slots=4, fast=True)
+        self.tick(101, limits=limits)
+        self.assertEqual(quick['state'], 'queued')
+        self.assertTrue(all(row['state'] == 'running' for row in normal))
+        self.complete('a', 102)
+        self.tick(103, limits=limits)
+        self.assertEqual((quick['state'],quick['lane_class']), ('running','fast'))
+        self.assertEqual(quick['job_deadline'],163)
+
+    def test_borrow_preserves_eligible_fast_preference(self):
+        normal = self.submit('normal')
+        quick = self.submit('quick', fast=True)
+        self.tick(limits=dict(LIMITS, MAX_JOBS=2, MAX_WORKERS=2, FAST_BORROW=1))
+        self.assertEqual(quick['lane_class'], 'fast')
+        self.assertEqual(normal['state'], 'running')
+
+    def test_blocked_fast_job_does_not_idle_unrelated_capacity(self):
+        limits = dict(LIMITS, MAX_JOBS=2, MAX_WORKERS=2, FAST_BORROW=1)
+        holder = self.submit('holder', leases=['ports:tcp:9000'])
+        self.tick(limits=limits)
+        quick = self.submit('quick', fast=True, leases=['ports:tcp:9000'])
+        normal = self.submit('normal')
+        self.tick(101, limits=limits)
+        self.assertEqual((holder['state'], quick['state'], normal['state']),
+                         ('running','queued','running'))
+        self.assertEqual(quick['blocker']['holder'], 'holder')
+
+    def test_borrow_never_overrides_pressure_or_physical_caps(self):
+        a = self.submit('a')
+        self.tick(limits=dict(LIMITS, FAST_BORROW=1), metrics=dict(METRICS, pressure=2))
+        self.assertEqual(a['state'], 'queued')
+        self.assertEqual(a['blocker']['reason'], 'pressure')
+        self.tick(131, limits=dict(LIMITS, FAST_BORROW=1, MAX_JOBS=1))
+        b = self.submit('b', now=132)
+        self.tick(132, limits=dict(LIMITS, FAST_BORROW=1, MAX_JOBS=1))
+        self.assertEqual((a['state'],b['state']), ('running','queued'))
+
     def test_project_service_history_changes_normal_selection(self):
         limits = dict(LIMITS, MAX_JOBS=1, MAX_WORKERS=1)
         self.data['served'] = {'heavy': 1000, 'light': 0}

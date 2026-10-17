@@ -216,8 +216,9 @@ exit "$FIXTURE_RC"
 
     def test_checkout_failure_is_infrastructure(self):
         """Requirement 2: checkout failure is not a candidate check verdict."""
-        with (self.bin / 'lib.sh').open('a') as lib:
-            lib.write('\ngit() { [ "$1" != fetch ] || return 1; command git "$@"; }\n')
+        # Checkout now execs Git inside the bounded process. Intercept that
+        # executable, so the failure reaches the same boundary as a real error.
+        self.stub('git', '[ "$1" != fetch ] || exit 1\nexec /usr/bin/git "$@"\n')
         self.assert_result(self.start('checkout-failed'), 'checkout-failed', 74)
         self.assertEqual(self.count(), 0)
 

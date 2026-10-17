@@ -69,36 +69,51 @@ def admit(data, pending, active, metrics, limits, now, frozen):
     for row in active.values():
         if row.get('state')=='quarantined':
             slots[row['project']]=max(0,slots[row['project']]-1)
-    running=[flat(row,token) for token,row in active.items() if row.get('workers') and row.get('version')==2]
-    proposal=ci_priority.plan(candidates,running,budget,slots,now,data.get('served'),reserve,
-                             aging_s=scheduler.DRAIN_SECONDS)
-    for token, reason in proposal['blocked'].items():
-        if not jobs[token].get('blocker'):
-            jobs[token]['blocker']=dict(reason=reason,holder=None)
-    added=0
-    for choice in proposal['selected']:
-        token=choice['id']; row=jobs[token]
-        # An old lease waiter may not be continually overtaken by work that
-        # takes its required named lease. Unrelated fast checks still progress.
-        fence=next((head for head in blocked_heads if head['sequence'] < row['sequence'] and
-                    ('exclusive-host' in head['requested']['leases'] or
-                     (now-head['submitted_at'] >= scheduler.DRAIN_SECONDS and
-                      scheduler.leases_conflict(head['requested']['leases'],row['requested']['leases'])))),None)
-        reason=scheduler.blocker(row,active,dict(metrics,load=metrics['load']+added),limits)
+    # Commit one choice, then replan against real grants. A rejected proposal
+    # must never occupy phantom workers/RAM/slots for the remaining candidates.
+    remaining = list(candidates)
+    added = 0
+    while remaining:
+        running = [flat(row, token) for token, row in active.items()
+                   if row.get('workers') and row.get('version') == 2]
+        proposal = ci_priority.plan(remaining, running, budget, slots, now,
+                                   data.get('served'), reserve, aging_s=scheduler.DRAIN_SECONDS)
+        if limits.get('FAST_BORROW') and not any(
+                choice['lane_class'] == 'fast' for choice in proposal['selected']):
+            # Nonpreemptive loan: preserve fast preference when it can run,
+            # otherwise let normal jobs use idle checkout/CPU/memory capacity.
+            proposal = ci_priority.plan(remaining, running, budget, slots, now,
+                data.get('served'), dict(workers=0, memory_mb=0, seconds=0),
+                aging_s=scheduler.DRAIN_SECONDS)
+        if not proposal['selected']:
+            for token, reason in proposal['blocked'].items():
+                if not jobs[token].get('blocker'):
+                    jobs[token]['blocker'] = dict(reason=reason, holder=None)
+            break
+        choice = proposal['selected'][0]
+        token = choice['id']; row = jobs[token]
+        remaining = [candidate for candidate in remaining if candidate['id'] != token]
+        fence = next((head for head in blocked_heads if head['sequence'] < row['sequence'] and
+            ('exclusive-host' in head['requested']['leases'] or
+             (now-head['submitted_at'] >= scheduler.DRAIN_SECONDS and
+              scheduler.leases_conflict(head['requested']['leases'],row['requested']['leases'])))), None)
+        reason = scheduler.blocker(row, active, dict(metrics, load=metrics['load']+added), limits)
         if fence:
-            reason=dict(reason='head-drain',holder=tokens[id(fence)])
+            reason = dict(reason='head-drain', holder=tokens[id(fence)])
         if frozen or metrics.get('legacy_blocker'):
-            reason=row.get('blocker') or dict(reason='pressure',holder=None)
+            reason = row.get('blocker') or dict(reason='pressure', holder=None)
         if reason:
-            row['blocker']=reason
+            row['blocker'] = reason
+            if reason['reason'].startswith('lease:'):
+                blocked_heads.append(row)
             continue
-        _grant(row,active,now,choice['lane_class'])
+        _grant(row, active, now, choice['lane_class'])
         if choice.get('drain'):
-            row['drain']=True
-        if choice['lane_class']=='fast':
-            row['job_deadline']=now+reserve['seconds']
-        active[token]=row
-        added+=row['workers']
+            row['drain'] = True
+        if choice['lane_class'] == 'fast':
+            row['job_deadline'] = now+reserve['seconds']
+        active[token] = row
+        added += row['workers']
 
 
 def _grant(row, holders, now, lane):
@@ -109,3 +124,6 @@ def _grant(row, holders, now, lane):
                touched=False,lane_class=lane,blocker=None,updated_at=now)
     row['granted']=dict(jobs=1,slot=slot,workers=row['workers'],memory_mb=row['memory_mb'],
                         leases=list(row['requested']['leases']),lane_class=lane)
+
+    if row.get('lease_phase_version') == 1:
+        row['held_leases'] = list(row['requested']['leases'])

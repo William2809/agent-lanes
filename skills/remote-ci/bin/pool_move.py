@@ -18,6 +18,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pool
+import manual_transfer
 
 GRANT = ('workers', 'slot', 'granted', 'admitted_at', 'process', 'groups', 'touched')
 
@@ -65,15 +66,26 @@ def pick(candidates, project, probe):
 
 
 def move(runners, source, needs, project, run, after, gap, out, probe=pool.probe, remote=ssh,
-         sleep=time.sleep, alive=lambda: True):
+         sleep=time.sleep, alive=lambda: True, owner=None, clock=time.monotonic):
     """Return 'moved', 'kept' (one refused or failed withdraw), 'started' or 'none'."""
     src = next((r for r in runners if r['name'] == source), None)
     candidates = [r for r in runners if r['enabled'] and needs <= r['caps'] and r['name'] != source]
-    if src is None or not candidates:
+    if src is None:
+        return 'none'
+    if not candidates and owner is None:
         return 'none'
     resources = 'python3 ~/ci/projects/%s/runs/%s/bin/resources.py' % (project, run)
-    sleep(after)
+    automatic_at = clock() + after
+    immediate = [r for r in candidates if r['name'].lower() == 'pc']
+    if owner is None and not immediate:
+        sleep(after)
+        automatic_at = clock()
     while alive():
+        requested = owner.request() if owner else None
+        before_delay = clock() < automatic_at
+        if owner and not requested and before_delay and not immediate:
+            sleep(min(1, max(0, automatic_at - clock())))
+            continue
         result = remote(src['route'], resources + ' status --json')
         row = None
         if result is not None and result.returncode == 0:
@@ -82,8 +94,12 @@ def move(runners, source, needs, project, run, after, gap, out, probe=pool.probe
             except (ValueError, IndexError, AttributeError):
                 row = None
         if row is False:
+            if owner:
+                owner.result('started')
             return 'started'
-        dest = pick(candidates, project, probe) if row else None
+        eligible = ([r for r in candidates if r['name'] == requested] if requested else
+                    immediate if before_delay else candidates)
+        dest = pick(eligible, project, probe) if row and (requested or eligible) else None
         if dest:
             sleep(gap)
             if ready(dest, project, probe)[0] and alive():
@@ -94,8 +110,13 @@ def move(runners, source, needs, project, run, after, gap, out, probe=pool.probe
                 pending.replace(out)
                 result = remote(src['route'], '%s withdraw --token %s --generation %d --to %s'
                                 % (resources, token, generation, dest['name']))
-                return 'moved' if result is not None and result.returncode == 0 else 'kept'
+                state = 'moved' if result is not None and result.returncode == 0 else 'kept'
+                if owner:
+                    owner.result(state, destination=dest['name'])
+                return state
         sleep(gap * 3)  # Each status read also runs the source's queue maintenance.
+    if owner:
+        owner.result('ended')
     return 'none'
 
 
@@ -116,8 +137,14 @@ def main():
         needs = set(os.environ.get('REMOTE_CI_NEEDS', '').split())
         parent = os.getppid()
         # Stop when the client is gone; it also signals this process group when its wait ends.
+        destinations = [r['name'] for r in runners
+                        if r['enabled'] and needs <= r['caps'] and r['name'] != args.source]
+        try:
+            owner = manual_transfer.Owner(args.project, args.run, args.source, destinations)
+        except (OSError, ValueError):
+            owner = None  # Manual control is optional; preserve the automatic mover if state is unavailable.
         print(move(runners, args.source, needs, args.project, args.run, args.after, args.gap,
-                   args.out, alive=lambda: os.getppid() == parent))
+                   args.out, alive=lambda: os.getppid() == parent, owner=owner))
         return 0
     except (pool.Infra, OSError, ValueError):
         return 3

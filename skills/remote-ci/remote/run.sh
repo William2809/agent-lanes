@@ -383,8 +383,8 @@ finish() {
     fi
     if [ "$guard_owned" = 1 ]; then
       if [ "$scheduler_version" = v2 ]; then stop_idle_postgres
-      else bounded_stop_idle_postgres || cleanup_failed=1; fi
-      [ ! -f "$dir/results/$run.infra-tree" ] || cleanup_failed=1
+      else bounded_stop_idle_postgres || { rc=76; cleanup_failed=1; }; fi
+      [ ! -f "$dir/results/$run.infra-tree" ] || { rc=76; cleanup_failed=1; }
       if [ "$cleanup_failed" = 1 ] && [ "$scheduler_version" != v2 ] && [ "$slotted" = 1 ]; then
         platform_lock "$dir/slots/$slot.lock" $$ || true
         printf '%s\n' "$run" >"$dir/slots/$slot.run"
@@ -392,7 +392,8 @@ finish() {
       release_guard
     fi
   fi
-  [ "$cleanup_failed" = 0 ] || rc=76
+  # A lock timeout retains ownership but remains infrastructure exit 74.
+  # Failed cleanup commands above use 76 for uncertain process/database state.
   if [ "$cleanup_failed" = 1 ]; then
     printf 'run=%s\nslot=%s\ndatabase=%s\nrole=%s\ncheck_rc=%s\npid=%s\n' \
       "$run" "$slot" "$REMOTE_CI_DB" "$role" "$check_rc" "$$" >"$dir/results/$run.cleanup"
@@ -930,6 +931,10 @@ prepare_database() {
   export "${REMOTE_CI_DATABASE_URL_VAR:-DATABASE_URL}=$(database_url "$REMOTE_CI_DB" "$role")"
 }
 [ -n "${REMOTE_CI_POSTGRES:-}" ] && phase database prepare_database
+if [ "$scheduler_version" = v2 ] && [ -n "${REMOTE_CI_POSTGRES:-}" ]; then
+  python3 "$runner_dir/resources.py" release-setup-leases --token "$resource_token" \
+    --owner "$$" || finish 74
+fi
 [ -n "${REMOTE_CI_PREPARE:-}" ] && phase prepare candidate prepare "$REMOTE_CI_PREPARE"
 [ "$force" = 1 ] && export TURBO_FORCE=true
 check=${command:-$REMOTE_CI_CHECK}

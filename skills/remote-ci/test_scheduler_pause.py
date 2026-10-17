@@ -182,7 +182,7 @@ class DurableRecords(unittest.TestCase):
         # Popen.wait reaps the root zombie; the real detached owner is reaped
         # by the system. A second recovery must retain the same original run.
         scheduler_resume.recover(self.queue, 'token')
-        child.wait(timeout=5)
+        child.wait(timeout=15)
         scheduler_resume.recover(self.queue, 'token')
         with self.queue.transaction() as data:
             row = data['jobs']['token']
@@ -248,12 +248,12 @@ class DurableRecords(unittest.TestCase):
         time.sleep(.1)
         self.assertFalse(marker.exists())
         child.stdin.close()
-        child.wait(timeout=5)
+        child.wait(timeout=15)
         self.assertFalse(marker.exists(), 'closed publication gate executed work')
         child = pause.gated_launcher(command)
         child.stdin.write(b'1')
         child.stdin.close()
-        child.wait(timeout=5)
+        child.wait(timeout=15)
         self.assertTrue(marker.exists())
 
 

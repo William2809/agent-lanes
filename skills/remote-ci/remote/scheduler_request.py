@@ -55,9 +55,14 @@ def main():
     if os.environ.get('SCHEDULER_EXCLUSIVE', '0') == '1':
         leases.append('exclusive-host')
     postgres = os.environ.get('SCHEDULER_POSTGRES', '')
+    setup_leases = []
+    recovery_leases = []
     if postgres:
-        # Serializes cluster start, template work and cleanup without later locks.
-        leases.extend(['postgres:' + postgres, 'template:' + project, 'cleanup:' + project])
+        # Shared cluster/profile and template mutation are serialized only until
+        # this run has cloned its slot database. Checks and cleanup are slot-owned.
+        setup_leases = ['postgres:' + postgres, 'template:' + project]
+        recovery_leases = ['postgres:' + postgres]
+        leases.extend(setup_leases)
     task = meta.get('task') or ('full' if mode == 'full' else digest)
     request = dict(schema='agent-ci.request/v1', protocol=2, task=task,
                    phase_memory_version=1, project=project, lane=meta.get('lane', ''), sha=sha, tree=tree, run_id=run,
@@ -66,6 +71,9 @@ def main():
                    slots=int(os.environ.get('SCHEDULER_SLOTS', '1')), workers=workers,
                    memory_mb=max(memory_floor, max(floor, model['predicted_mb']) + (2048 if postgres else 0)),
                    leases=sorted(set(leases)), cleanup_required=bool(postgres), **model)
+    if postgres:
+        request.update(lease_phase_version=1, setup_leases=sorted(set(setup_leases)),
+                       recovery_leases=sorted(set(recovery_leases)))
     if meta.get('park_version') == 1:
         request['park_version'] = 1
     scheduler.validate(request)

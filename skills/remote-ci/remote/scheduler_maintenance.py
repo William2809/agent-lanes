@@ -78,7 +78,7 @@ def main():
         if not pending.exists():
             return 76
         command = ['/bin/bash', str(KIT/'run.sh'), '--cleanup-v2', str(pending)]
-        leases = old['requested']['leases']
+        leases = old.get('quarantined_leases', old['requested']['leases'])
         slots, memory = old['requested']['slots'], old['requested']['memory_mb']
     else:
         project, slots, memory = 'maintenance', 1, 4096
