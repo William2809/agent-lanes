@@ -150,6 +150,19 @@ def audit_snapshot(queue, expected):
             row = data['jobs'].get(token)
             if row is None:
                 if identity.get('_legacy_may_retire'):
+                    run = identity.get('run_id')
+                    if not isinstance(run, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,200}', run) or run in ('.', '..'):
+                        raise ValueError('retired legacy queue record has no safe run identity: %s' % token)
+                    receipts = list(ci_root().glob('projects/*/results/%s.exit' % run))
+                    if (len(receipts) != 1 or not receipts[0].is_file() or
+                            receipts[0].is_symlink()):
+                        raise ValueError('retired legacy queue record has no unique completion receipt: %s' % token)
+                    try:
+                        result = receipts[0].read_text().strip()
+                    except OSError:
+                        result = ''
+                    if not re.fullmatch(r'[0-9]+', result):
+                        raise ValueError('retired legacy queue record has invalid completion receipt: %s' % token)
                     continue
                 raise ValueError('accepted queue record is missing: %s' % token)
             if any(row.get(key) != identity.get(key) for key in IDENTITY):
