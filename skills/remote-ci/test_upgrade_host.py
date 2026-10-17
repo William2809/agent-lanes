@@ -114,6 +114,20 @@ class UpgradeHost(unittest.TestCase):
         resume.assert_not_called()
         self.assertTrue((self.ci/'freeze').exists())
 
+    def test_missing_legacy_row_requires_durable_completion_receipt(self):
+        expected = {'legacy': dict(version=1, run_id='legacy-run',
+                                   _legacy_may_retire=True)}
+        with self.assertRaisesRegex(ValueError, 'no unique completion receipt'):
+            upgrade_host.audit_snapshot(resources.Queue(), expected)
+
+    def test_missing_legacy_row_accepts_unique_numeric_completion_receipt(self):
+        expected = {'legacy': dict(version=1, run_id='legacy-run',
+                                   _legacy_may_retire=True)}
+        receipt = self.ci/'projects/fixture/results/legacy-run.exit'
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text('0\n')
+        upgrade_host.audit_snapshot(resources.Queue(), expected)
+
     def test_pause_side_effect_before_journal_is_reconciled(self):
         self.prepared()
         state = upgrade_host.advance('upgrade-1')
