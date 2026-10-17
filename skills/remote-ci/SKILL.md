@@ -105,8 +105,9 @@ fast prioritization. A job runs entirely on one device; running jobs do not
 migrate between hosts. Follow-up diagnostics use the runner that executed the
 commit. The pool never substitutes local execution when remote devices fail.
 
-A queued check can move once before it starts. When a scored check's v2 queue row
-is still unstarted after `REMOTE_CI_MOVE_AFTER` seconds (default 60), the client
+A queued check can move once before it starts. A compatible configured runner named
+`pc` is probed immediately; other destinations wait until the scored check's v2 queue row
+is still unstarted after `REMOTE_CI_MOVE_AFTER` seconds (default 60). The client
 (`bin/pool_move.py`) looks for another enabled runner that meets the check's needs,
 has the project set up, and admits now on two probes about 5 seconds apart. The
 source then withdraws the row in one queue transaction (`resources.py withdraw
