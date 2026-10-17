@@ -51,15 +51,17 @@ for spec in skills/session-stats/test_session_stats.py skills/loop-stats/test_lo
   bin/test_lanes.py bin/test_diskguard.py skills/wt-dev/test_wt_dev.py tests/test_*.py \
   skills/*/test_diagnostics.py skills/*/test_runner.py skills/*/test_resources.py skills/remote-ci/test_pool*.py skills/remote-ci/test_db_phase*.py \
   skills/*/test_client_process.py skills/*/test_route_policy.py \
-  skills/*/test_scheduler*.py skills/*/test_fast_*.py skills/*/test_memory.py skills/*/test_tree_scheduler.py \
+  skills/*/test_scheduler*.py skills/*/test_fast_*.py skills/*/test_memory.py skills/*/test_phase_memory.py skills/*/test_tree_scheduler.py \
   skills/*/test_review_followup.py skills/*/test_ci_reliability.py skills/*/test_ci_policy.py skills/*/test_receipts.py skills/*/test_hostkit.py skills/*/test_cache*.py; do
   case "$spec" in tests/test_workflow.py|tests/test_bounce_train.py) continue ;; esac
   suite=${spec##*/}; suite=${suite%.py}
   run "${spec%.py}" python_suite "${spec%/*}" "$suite" || status=1
 done
-if [ -f skills/ci-board/test_maintenance.py ]; then
-  run skills/ci-board/test_maintenance python_suite skills/ci-board test_maintenance || status=1
-fi
+for suite in test_maintenance test_stalls test_workers; do
+  if [ -f "skills/ci-board/$suite.py" ]; then
+    run "skills/ci-board/$suite" python_suite skills/ci-board "$suite" || status=1
+  fi
+done
 # test_browser_tools.mjs needs a project with Playwright installed.
 run skills/ui-shots/test_auth_cache node --test skills/ui-shots/test_auth_cache.mjs || status=1
 run mods/workers/portable sh tests/check-workers || status=1

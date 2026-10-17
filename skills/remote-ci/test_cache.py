@@ -505,9 +505,15 @@ pg_profile_configure && pg_profile_ensure
         with (fixture.dir / 'conf').open('a') as stream:
             stream.write("REMOTE_CI_INSTALL_INPUTS=source.txt\nREMOTE_CI_LIFECYCLE_INPUTS=source.txt\n"
                 "REMOTE_CI_INSTALL='mkdir -p node_modules; echo fixture >node_modules/value'\n")
-        (fixture.dir / 'env.local').write_text('platform_lock() {\n'
-            'case "$1" in */cache/*) touch "$HOME/install-adapter" ;; esac\n'
-            '/usr/bin/shlock -f "$1" -p "$2"; }\n')
+        (fixture.dir / 'env.local').write_text('''
+if ! declare -F fixture_platform_lock >/dev/null; then
+  eval "$(declare -f platform_lock | sed '1s/^platform_lock/fixture_platform_lock/')"
+fi
+platform_lock() {
+  case "$1" in */cache/*) touch "$HOME/install-adapter" ;; esac
+  fixture_platform_lock "$@"
+}
+''')
         fixture.assert_result(fixture.start('adapter', command='true'), 'adapter', 0)
         self.assertTrue((fixture.home / 'install-adapter').exists(), 'install must use the portable lock')
 

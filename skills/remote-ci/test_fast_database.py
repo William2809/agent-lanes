@@ -131,7 +131,7 @@ class FastDatabase(unittest.TestCase):
         self.assert_result(self.start('hung-checkout', command='true'), 'hung-checkout', 74)
         self.assertLess(time.monotonic() - started, 15)
         self.assertTrue((self.home / 'hung-checkout-started').exists())
-        self.assertIn('phase stopped phase=check rc=74', self.log('hung-checkout'))
+        self.assertIn('phase stopped phase=check reason=deadline rc=74', self.log('hung-checkout'))
 
     def test_fast_deadline_stops_hung_cache_operation(self):
         self.enable_five_second_fast_lane()
@@ -146,7 +146,7 @@ class FastDatabase(unittest.TestCase):
         self.assert_result(self.start('hung-cache', command='true'), 'hung-cache', 74)
         self.assertLess(time.monotonic() - started, 15)
         self.assertTrue((self.home / 'hung-cache-started').exists())
-        self.assertIn('phase stopped phase=check rc=74', self.log('hung-cache'))
+        self.assertIn('phase stopped phase=check reason=deadline rc=74', self.log('hung-cache'))
 
 
     def test_stuck_cleanup_ref_is_bounded_and_quarantined(self):
