@@ -17,6 +17,9 @@ case "$platform_os" in
     ;;
   *) echo 'remote-ci: unsupported runner platform' >&2; return 3 ;;
 esac
+# Receipt collection always uses the native adapter selected above. Project
+# env.local may override platform_time only for the candidate check prefix.
+platform_receipt_time=("${platform_time[@]}")
 platform_decode() { base64 -d; }
 platform_lock() {
   # Keep Darwin interoperable with already-running snapshots during rollout.
