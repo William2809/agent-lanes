@@ -82,14 +82,14 @@ class SchedulerRequest(unittest.TestCase):
             self.request_builder.main()
         return json.loads(stdout.getvalue())
 
-    def test_cold_requested_profile_bootstraps_with_one_worker(self):
+    def test_cold_profile_keeps_requested_workers(self):
         request = self.build(workers=3)
-        expected = self.profiles.key('project', self.digest, self.context, 1, False)
-        self.assertEqual(request['workers'], 1)
+        expected = self.profiles.key('project', self.digest, self.context, 3, False)
+        self.assertEqual(request['workers'], 3)
         self.assertEqual(request['profile'], expected)
         self.assertFalse(request['profile_known'])
         self.assertFalse(request['memory_known'])
-        self.assertEqual(request['memory_mb'], 4096)
+        self.assertEqual(request['memory_mb'], 3072)
 
     def test_one_or_two_successes_reduce_memory_but_remain_normal_lane(self):
         for count in (1, 2):
@@ -126,17 +126,16 @@ class SchedulerRequest(unittest.TestCase):
         self.assertEqual(request['profile'], expected)
         self.assertFalse(request['profile_known'])
         self.assertFalse(request['memory_known'])
-        self.assertGreaterEqual(request['memory_mb'], 4096)
+        self.assertEqual(request['memory_mb'], 3072)
 
-    def test_database_overhead_can_make_single_worker_ineligible(self):
-        self.add_history(1, service=20, database=True)
+    def test_database_has_no_fixed_reservation_padding(self):
+        expected = self.add_history(1, service=20, database=True)
         request = self.build(workers=2, database='15')
-        expected = self.profiles.key('project', self.digest, self.context, 2, True)
-        self.assertEqual(request['workers'], 2)
+        self.assertEqual(request['workers'], 1)
         self.assertEqual(request['profile'], expected)
-        self.assertFalse(request['profile_known'])
-        self.assertFalse(request['memory_known'])
-        self.assertGreaterEqual(request['memory_mb'], 6144)
+        self.assertTrue(request['profile_known'])
+        self.assertTrue(request['memory_known'])
+        self.assertEqual(request['memory_mb'], 1024)
 
 
 if __name__ == '__main__':

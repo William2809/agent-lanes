@@ -336,10 +336,16 @@ waits until available memory minus reserve and unused reservations covers the
 grant. The host caps the project setting with `AGENT_CI_MAX_JOB_MB` (default
 8192). This cap applies to the setting, not the host's per-worker budget.
 V2 also applies the project floor, alongside its conservative learned budget.
+V2 applies `AGENT_CI_RESERVATION_CAP_MB` as a separate accounting cap
+(default disabled; set to 3072 for a 3 GiB maximum reservation). The reservation
+uses the trusted measured whole-job peak without synthetic headroom or database
+padding, while retaining the requested project floor and host per-worker floor.
+The receipt estimate remains visible. `AGENT_CI_MAX_JOB_MB`, `AGENT_CI_KILL_PCT`,
+live pressure, and deadlines remain runtime safety limits. Existing admitted runs keep their saved grants.
 
-The budget stop threshold is host `AGENT_CI_KILL_PCT` percent of the grant
-(default 150). This is the only threshold setting. It must be a positive
-integer. For example, 300 allows three times the grant. A failed policy read
+Legacy jobs stop above the smaller of host `AGENT_CI_KILL_PCT` percent of the
+grant (default 150) and `AGENT_CI_MAX_JOB_MB`. The percentage must be a positive
+integer. V2 jobs governed by the reservation cap retain the host burst percentage and absolute runtime maximum; the smaller accounting reservation is not a 100% kill threshold. A failed policy read
 retains the installed runner's 150 percent fallback; an active sampling
 failure still fails closed. Equality does not stop a run. Pressure level 4
 still stops it at once. Each admitted run logs `== memory peak N MB of M granted`.
@@ -624,12 +630,13 @@ killed or incomplete terminal run establish a runtime-known profile. Its estimat
 1.25 times the largest of the last 20 successful whole-job service durations
 (checkout through cleanup, excluding queue wait). A one-second check with a
 15-minute setup is therefore not classified as short. Fast admission requires
-the estimate and complete worker/memory request to fit the reserve. Unknown
-profiles initially use one worker and at least 4096 MB; database jobs add
-2048 MB. After one complete, uncached successful whole-job observation since
-the latest failure, memory may instead use the measured peak with 25% headroom
-plus 256 MB. The host worker floor and explicit project floor still apply, and
-all earlier observed peaks, including failures, remain lower bounds. A later
+the estimate and complete worker/memory request to fit the reserve. Cold profiles retain the requested worker count and reserve the greater of the
+host per-worker floor and explicit project floor. Database work adds no fixed
+reservation padding because host live availability already includes service use.
+After one complete, uncached successful whole-job observation since the latest
+failure, memory may use the largest relevant measured peak directly. All earlier
+observed peaks, including failures, remain lower bounds for the estimate. The
+configured reservation cap applies after these floors and estimates. A later
 failure revokes this reduced-floor eligibility until the next complete success.
 This memory confidence does not establish fast status. Once the single-worker
 runtime profile is known, short jobs keep that small
@@ -898,11 +905,11 @@ hold-and-wait; it does not guarantee progress when external memory pressure
 removes available capacity. Full commitments are compared conservatively with
 OS available memory; raw summed RSS does not earn admission credit.
 
-Phase-sized jobs stop when their supervised tree exceeds the current grant
-(100%, regardless of the legacy percentage multiplier) or host pressure becomes
-critical. Sampling is not an OS hard memory limit: detached external services
+Reservation-capped jobs remain governed by the host burst percentage and
+`AGENT_CI_MAX_JOB_MB`; the accounting cap does not become a 100% runtime stop.
+Critical host pressure still stops a run. Sampling is not an OS hard memory limit: detached external services
 such as PostgreSQL still need their service allowance and host pressure checks.
-A full command may receive more than 3 GiB. Splitting phases further requires
+A host configured with a 3072 MB reservation cap accounts at most 3 GiB per command; runtime safety can permit a bounded burst above that reservation. Splitting phases further requires
 trusted measurements, not guessing from the current RSS.
 
 Verification: `test_phase_memory` covers database-inclusive initial grants,
@@ -911,3 +918,18 @@ FIFO growth, pressure cooldown, impossible ceilings, generation/reap fences,
 bounded growth timeout and cleanup bypass. Its real runner fixture verifies
 3 GiB admission, 6 GiB command grant, return to 3 GiB, telemetry and final release.
 Host metrics in those fixtures are synthetic; live queued canaries verify deployment.
+
+### Reservation cap regression boundaries (2026-10-17)
+
+These profile tests cover capped reservations and phase ceilings at the host maximum.
+
+| Test | Requirement and boundary | Gap |
+| --- | --- | --- |
+| authorize_caps_requested_memory_at_host_maximum | 4095/4096/4097 MB requests with a 4096 MB cap | Receipt fixture; no host admission |
+| authorize_caps_history_database_and_unknown_floors | A large observation, database service, unknown history and four-worker floor all obey a 3072 MB cap | Synthetic history; no unique-memory measurement |
+| authorize_caps_phase_ceiling_before_initial_reservation | Oversized request, 3072 MB ceiling, initial limits below/equal/above the cap | Pure authorization; phase tests cover growth |
+
+The receipt sampler sums each owned PID once per sample and keeps the largest
+sample for each phase. The profile uses the largest phase peak, not their sum.
+Shared mapped pages can still appear in several processes' RSS, so a saved peak
+does not identify shared-page contribution.

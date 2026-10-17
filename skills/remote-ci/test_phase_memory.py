@@ -82,6 +82,16 @@ class PhaseMemory(unittest.TestCase):
         self.assertFalse(memory.grow(self.data, 'a', METRICS, LIMITS, 103))
         self.assertTrue(memory.grow(self.data, 'a', METRICS, LIMITS, 133))
 
+    def test_memory_growth_uses_cumulative_swap_window(self):
+        a = self.submit('a'); self.tick()
+        a['memory_wait'] = dict(at=101, target_mb=6144)
+        low = dict(METRICS, available_mb=4000)
+        for now, swap in ((101, 16), (106, 32), (111, 48)):
+            self.assertFalse(memory.grow(self.data, 'a', dict(low, swap_mb=swap), LIMITS, now))
+        self.assertFalse(memory.grow(self.data, 'a', dict(METRICS, swap_mb=64), LIMITS, 116))
+        self.assertEqual(self.data['throttle_reason'], 'swap-recovery')
+        self.assertTrue(memory.grow(self.data, 'a', dict(METRICS, swap_mb=64), LIMITS, 147))
+
     def test_oldest_growth_gets_full_increment_not_partial_or_overtaken(self):
         a,b = self.submit('a'),self.submit('b');self.tick()
         a['memory_wait']=dict(at=101,target_mb=6144)
@@ -191,10 +201,10 @@ class PhaseMemoryPause(unittest.TestCase):
         pause_fixture.PauseLifecycle.test_park_install_resume_original_pooled_job_once(self)
         for row in self.rows().values():
             if row.get('run_id') in ('saved','earlier-name'):
-                self.assertEqual(row['initial_memory_mb'],3072)
-                self.assertEqual(row['requested']['memory_mb'],3072)
-                self.assertEqual(row['memory_ceiling_mb'],4096)
-                self.assertEqual(row['peak_grant_mb'],4096)
+                self.assertEqual(row['initial_memory_mb'],2048)
+                self.assertEqual(row['requested']['memory_mb'],2048)
+                self.assertEqual(row['memory_ceiling_mb'],2048)
+                self.assertNotIn('peak_grant_mb', row)
 
 
 if __name__=='__main__':unittest.main()
