@@ -474,7 +474,9 @@ class Client(unittest.TestCase):
 
     def test_manual_request_moves_through_owner_and_keeps_the_snapshot(self):
         a = self.host('a', 'v2', 0, hold=60)
-        pc = self.host('pc', 'v2', 0)
+        # The first pool-selection probe sees PC as busy, so `a` is deterministically
+        # the source. The mover's later probes see PC idle and exercise the transfer.
+        pc = self.host('pc', 'v2', 1)
         (Path(self.temp.name) / 'config').write_text('CI_RUNNERS="a=a-route:unit pc=pc-route:unit"\n')
         (self.repo / 'manual.txt').write_text('same snapshot\n')
         transfers = Path(self.temp.name) / '.local/state/remote-ci/transfers'
@@ -488,8 +490,18 @@ class Client(unittest.TestCase):
         # registration guarantee at source launch, not at client process creation.
         launch_deadline = time.time() + 60
         while time.time() < launch_deadline and not (a / 'run.args').exists():
+            if child.poll() is not None:
+                break
             time.sleep(.05)
-        self.assertTrue((a / 'run.args').exists(), 'source run did not launch')
+        if not (a / 'run.args').exists():
+            if child.poll() is None:
+                child.terminate()
+            try:
+                stdout, stderr = child.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                stdout, stderr = child.communicate(timeout=5)
+            self.fail('source run did not launch:\n' + stdout + stderr)
         deadline = time.time() + 10
         owner = None
         while time.time() < deadline:
