@@ -108,9 +108,12 @@ def run_canary(op, host, directory):
         if key.startswith(('REMOTE_CI_', 'REMOTE_CI_', 'CI_ROUTE_', 'CI_RUNNER')):
             env.pop(key)
     env['AGENT_LANES_CONFIG'] = '/dev/null'
-    env.update(AGENT_LANES_CONFIG='/dev/null',
-               CI_RUNNERS=op['registry'], REMOTE_CI_RUNNER=host['name'], REMOTE_CI_MOVE='0',
-               REMOTE_CI_CONF=str(directory/'canary.conf'))
+    user, separator, hostname = host['route'].rpartition('@')
+    if not separator:
+        hostname, user = host['route'], os.environ.get('USER', '')
+    env.update(AGENT_LANES_CONFIG='/dev/null', REMOTE_CI_MOVE='0',
+               REMOTE_CI_HOST=host['route'], REMOTE_CI_DIRECT_HOST=hostname,
+               REMOTE_CI_USER=user, REMOTE_CI_CONF=str(directory/'canary.conf'))
     log = directory/(host['name']+'-canary-'+str(time.time_ns())+'.log')
     host['canary_log'] = str(log)
     save(directory/'operation.json', op)
@@ -233,7 +236,7 @@ def start(names, timeout):
 
 def launch(directory):
     with (directory/'controller.log').open('a') as log:
-        proc = subprocess.Popen([sys.executable, str(directory/'client/bin/rolling_upgrade.py'),
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
                                  '_run', directory.name], stdin=subprocess.DEVNULL,
                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     print('upgrade '+directory.name+' started (controller '+str(proc.pid)+')')
