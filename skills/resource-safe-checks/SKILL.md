@@ -77,8 +77,9 @@ Serialize browser capture work. Do not kill unrelated agents, Finder or Shottr.
 
 ## Tune and verify
 
-Host policy belongs in `~/.config/agent-lanes/config` (legacy agent-lanes
-config is read first), on the execution device. Preserve the user's configured
+Host policy belongs in the execution device's toolkit configuration, normally
+`~/.config/agent-lanes/config`. Inspect the effective installed policy and
+preserve the user's configured
 limits. Project slots cannot raise the host ceiling; per-project worker requests
 still share `AGENT_CI_MAX_WORKERS`.
 
