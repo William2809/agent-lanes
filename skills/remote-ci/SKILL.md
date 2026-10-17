@@ -845,3 +845,43 @@ runner with fake database commands, checkout/cache deadlines and checkout cwd;
 `test_scheduler_events` checks bounded private transition events. `test_cache`
 adds contention and pin races. These fixtures run through the remote queue.
 Live host canaries and the unfiltered gate are required before enabling the flag.
+
+
+### Initial memory and phase growth
+
+Host-only `AGENT_CI_INITIAL_MEMORY_MB=3072` enables a 3 GiB initial reservation
+for new phase-aware V2 runs (0, the default, keeps whole-job admission). This
+includes the PostgreSQL service allowance; it is not 3 GiB plus the service.
+The trusted whole-job estimate, explicit project floor and host maximum still
+define the eventual ceiling. Old running or parked jobs keep their saved policy.
+
+Checkout, cache operations and database control commands retain the initial
+grant. Before an install, migration, prepare or check command launches, it must
+acquire its full estimated phase budget atomically. Unknown commands use the
+conservative whole-job ceiling. Extra memory returns only after the supervised
+process tree is reaped, never because RSS briefly falls. The board reads the
+current grant; telemetry records `memory-granted` / `memory-released`, old/new
+grants, ceiling and wait duration. The receipt admission grant remains initial.
+
+New admission preserves shared headroom for the largest remaining growth
+request. Existing growth waiters take priority over new admissions. Growth
+waits at most 60 seconds and consumes existing phase/job deadlines; failure
+returns infrastructure 75 without launching the candidate, then runs bounded
+cleanup. Cleanup never waits for a memory increment. This prevents unbounded
+hold-and-wait; it does not guarantee progress when external memory pressure
+removes available capacity. Full commitments are compared conservatively with
+OS available memory; raw summed RSS does not earn admission credit.
+
+Phase-sized jobs stop when their supervised tree exceeds the current grant
+(100%, regardless of the legacy percentage multiplier) or host pressure becomes
+critical. Sampling is not an OS hard memory limit: detached external services
+such as PostgreSQL still need their service allowance and host pressure checks.
+A full command may receive more than 3 GiB. Splitting phases further requires
+trusted measurements, not guessing from the current RSS.
+
+Verification: `test_phase_memory` covers database-inclusive initial grants,
+legacy/flag-off compatibility, both admission planners, shared growth headroom,
+FIFO growth, pressure cooldown, impossible ceilings, generation/reap fences,
+bounded growth timeout and cleanup bypass. Its real runner fixture verifies
+3 GiB admission, 6 GiB command grant, return to 3 GiB, telemetry and final release.
+Host metrics in those fixtures are synthetic; live queued canaries verify deployment.

@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ci_telemetry
 from process_tree import Tree
 
-KEYS = ('MAX_JOBS', 'MAX_WORKERS', 'CPU_RESERVE', 'MEM_RESERVE_MB', 'WORKER_MB', 'MAX_JOB_MB', 'KILL_PCT', 'CLEANUP_QUARANTINE_S', 'FAST_LANE', 'FAST_WORKERS', 'FAST_MEMORY_MB', 'FAST_SECONDS')
+KEYS = ('MAX_JOBS', 'MAX_WORKERS', 'CPU_RESERVE', 'MEM_RESERVE_MB', 'WORKER_MB', 'MAX_JOB_MB', 'KILL_PCT', 'CLEANUP_QUARANTINE_S', 'FAST_LANE', 'FAST_WORKERS', 'FAST_MEMORY_MB', 'FAST_SECONDS', 'INITIAL_MEMORY_MB')
 
 
 def output(args):
@@ -37,11 +37,11 @@ def policy(mode):
             script = '. "$1" >/dev/null 2>&1 || exit; shift; for key; do printf "%s=%s\n" "$key" "${!key}"; done'
             result = output(['/bin/bash', '-c', script, '_', str(path), *keys])
             values.update(line.split('=', 1) for line in result.splitlines() if line.partition('=')[2])
-    defaults = dict(MAX_JOBS=1, MAX_WORKERS=2, CPU_RESERVE=2, MEM_RESERVE_MB=2048, WORKER_MB=2048, MAX_JOB_MB=8192, KILL_PCT=150, CLEANUP_QUARANTINE_S=600, FAST_LANE=0, FAST_WORKERS=1, FAST_MEMORY_MB=2048, FAST_SECONDS=60)
+    defaults = dict(MAX_JOBS=1, MAX_WORKERS=2, CPU_RESERVE=2, MEM_RESERVE_MB=2048, WORKER_MB=2048, MAX_JOB_MB=8192, KILL_PCT=150, CLEANUP_QUARANTINE_S=600, FAST_LANE=0, FAST_WORKERS=1, FAST_MEMORY_MB=2048, FAST_SECONDS=60, INITIAL_MEMORY_MB=0)
     result = {}
     for key, default in defaults.items():
         raw = str(values.get('AGENT_CI_' + key, default))
-        if not raw.isdigit() or not (0 if key == 'FAST_LANE' else 1) <= int(raw) <= (1 if key == 'FAST_LANE' else 1048576):
+        if not raw.isdigit() or not (0 if key in ('FAST_LANE', 'INITIAL_MEMORY_MB') else 1) <= int(raw) <= (1 if key == 'FAST_LANE' else 1048576):
             raise ValueError('AGENT_CI_' + key + ' must be a positive integer')
         result[key] = int(raw)
     if mode == 'local':

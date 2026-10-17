@@ -59,23 +59,37 @@ def save_tree(row, record):
     tree.save(marker)
 
 
-def run(queue, token, phase, seconds, marker, command):
+def run(queue, token, phase, seconds, marker, command, heavy=False, stage=None):
     child = None
     record = None
     code = 74
     percent, maximum = resources.kill_limits()
     interrupted = [False]
+    memory_generation = None
+    import scheduler_memory
+    memory_phase = 'template' if stage == 'migration' else stage or phase
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda _s, _f: interrupted.__setitem__(0, True))
     # The child waits on a pipe until its birth identity has been committed.
     reader, writer = os.pipe()
     result_reader, result_writer = os.pipe()
     try:
+        ready, seconds = scheduler_memory.prepare(queue, token, memory_phase, heavy, seconds, interrupted)
+        if not ready:
+            if marker:
+                Path(marker).write_text('75')
+            print('== phase stopped phase=%s reason=memory-growth rc=75' % phase, flush=True)
+            return 75
         with queue.transaction() as data:
             row = data['jobs'][token]
             if row['state'] != 'running' or (row.get('cancel') and phase != 'cleanup'):
                 return 74
             generation, memory = row['lease_generation'], row['memory_mb']
+            memory_generation = generation
+            # A phase-sized grant is the monitored bound. Legacy jobs retain
+            # their pinned percentage policy; do not silently shrink them.
+            if row.get('initial_memory_mb'):
+                percent, maximum = 100, memory
             if phase not in ('cleanup', 'maintenance'):
                 # Queue time and earlier phases consume the same job budget.
                 # Fast-lane jobs may have an additional, shorter service limit.
@@ -173,6 +187,8 @@ def run(queue, token, phase, seconds, marker, command):
                         row['reap_failed'] = True
                         code = 76
                     save_tree(row, record)
+        if memory_generation is not None:
+            scheduler_memory.release_phase(queue, token, memory_generation, memory_phase)
         os.close(result_reader)
         os.close(writer)
         if child:
@@ -226,11 +242,13 @@ if __name__ == '__main__':
     parser.add_argument('--phase', required=True, choices=['check', 'database', 'cleanup', 'maintenance'])
     parser.add_argument('--timeout', type=int, required=True)
     parser.add_argument('--marker')
+    parser.add_argument('--heavy', action='store_true')
+    parser.add_argument('--stage', choices=['install', 'migration', 'prepare', 'check'])
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     try:
-        sys.exit(run(resources.Queue(), args.token, args.phase, args.timeout, args.marker, command))
+        sys.exit(run(resources.Queue(), args.token, args.phase, args.timeout, args.marker, command, args.heavy, args.stage))
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         print('lost-run: lease supervisor unavailable', file=sys.stderr)
         sys.exit(74)

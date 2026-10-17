@@ -30,6 +30,10 @@ class CacheSpaceError(OSError):
     pass
 
 
+class CachePinnedError(ValueError):
+    pass
+
+
 def measurement(value):
     """Normalize legacy or malformed measurement times to an expired value."""
     try:
@@ -560,7 +564,7 @@ class Cache:
                 path = Path(entry['path'])
                 if entry['kind'] in ('deps', 'venv') and work in path.parents:
                     if entry['pins']:
-                        raise ValueError('previous job still pins install outputs')
+                        raise CachePinnedError('previous job still pins install outputs')
                     self.delete(path)
                     del entries[key]
 
@@ -1012,6 +1016,9 @@ if __name__ == '__main__':
     except CacheSpaceError:
         print('cache blocked: host disk floor or byte cap', file=sys.stderr)
         sys.exit(75)
+    except CachePinnedError:
+        print('cache unavailable reason=install-output-pinned', file=sys.stderr)
+        sys.exit(74)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         print('cache unavailable; entry not trusted', file=sys.stderr)
         sys.exit(74)

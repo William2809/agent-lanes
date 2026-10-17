@@ -194,6 +194,15 @@ def authorize(request, root, limits):
                  floor + service, 4096 + service if not model['memory_known'] else 0)
     if memory > maximum:
         raise ValueError('authorized memory exceeds maximum job budget')
+    # Only a kit with phase gates may opt into a smaller initial reservation.
+    # The ceiling remains the trusted full-job estimate, never caller lowballing.
+    result.pop('memory_ceiling_mb', None)
+    result.pop('initial_memory_mb', None)
     result.update(model)
     result['memory_mb'] = int(math.ceil(memory))
+    initial = limits.get('INITIAL_MEMORY_MB', 0)
+    if initial and request.get('phase_memory_version') == 1:
+        result['memory_ceiling_mb'] = result['memory_mb']
+        result['memory_mb'] = min(result['memory_mb'], initial)
+        result['initial_memory_mb'] = result['memory_mb']
     return result

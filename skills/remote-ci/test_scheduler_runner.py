@@ -218,6 +218,17 @@ class SchedulerRunner(unittest.TestCase):
         self.assert_result(self.start('dirty'), 'dirty', 76)
         pending = self.dir/'results/dirty.cleanup'
         self.assertTrue(pending.exists())
+        cleanup = dict(line.split('=', 1) for line in pending.read_text().splitlines())
+        original_pin = 'fixture-dirty-' + cleanup['pid']
+        foreign_pin = 'fixture-foreign-live-1'
+        registry = self.ci/'cache/registry.json'
+        ledger = json.loads(registry.read_text())
+        for key, pins in (('recovery-owned', [original_pin]),
+                          ('recovery-shared', [original_pin, foreign_pin])):
+            ledger['entries'][key] = dict(
+                path=str(self.ci/'cache'/key), kind='deps', pins=pins, bytes=1,
+                measured=time.time(), used=time.time(), metadata={})
+        registry.write_text(json.dumps(ledger))
         self.assert_result(self.start('short', project='other'), 'short', 0, project='other')
         self.assertTrue(pending.exists())
         token = next(t for t, r in self.rows().items() if r.get('run_id') == 'dirty')
@@ -232,6 +243,9 @@ class SchedulerRunner(unittest.TestCase):
         self.assertFalse(pending.exists())
         self.assertTrue((self.dir/'results/dirty.recovered').exists())
         self.assertEqual(self.rows()[token]['state'], 'finished')
+        entries = json.loads(registry.read_text())['entries']
+        self.assertEqual(entries['recovery-owned']['pins'], [])
+        self.assertEqual(entries['recovery-shared']['pins'], [foreign_pin])
 
     def test_database_commands_have_phase_deadline(self):
         """Follow-up 4: a blocked DB command cannot hold an admitted slot forever."""

@@ -48,6 +48,13 @@ def validate(request):
     for field in ('slots', 'workers', 'memory_mb', 'generation'):
         if type(request[field]) is not int or request[field] < 1:
             raise ValueError('invalid scheduler request')
+    if 'phase_memory_version' in request and (type(request['phase_memory_version']) is not int or request['phase_memory_version'] != 1):
+        raise ValueError('unsupported phase-memory protocol')
+    if 'memory_ceiling_mb' in request:
+        ceiling = request['memory_ceiling_mb']
+        if (type(ceiling) is not int or ceiling < request['memory_mb'] or
+                request.get('initial_memory_mb') != request['memory_mb']):
+            raise ValueError('invalid phase-memory contract')
     if not isinstance(request['leases'], list) or len(request['leases']) > 128:
         raise ValueError('invalid lease list')
     for lease in request['leases']:
@@ -75,7 +82,7 @@ def submit(data, token, owner, start, now, deadline, request):
                landing=bool(request.get('landing')), blocker=None,
                cleanup_required=bool(request.get('cleanup_required')),
                requested={key: request[key] for key in ('slots', 'workers', 'memory_mb', 'leases')})
-    for key in ('predicted_mb', 'samples', 'source', 'profile_known', 'profile', 'predicted_s', 'estimate_scope', 'park_version', 'park_envelope'):
+    for key in ('predicted_mb', 'samples', 'source', 'profile_known', 'profile', 'predicted_s', 'estimate_scope', 'park_version', 'park_envelope', 'initial_memory_mb', 'memory_ceiling_mb'):
         if key in request:
             row[key] = request[key]
     if re.fullmatch(r'[a-zA-Z0-9_.-]{1,160}', request.get('run_id', '')):
@@ -156,6 +163,10 @@ def unused(row):
 
 def blocker(row, active, metrics, limits):
     req = row['requested']
+    import scheduler_memory
+    growth = next((t for t, r in active.items() if r.get('memory_wait')), None)
+    if growth:
+        return dict(reason='memory-growth', holder=growth)
     for token, other in active.items():
         if other.get('version') != 2:
             return dict(reason='legacy-run', holder=token)
@@ -179,6 +190,13 @@ def blocker(row, active, metrics, limits):
         return dict(reason='cpu', holder=None)
     if metrics['available_mb'] - limits['MEM_RESERVE_MB'] - sum(unused(r) for r in active.values()) < req['memory_mb']:
         return dict(reason='memory', holder=next(iter(occupied), None))
+    # Shared headroom for the largest remaining growth request. An admitted
+    # job can reach its full phase budget without relying on another setup job
+    # finishing first. RSS is never used as capacity credit.
+    proposed = dict(row, memory_mb=req['memory_mb'], workers=req['workers'])
+    required = scheduler_memory.admission_memory([*active.values(), proposed])
+    if required > min(metrics.get('total_mb', float('inf')), metrics['available_mb']) - limits['MEM_RESERVE_MB']:
+        return dict(reason='memory-growth-reserve', holder=None)
     return None
 
 
@@ -272,8 +290,8 @@ def schedule(data, metrics, limits, procs, now):
         req = row['requested']
         cpu_limit = metrics['cores'] - min(limits['CPU_RESERVE'], max(0, metrics['cores'] - 1))
         if (req['workers'] > min(limits['MAX_WORKERS'], cpu_limit) or
-                req['memory_mb'] > limits.get('MAX_JOB_MB', float('inf')) or
-                req['memory_mb'] > metrics.get('total_mb', float('inf')) - limits['MEM_RESERVE_MB']):
+                row.get('memory_ceiling_mb', req['memory_mb']) > limits.get('MAX_JOB_MB', float('inf')) or
+                row.get('memory_ceiling_mb', req['memory_mb']) > metrics.get('total_mb', float('inf')) - limits['MEM_RESERVE_MB']):
             row.update(state='rejected', result=75, finished_at=now, updated_at=now,
                        blocker=dict(reason='impossible-request', holder=None))
             continue

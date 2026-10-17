@@ -61,7 +61,8 @@ release_guard() { return 0; }
 stop_idle_postgres() { return 0; }
 
 scheduler_exec() {
-  local phase=$1 seconds=$REMOTE_CI_TIMEOUT remaining; shift
+  local phase=$1 seconds=$REMOTE_CI_TIMEOUT remaining growth=(); shift
+  [ "${scheduler_heavy:-0}" != 1 ] || growth=(--heavy --stage "${scheduler_memory_stage:-check}")
   if [ "$phase" = cleanup ] && [ "$seconds" -gt 60 ]; then seconds=60; fi
   if [ -n "${scheduler_phase_deadline:-}" ]; then
     remaining=$((scheduler_phase_deadline - $(date +%s)))
@@ -69,7 +70,7 @@ scheduler_exec() {
     [ "$remaining" -ge "$seconds" ] || seconds=$remaining
   fi
   python3 "$runner_dir/scheduler_process.py" --token "$resource_token" --phase "$phase" \
-    --timeout "$seconds" --marker "$dir/results/$run.resource-stop" -- "$@"
+    ${growth[@]+"${growth[@]}"} --timeout "$seconds" --marker "$dir/results/$run.resource-stop" -- "$@"
 }
 scheduler_db() {
   local tool=$1; shift
