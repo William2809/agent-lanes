@@ -86,6 +86,37 @@ class SnapshotTest(Tmp):
         text = json.dumps(snap)
         self.assertNotIn('pnpm run check', text, 'command text must never leave the runner')
 
+    def test_transfer_exit_is_not_infrastructure(self):
+        self.assertEqual(snapmod.outcome(79), 'transferred')
+
+    def test_v2_blockers_are_allowlisted_without_tokens_or_commands(self):
+        expected = {
+            'project-slot': 'waiting for a project slot',
+            'workers': 'waiting for worker capacity',
+            'cpu': 'waiting for CPU headroom',
+            'memory': 'waiting for memory',
+            'pressure': 'waiting for memory pressure to recover',
+            'swap-recovery': 'waiting for swap recovery',
+            'maintenance': 'paused for maintenance',
+            'lease:postgres:18': 'waiting for PostgreSQL setup',
+            'lease:template:secret-project': 'waiting for a database template',
+            'lease:cleanup:secret-project': 'waiting for database cleanup',
+            'lease:private-token': 'waiting for a shared service',
+        }
+        for reason, text in expected.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(snapmod.blocker_text({'reason': reason, 'holder': 'private-token'}), text)
+        self.assertIsNone(snapmod.blocker_text({'reason': 'command:secret'}))
+
+        home = fixtures.Home(self.dir)
+        run = home.active('proj', 'ab' * 20, time.time() - 10, None, [], live=True)
+        job = next(iter(home.jobs.values()))
+        job.update(version=2, state='queued', blocker={'reason': 'project-slot', 'holder': 'private-token'})
+        home.save()
+        row = next(r for r in snapshot(self.dir)['active'] if r['run'] == run)
+        self.assertEqual(row['blocker'], 'waiting for a project slot')
+        self.assertNotIn('private-token', json.dumps(row))
+
     def test_lost_and_stale_runs_are_not_shown_as_running(self):
         home = fixtures.Home(self.dir)
         lost = home.active('proj', 'ab' * 20, time.time() - 100, 5, [('checkout', 1)], live=False)

@@ -324,6 +324,45 @@ def job_live(job, run, pid, procs):
     return any(p[0] in groups for p in procs.values())
 
 
+BLOCKER_TEXT = {
+    'project-slot': 'waiting for a project slot',
+    'jobs': 'waiting for host job capacity',
+    'workers': 'waiting for worker capacity',
+    'cpu': 'waiting for CPU headroom',
+    'memory': 'waiting for memory',
+    'memory-growth': 'waiting for memory growth',
+    'memory-growth-reserve': 'waiting for memory growth headroom',
+    'pressure': 'waiting for memory pressure to recover',
+    'swap-recovery': 'waiting for swap recovery',
+    'maintenance': 'paused for maintenance',
+    'legacy-run': 'waiting for an older runner job',
+    'project-reserve': 'waiting for project capacity',
+    'fast-reserve': 'waiting for fast-lane capacity',
+    'head-drain': 'waiting behind an aged wide check',
+    'head-reservation': 'waiting behind an earlier reservation',
+    'aged-drain': 'waiting behind an aged wide check',
+}
+
+
+def blocker_text(blocker):
+    """Return a privacy-safe queue reason; never expose holder tokens or lease names."""
+    reason = blocker.get('reason') if isinstance(blocker, dict) else None
+    if not isinstance(reason, str):
+        return None
+    if reason.startswith('lease:'):
+        lease = reason[6:]
+        if lease.startswith('postgres:'):
+            return 'waiting for PostgreSQL setup'
+        if lease.startswith('template:'):
+            return 'waiting for a database template'
+        if lease.startswith('cleanup:'):
+            return 'waiting for database cleanup'
+        if lease == 'exclusive-host':
+            return 'waiting for exclusive host access'
+        return 'waiting for a shared service'
+    return BLOCKER_TEXT.get(reason)
+
+
 def queue(procs):
     try:
         with open(QUEUE) as f:
@@ -371,7 +410,8 @@ def queue(procs):
                          rss_mb=rss, cpu_pct=cpu, phase_deadline=phase_deadline,
                          job_deadline=job_deadline, run_deadline=run_deadline,
                          ledger_phase=phase.get('phase') if trusted_phase else None,
-                         admitted_at=admitted_at, maintenance_state=maintenance))
+                         admitted_at=admitted_at, maintenance_state=maintenance,
+                         blocker=blocker_text(job.get('blocker'))))
         if os.environ.get('CI_BOARD_HOME') and job.get('fixture_wait'):
             rows[-1]['fixture_wait'] = job['fixture_wait']   # fixture owners are pid 1: no process tree
     rows.sort(key=lambda r: r['sequence'])
@@ -521,7 +561,7 @@ def parse_log(lines, flags):
 
 
 def outcome(rc):
-    return 'pass' if rc == 0 else 'fail' if rc == 1 else 'infra'
+    return 'pass' if rc == 0 else 'fail' if rc == 1 else 'transferred' if rc == 79 else 'infra'
 
 
 def projects(qrows, queue_ok, procs_ok):
@@ -602,7 +642,8 @@ def projects(qrows, queue_ok, procs_ok):
                        elapsed_s=round(NOW - info['started']) if info['started'] else None,
                        waited_s=round((info['started'] or NOW) - (submitted or mtime)),
                        sequence=trusted.get('sequence') if live else None,
-                       live=trusted.get('live', live), maintenance_state=maintenance, check=info['check'],
+                       live=trusted.get('live', live), maintenance_state=maintenance,
+                       blocker=trusted.get('blocker'), check=info['check'],
                        phase_deadline=trusted.get('phase_deadline'), job_deadline=trusted.get('job_deadline'),
                        run_deadline=trusted.get('run_deadline'),
                        log_idle_s=max(0, round(NOW - mtime)),

@@ -16,7 +16,7 @@ REASONS = {'fifo', 'jobs', 'workers', 'cpu', 'memory', 'pressure', 'project-slot
            'monitor-unavailable', 'cleanup-incomplete', 'quarantine-expired', 'complete', 'unknown'}
 PHASES = {'queue', 'checkout', 'install', 'template', 'database', 'prepare', 'check', 'cleanup', 'unknown'}
 NUMERIC = {'wait_s', 'workers', 'memory_mb', 'exit_code', 'predicted_s', 'samples',
-           'host_load', 'available_mb', 'previous_mb', 'ceiling_mb'}
+           'host_load', 'available_mb', 'previous_mb', 'ceiling_mb', 'rss_mb', 'limit_mb', 'pressure'}
 LANES = {'fast', 'normal'}
 MAX_BYTES = 2 * 1024 * 1024
 

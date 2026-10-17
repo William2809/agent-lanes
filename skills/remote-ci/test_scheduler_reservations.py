@@ -1,5 +1,6 @@
 """Accounting caps preserve identities and allow host-bounded working sets."""
 import copy
+import json
 import sys
 from pathlib import Path
 import unittest
@@ -63,5 +64,36 @@ class CappedRunner(unittest.TestCase):
         self.assertEqual(row['memory_ceiling_mb'],64)
         self.assertGreater(row['peak_rss_mb'],64)
         self.assertFalse(row.get('workers'))
+
+    def stopped_event(self, run):
+        events = self.home / '.local/state/agent-ci/telemetry/events.jsonl'
+        return next(row for row in map(json.loads, events.read_text().splitlines())
+                    if row.get('event') == 'stopped' and row.get('run_id') == run)
+
+    def test_budget_stop_records_triggering_memory_and_reaps(self):
+        with (self.home/'.config/agent-lanes/config').open('a') as f:
+            f.write('AGENT_CI_RESERVATION_CAP_MB=64\nAGENT_CI_INITIAL_MEMORY_MB=64\nAGENT_CI_KILL_PCT=150\n')
+        proc = self.start('budget-evidence', command="python3 -c 'import time; payload=bytearray(192*1024*1024); time.sleep(20)'")
+        self.assert_result(proc, 'budget-evidence', 75)
+        event = self.stopped_event('budget-evidence')
+        self.assertEqual(event['reason'], 'memory-budget')
+        self.assertGreater(event['rss_mb'], event['limit_mb'])
+        self.assertEqual(event['pressure'], 1)
+        self.assertIn('reason=memory-budget rc=75', self.log('budget-evidence'))
+        self.assertFalse(any(r.get('groups') or r.get('workers') for r in self.rows().values()))
+
+    def test_pressure_stop_is_distinguished_from_small_working_set(self):
+        sampler = self.bin/'resources.py'
+        sampler.write_text(sampler.read_text().replace("if __name__ == '__main__':",
+            "sample=lambda: dict(cores=10, load=0, available_mb=20000, pressure=4)\nif __name__ == '__main__':"))
+        proc = self.start('pressure-evidence', command="python3 -c 'import time; time.sleep(20)'")
+        self.assert_result(proc, 'pressure-evidence', 75)
+        event = self.stopped_event('pressure-evidence')
+        self.assertEqual(event['reason'], 'pressure')
+        self.assertEqual(event['pressure'], 4)
+        self.assertEqual(event['available_mb'], 20000)
+        self.assertLess(event['rss_mb'], event['limit_mb'])
+        self.assertIn('reason=pressure rc=75', self.log('pressure-evidence'))
+        self.assertFalse(any(r.get('groups') or r.get('workers') for r in self.rows().values()))
 
 if __name__=='__main__': unittest.main()

@@ -145,12 +145,12 @@ class SchedulerProfiles(unittest.TestCase):
         result = self.p.read_model(self.root, 'project', self.profile, 1024)
         self.assertFalse(result['memory_known'])
         self.assertFalse(result['profile_known'])
-        self.assertEqual(result['predicted_mb'], 6656)
+        self.assertEqual(result['predicted_mb'], 5120)
 
     def test_failed_peak_is_retained_as_memory_lower_bound(self):
         self.write('oom.json', self.row(code=137, peak=8 * 1024 * 1048576))
         result = self.p.read_model(self.root, 'project', self.profile, 1024)
-        self.assertEqual(result['predicted_mb'], 10496)
+        self.assertEqual(result['predicted_mb'], 8192)
         self.assertFalse(result['profile_known'])
         self.assertFalse(result['memory_known'])
 
@@ -224,7 +224,7 @@ class SchedulerProfiles(unittest.TestCase):
         self.assertIsNone(result['predicted_s'])
         self.assertEqual(result['samples'], 0)
         self.assertEqual(result['source'], 'unknown')
-        self.assertEqual(result['memory_mb'], 4096)
+        self.assertEqual(result['memory_mb'], 1536)
 
     def test_authorize_command_context_and_worker_mismatch_cannot_reuse_history(self):
         self.trusted_history()
@@ -237,7 +237,7 @@ class SchedulerProfiles(unittest.TestCase):
                 self.assertFalse(result['profile_known'])
                 self.assertFalse(result['memory_known'])
                 self.assertIsNone(result['predicted_s'])
-                self.assertEqual(result['memory_mb'], 4096)
+                self.assertEqual(result['memory_mb'], 2048 if change.get('workers') == 2 else 1536)
 
     def test_authorize_valid_trusted_history_allows_fast_classification(self):
         profile = self.trusted_history()
@@ -259,19 +259,19 @@ class SchedulerProfiles(unittest.TestCase):
                 self.assertIsNone(result['profile'])
                 self.assertEqual(result['memory_mb'], 6144)
 
-    def test_authorize_memory_cannot_lowball_history_workers_or_database_service(self):
+    def test_authorize_memory_cannot_lowball_history_or_worker_floor(self):
         self.trusted_history(peak=4 * 1024 * 1048576)
         known = self.p.authorize(self.request(memory_mb=512), self.root, self.limits)
-        self.assertEqual(known['memory_mb'], 5376)
+        self.assertEqual(known['memory_mb'], 4096)
         unknown = self.p.authorize(self.request(profile_context=None, memory_mb=512),
                                    self.root, self.limits)
-        self.assertEqual(unknown['memory_mb'], 4096)
+        self.assertEqual(unknown['memory_mb'], 1024)
 
         db_profile = self.trusted_history(database=True)
         database = self.p.authorize(
             self.request(memory_mb=512, leases=['postgres:main']), self.root, self.limits)
         self.assertEqual(database['profile'], db_profile)
-        self.assertGreaterEqual(database['memory_mb'], database['predicted_mb'] + 2048)
+        self.assertEqual(database['memory_mb'], database['predicted_mb'])
 
     def test_authorize_one_success_reduces_unknown_floor_but_keeps_all_floors(self):
         profile = self.p.key('project', self.digest, self.context, 1, False)
@@ -293,12 +293,52 @@ class SchedulerProfiles(unittest.TestCase):
             self.request(memory_mb=512, leases=['postgres:main']), self.root, self.limits)
         self.assertFalse(database['profile_known'])
         self.assertTrue(database['memory_known'])
-        self.assertEqual(database['memory_mb'], 3072)
+        self.assertEqual(database['memory_mb'], 1024)
 
-    def test_authorize_rejects_budget_above_maximum_instead_of_lowering(self):
+    def test_authorize_caps_requested_memory_at_host_maximum(self):
+        # Brief 1: cap excessive grants; preserve requests below/equal to the cap.
+        self.trusted_history()
         limits = dict(self.limits, MAX_JOB_MB=4096)
-        with self.assertRaises(ValueError):
-            self.p.authorize(self.request(memory_mb=4097), self.root, limits)
+        for requested, expected in ((4095, 4095), (4096, 4096), (4097, 4096)):
+            with self.subTest(requested=requested):
+                result = self.p.authorize(self.request(memory_mb=requested),
+                                          self.root, limits)
+                self.assertEqual(result['memory_mb'], expected)
+                self.assertNotIn('memory_ceiling_mb', result)
+
+    def test_authorize_caps_history_database_and_unknown_floors(self):
+        # Brief 1: the 3072 MB cap includes database and worker floors.
+        profile = self.p.key('project', self.digest, self.context, 1, True)
+        self.write('one-db.json', self.row(profile=profile, workers=1,
+                                        peak=5903 * 1048576))
+        limits = dict(self.limits, MAX_JOB_MB=3072)
+        cases = [(dict(leases=['postgres:main']), 3072),
+                 (dict(profile_context=None), 1536),
+                 (dict(profile_context=None, leases=['postgres:main']), 1536),
+                 (dict(workers=4), 3072)]
+        for changes, expected in cases:
+            with self.subTest(changes=changes):
+                result = self.p.authorize(self.request(**changes), self.root, limits)
+                self.assertEqual(result['memory_mb'], expected)
+                if changes == cases[0][0]:
+                    # The trusted whole-job peak is retained without reservation padding.
+                    self.assertEqual(result['predicted_mb'], 5903)
+                    self.assertTrue(result['memory_known'])
+                    self.assertEqual(result['samples'], 1)
+
+    def test_authorize_caps_phase_ceiling_before_initial_reservation(self):
+        # Brief 1: initial and eventual grants must both obey the host cap.
+        for initial, expected in ((2048, 2048), (3072, 3072), (6144, 3072)):
+            with self.subTest(initial=initial):
+                limits = dict(self.limits, MAX_JOB_MB=3072,
+                              INITIAL_MEMORY_MB=initial)
+                result = self.p.authorize(
+                    self.request(memory_mb=9707, phase_memory_version=1,
+                                 memory_ceiling_mb=99999, initial_memory_mb=99999),
+                    self.root, limits)
+                self.assertEqual(result['memory_ceiling_mb'], 3072)
+                self.assertEqual(result['memory_mb'], expected)
+                self.assertEqual(result['initial_memory_mb'], expected)
 
 
 if __name__ == '__main__':

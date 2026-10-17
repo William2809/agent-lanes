@@ -153,7 +153,7 @@ def read_model(root, project, profile, memory_floor_mb, min_samples=5, fast_limi
     known = len(successes) >= min_samples
     predicted_s = max(durations) * 1.25 if known and durations else None
     predicted_mb = int(math.ceil(max([memory_floor_mb] +
-                                     [peak / 1048576 * 1.25 + 256 for peak in memory])))
+                                     [peak / 1048576 for peak in memory])))
     return dict(profile=profile, profile_known=known, memory_known=memory_known,
                 predicted_s=predicted_s,
                 predicted_mb=predicted_mb, samples=len(successes), estimate_scope='job',
@@ -181,7 +181,6 @@ def authorize(request, root, limits):
               isinstance(command, str) and DIGEST.fullmatch(command))
     database = any(isinstance(lease, str) and lease.startswith('postgres:')
                    for lease in request.get('leases', ()))
-    service = 2048 if database else 0
     if framed:
         profile = key(project, command, context, workers, database)
         model = read_model(root, project, profile, floor,
@@ -190,12 +189,10 @@ def authorize(request, root, limits):
         model = dict(profile=None, profile_known=False, memory_known=False, predicted_s=None,
                      predicted_mb=floor, samples=0, estimate_scope='job', source='unknown')
 
-    memory = max(requested, model['predicted_mb'] + service,
-                 floor + service, 4096 + service if not model['memory_known'] else 0)
-    if memory > maximum:
-        raise ValueError('authorized memory exceeds maximum job budget')
+    memory = max(requested, model['predicted_mb'], floor)
+    memory = min(memory, maximum)
     # Only a kit with phase gates may opt into a smaller initial reservation.
-    # The ceiling remains the trusted full-job estimate, never caller lowballing.
+    # Bound the trusted full-job ceiling before choosing the initial reservation.
     result.pop('memory_ceiling_mb', None)
     result.pop('initial_memory_mb', None)
     result.update(model)

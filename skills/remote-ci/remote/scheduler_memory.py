@@ -34,13 +34,8 @@ def grow(data, token, metrics, limits, now):
                if r.get('state') == 'running' and r.get('memory_wait') and not r.get('cancel')]
     if waiters and min(waiters)[2] != token:
         return False
-    prior = data.get('sample', {})
-    pressure = metrics['pressure'] != 1
-    swap = metrics.get('swap_mb', 0) > prior.get('swap_mb', metrics.get('swap_mb', 0))
-    if pressure or swap:
-        data['frozen_until'] = now + 30
-    data['sample'] = dict(at=now, swap_mb=metrics.get('swap_mb', 0))
-    if now < data.get('frozen_until', 0):
+    import scheduler
+    if scheduler.update_pressure(data, metrics, now):
         return False
     committed = sum(r.get('memory_mb', 0) for r in data['jobs'].values() if r.get('workers'))
     available = min(metrics['available_mb'], metrics.get('total_mb', float('inf'))) - limits['MEM_RESERVE_MB']

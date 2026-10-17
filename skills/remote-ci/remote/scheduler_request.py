@@ -37,20 +37,19 @@ def main():
     model = predict(workers)
     if requested_workers > 1:
         single = predict(1)
-        single_memory = max(memory_floor, single['predicted_mb']) + (2048 if database else 0)
+        single_memory = max(memory_floor, single['predicted_mb'])
         single_fast = (limits.get('FAST_LANE') and single['profile_known'] and
                        single['estimate_scope'] == 'job' and
                        type(single['predicted_s']) in (int, float) and
                        0 <= single['predicted_s'] <= limits.get('FAST_SECONDS', 60) and
                        limits.get('FAST_WORKERS', 1) >= 1 and
                        single_memory <= limits.get('FAST_MEMORY_MB', 2048))
-        # Bootstrap with one worker only until it is measured. Thereafter a slow
-        # or large one-worker profile must let the requested profile collect its
-        # own evidence; exact worker-count profiles are never inferred.
-        if single_fast or (not model['profile_known'] and not single['profile_known']):
+        # Prefer one worker only when its exact trusted profile fits the fast lane.
+        # Cold profiles keep the requested width so they can train without
+        # underusing host capacity; worker-count profiles are never inferred.
+        if single_fast:
             workers, model = 1, single
-    floor = max(memory_floor, limits['WORKER_MB'] * workers,
-                0 if model['memory_known'] else 4096)
+    floor = max(memory_floor, limits['WORKER_MB'] * workers)
     leases = os.environ.get('SCHEDULER_LEASES', '').split()
     if os.environ.get('SCHEDULER_EXCLUSIVE', '0') == '1':
         leases.append('exclusive-host')
@@ -69,7 +68,7 @@ def main():
                    mode=mode, command_digest=digest, profile_context=context,
                    generation=int(meta.get('generation', 1)), landing=bool(meta.get('landing', True)),
                    slots=int(os.environ.get('SCHEDULER_SLOTS', '1')), workers=workers,
-                   memory_mb=max(memory_floor, max(floor, model['predicted_mb']) + (2048 if postgres else 0)),
+                   memory_mb=max(floor, model['predicted_mb']),
                    leases=sorted(set(leases)), cleanup_required=bool(postgres), **model)
     if postgres:
         request.update(lease_phase_version=1, setup_leases=sorted(set(setup_leases)),

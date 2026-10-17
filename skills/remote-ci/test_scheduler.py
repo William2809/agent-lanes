@@ -219,9 +219,38 @@ with q.transaction() as data:
         self.tick(metrics=dict(METRICS, pressure=2))
         self.assertEqual(self.data['jobs']['a']['state'], 'queued')
         self.tick(101, metrics=dict(METRICS, swap_mb=10))
+        self.assertEqual(self.data['frozen_until'], 130)
         self.tick(110, metrics=dict(METRICS, swap_mb=10))
         self.assertEqual(self.data['jobs']['a']['state'], 'queued')
         self.tick(132, metrics=dict(METRICS, swap_mb=10))
+        self.assertEqual(self.data['jobs']['a']['state'], 'running')
+
+        self.submit('b')
+        self.tick(133, metrics=dict(METRICS, swap_mb=74))
+        self.assertEqual(self.data['jobs']['b']['blocker']['reason'], 'swap-recovery')
+        self.assertEqual(self.data['frozen_until'], 163)
+        self.tick(164, metrics=dict(METRICS, swap_mb=74))
+        self.assertEqual(self.data['jobs']['b']['state'], 'running')
+
+    def test_swap_growth_accumulates_within_bounded_window(self):
+        self.tick(100, metrics=dict(METRICS, swap_mb=0))
+        for now, swap in ((105, 16), (110, 32), (115, 48)):
+            self.tick(now, metrics=dict(METRICS, swap_mb=swap))
+            self.assertFalse(self.data.get('frozen_until'))
+        self.submit('a', now=120)
+        self.tick(120, metrics=dict(METRICS, swap_mb=64))
+        self.assertEqual(self.data['jobs']['a']['blocker']['reason'], 'swap-recovery')
+        self.assertEqual(self.data['frozen_until'], 150)
+        self.tick(151, metrics=dict(METRICS, swap_mb=64))
+        self.assertEqual(self.data['jobs']['a']['state'], 'running')
+
+    def test_slow_swap_growth_starts_a_new_quiet_window(self):
+        self.tick(100, metrics=dict(METRICS, swap_mb=0))
+        self.tick(120, metrics=dict(METRICS, swap_mb=37))
+        self.tick(131, metrics=dict(METRICS, swap_mb=50))
+        self.submit('a', now=150)
+        self.tick(150, metrics=dict(METRICS, swap_mb=87))
+        self.assertFalse(self.data.get('frozen_until'))
         self.assertEqual(self.data['jobs']['a']['state'], 'running')
 
     def test_no_raw_rss_credit_and_memory_budget(self):

@@ -140,12 +140,14 @@ def run(queue, token, phase, seconds, marker, command, heavy=False, stage=None):
             procs = snapshot()
             refresh(record, procs)
             reason = None
+            reason_name = None
             with queue.transaction() as data:
                 row = data['jobs'].get(token, {})
                 owner = procs.get(row.get('owner'), {})
                 if (row.get('lease_generation') != generation or (row.get('cancel') and phase != 'cleanup') or
                         owner.get('birth') != row.get('owner_birth') or interrupted[0]):
                     reason = 74
+                    reason_name = 'interrupted' if interrupted[0] else 'owner-lost'
                 else:
                     row['process'] = record
                     row['groups'][str(child.pid)] = record
@@ -159,14 +161,25 @@ def run(queue, token, phase, seconds, marker, command, heavy=False, stage=None):
                     row['peak_rss_mb'] = max(rss, row.get('peak_rss_mb', 0))
                     save_tree(row, record)
             if time.monotonic() >= phase_deadline:
-                reason = 74
-            if resources.budget_exceeded(rss, memory, percent, maximum) or resources.sample()['pressure'] >= 4:
-                reason = 75
+                reason, reason_name = 74, 'deadline'
+            metrics = resources.sample()
+            if resources.budget_exceeded(rss, memory, percent, maximum):
+                reason, reason_name = 75, 'memory-budget'
+            elif metrics['pressure'] >= 4:
+                reason, reason_name = 75, 'pressure'
             if reason:
                 code = reason
                 if marker:
                     Path(marker).write_text(str(code))
-                print('== phase stopped phase=%s rc=%s' % (phase, code), flush=True)
+                # Log the triggering observation, not a later recovered host sample.
+                limit_mb = min(memory * percent / 100, maximum)
+                print('== phase stopped phase=%s reason=%s rc=%s rss_mb=%s limit_mb=%s pressure=%s available_mb=%s' %
+                      (phase, reason_name, code, rss, limit_mb, metrics['pressure'], metrics['available_mb']), flush=True)
+                resources.ci_telemetry.emit(queue.root / 'telemetry', 'stopped',
+                    project=row.get('project', 'unknown'), run_id=row.get('run_id', 'unknown'),
+                    phase=phase if phase != 'maintenance' else 'cleanup', reason=reason_name,
+                    exit_code=code, rss_mb=rss, limit_mb=limit_mb, pressure=metrics['pressure'],
+                    available_mb=metrics['available_mb'])
                 break
     finally:
         os.close(reader)

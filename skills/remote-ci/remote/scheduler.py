@@ -11,6 +11,30 @@ import re
 TERMINAL = ('finished', 'superseded', 'expired', 'lost', 'rejected')
 DRAIN_SECONDS = 300
 RECOVERY_SECONDS = 30
+SWAP_GROWTH_MB = 64
+
+
+def update_pressure(data, metrics, now):
+    """Persist one bounded pressure sample and return whether grants are frozen."""
+    prior = data.get('sample', {})
+    pressure = metrics['pressure'] != 1
+    swap = metrics.get('swap_mb', 0)
+    swap_window_at = prior.get('swap_window_at', prior.get('at', now))
+    swap_window_mb = prior.get('swap_window_mb', prior.get('swap_mb', swap))
+    # Accumulate rapid page-level growth independently of queue poll frequency.
+    # Old slow churn and reclaimed swap start a fresh bounded observation window.
+    if now - swap_window_at > RECOVERY_SECONDS or swap < swap_window_mb:
+        swap_window_at, swap_window_mb = now, swap
+    growth = swap - swap_window_mb >= SWAP_GROWTH_MB
+    if growth:
+        swap_window_at, swap_window_mb = now, swap
+    if pressure or growth:
+        data['frozen_until'] = now + RECOVERY_SECONDS
+    data['sample'] = dict(at=now, swap_mb=swap, swap_window_at=swap_window_at,
+                          swap_window_mb=swap_window_mb)
+    frozen = now < data.get('frozen_until', 0)
+    data['throttle_reason'] = ('pressure' if pressure else 'swap-recovery') if frozen else None
+    return frozen
 
 
 def leases_conflict(left, right):
@@ -289,14 +313,8 @@ def schedule(data, metrics, limits, procs, now):
             if not leader or leader.get('state') in TERMINAL + ('quarantined',):
                 row.update(state='finished', result=leader.get('result', 74) if leader else 74,
                            finished_at=now, updated_at=now)
-    prior = data.get('sample', {})
+    frozen = update_pressure(data, metrics, now)
     pressure = metrics['pressure'] != 1
-    growth = metrics.get('swap_mb', 0) > prior.get('swap_mb', metrics.get('swap_mb', 0))
-    if pressure or growth:
-        data['frozen_until'] = now + RECOVERY_SECONDS
-    data['sample'] = dict(at=now, swap_mb=metrics.get('swap_mb', 0))
-    frozen = now < data.get('frozen_until', 0)
-    data['throttle_reason'] = ('pressure' if pressure else 'swap-recovery') if frozen else None
     pending = sorted((r for r in jobs.values() if r.get('state') == 'queued'),
                      key=lambda r: r['sequence'])
     active = {t: r for t, r in jobs.items() if r.get('workers') or r.get('state') == 'quarantined'}

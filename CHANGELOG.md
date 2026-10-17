@@ -4,6 +4,8 @@ All notable changes to agent-lanes. The format follows [Keep a Changelog](https:
 
 ## [Unreleased]
 
+- Keep cold checks at their requested worker count, remove synthetic memory/database padding from trusted reservations, and retain runtime burst safety above capped accounting.
+- Report privacy-safe queue blockers and phase resource-stop telemetry; ignore swap changes below 64 MiB within the bounded recovery window.
 - Remove GitHub Actions workflows; use configured remote resource queues for validation and record exact commit/command/runner evidence.
 - Replan fast admission after real grants and optionally lend an idle fast reserve to normal work with `AGENT_CI_FAST_BORROW=1`.
 - Release PostgreSQL cluster and template setup leases after an isolated slot database is ready, while retaining fenced recovery after failed setup.
